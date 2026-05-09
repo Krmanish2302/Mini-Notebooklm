@@ -14,6 +14,10 @@ Phase-1 fixes
 - EmbeddingPipeline dim inferred from embed_query() result shape
 - VideoAudioPipeline import removed (tombstoned — raises NotImplementedError)
 - WebSearchAgent import removed (file not present yet — Phase 5)
+
+Phase-2 fix
+-----------
+- HybridRetriever constructor now passes storage_manager + dim
 """
 from __future__ import annotations
 
@@ -135,10 +139,13 @@ class MasterPipeline:
         logger.info("MasterPipeline: embedding dim=%d model=%s", self._embed_dim, self._embed_model)
 
         # ── Retrieval ─────────────────────────────────────────────────────────
-        # HybridRetriever takes StorageManager — Phase 3 will rewrite internals
-        # to use EnsembleRetriever; for now pass storage_manager so it can call
-        # get_chunks_as_documents() after FAISS results come back.
-        self.hybrid_retriever = HybridRetriever(self.storage_manager.faiss)
+        # Phase-2 fix: pass storage_manager + dim so HybridRetriever can call
+        # faiss_store.search({dim: qvec}) and hydrate results via StorageManager.
+        self.hybrid_retriever = HybridRetriever(
+            self.storage_manager.faiss,
+            storage_manager=self.storage_manager,
+            dim=self._embed_dim,
+        )
 
         # ── Generation ────────────────────────────────────────────────────────
         self.llm: Optional[LLMClient] = None
@@ -231,213 +238,187 @@ class MasterPipeline:
             elif resolved_type == "image":
                 result = ImagePipeline.process(file_path, source_id)
             elif resolved_type in ("video", "audio"):
-                # Tombstoned — raises NotImplementedError by design.
+                # Tombstoned: VideoAudioPipeline raises NotImplementedError.
+                # Lazy import so the dead module never loads at startup.
                 from src.ingestion.pipelines.video_audio_pipeline import VideoAudioPipeline
                 result = VideoAudioPipeline.process(file_path, source_id)
-            elif resolved_type == "website":
-                loop = asyncio.get_event_loop()
-                result = loop.run_until_complete(WebsitePipeline.process(url, source_id))
             elif resolved_type == "youtube":
                 result = YouTubePipeline.process(url, source_id)
+            elif resolved_type == "website":
+                loop = asyncio.get_event_loop()
+                result = loop.run_until_complete(
+                    WebsitePipeline.process(url, source_id)
+                )
             elif resolved_type == "csv":
                 result = CSVPipeline.process(file_path, source_id)
             else:
-                raise ValueError(
-                    f"Unsupported source_type: '{resolved_type}'. "
-                    "Valid: pdf, image, website, youtube, csv."
-                )
+                raise ValueError(f"Unknown source_type: '{resolved_type}'")
+        except NotImplementedError:
+            raise
         except Exception as exc:
-            self.ingestion_graph.mark_error(source_id, "extracted", str(exc))
-            raise RuntimeError(
-                f"Ingestion failed at extraction stage (type='{resolved_type}'): {exc}"
-            ) from exc
+            self.ingestion_graph.mark_error(source_id, stage="extract", error=str(exc))
+            raise RuntimeError(f"Extraction failed for '{resolved_type}': {exc}") from exc
 
-        self.ingestion_graph.mark_stage(source_id, "extracted",
-                                        meta={"modality": result.get("modality")})
+        raw_content = result.get("content", "")
+        self.ingestion_graph.mark_stage(source_id, "extract")
 
         # ── Step 3: preprocess ────────────────────────────────────────────────
         try:
-            preprocessed = self.preprocessor.process(
-                result["content"],
-                resolved_type,
-                result.get("metadata", {}),
-            )
+            preprocessed = self.preprocessor.preprocess(raw_content, source_type=resolved_type)
         except Exception as exc:
-            self.ingestion_graph.mark_error(source_id, "preprocessed", str(exc))
-            raise RuntimeError(f"Ingestion failed at preprocessing stage: {exc}") from exc
-
-        self.ingestion_graph.mark_stage(source_id, "preprocessed")
+            self.ingestion_graph.mark_error(source_id, stage="preprocess", error=str(exc))
+            raise RuntimeError(f"Preprocessing failed: {exc}") from exc
+        self.ingestion_graph.mark_stage(source_id, "preprocess")
 
         # ── Step 4: chunk ─────────────────────────────────────────────────────
-        strategy = preprocessed.get("recommendation", {}).get("strategy", "recursive")
         try:
-            chunker = ChunkerRegistry.get_chunker(strategy)
-            chunks  = chunker.chunk(
-                preprocessed["cleaned_content"],
-                {
-                    "source_id": source_id,
-                    "modality":  result["modality"],
-                    **result.get("metadata", {}),
-                },
-            )
+            chunker = ChunkerRegistry.get_chunker(resolved_type)
+            chunks  = chunker.chunk(preprocessed, source_id=source_id)
         except Exception as exc:
-            self.ingestion_graph.mark_error(source_id, "chunked", str(exc))
-            raise RuntimeError(
-                f"Ingestion failed at chunking stage (strategy='{strategy}'): {exc}"
-            ) from exc
-
-        self.ingestion_graph.mark_stage(source_id, "chunked", meta={"num_chunks": len(chunks)})
+            self.ingestion_graph.mark_error(source_id, stage="chunk", error=str(exc))
+            raise RuntimeError(f"Chunking failed: {exc}") from exc
+        self.ingestion_graph.mark_stage(source_id, "chunk")
 
         # ── Step 5: embed ─────────────────────────────────────────────────────
         try:
-            chunks = self.embedder.embed_chunks(chunks)
+            embedded_chunks = self.embedder.embed_chunks(chunks)
         except Exception as exc:
-            self.ingestion_graph.mark_error(source_id, "embedded", str(exc))
-            raise RuntimeError(f"Ingestion failed at embedding stage: {exc}") from exc
+            self.ingestion_graph.mark_error(source_id, stage="embed", error=str(exc))
+            raise RuntimeError(f"Embedding failed: {exc}") from exc
+        self.ingestion_graph.mark_stage(source_id, "embed")
 
-        self.ingestion_graph.mark_stage(source_id, "embedded")
-
-        # ── Step 6: cross-modal merge ─────────────────────────────────────────
-        chunks = self.cross_modal_merger.merge(chunks)
+        # ── Step 6: merge cross-modal (no-op for single-source ingestion) ─────
+        try:
+            merged_chunks = self.cross_modal_merger.merge([embedded_chunks])
+        except Exception as exc:
+            # Non-fatal — fall back to un-merged chunks
+            logger.warning("CrossModalMerger failed (non-fatal): %s", exc)
+            merged_chunks = embedded_chunks
 
         # ── Step 7: store ─────────────────────────────────────────────────────
-        source_meta = result.get("metadata", {})
-        source = {
-            "id":          source_id,
-            "title":       source_meta.get("title", file_path or url or "Untitled"),
-            "source_type": resolved_type,
-            "file_path":   file_path,
-            "url":         url,
-            "metadata":    source_meta,
-            "status":      "ready",
+        source_record = {
+            "id":         source_id,
+            "name":       file_path or url or "unknown",
+            "type":       resolved_type,
+            "created_at": time.time(),
         }
         try:
             self.storage_manager.store(
-                source=source,
-                chunks=chunks,
+                source_record,
+                merged_chunks,
                 embedding_model=self._embed_model,
                 dim=self._embed_dim,
             )
         except Exception as exc:
-            self.ingestion_graph.mark_error(source_id, "indexed", str(exc))
-            raise RuntimeError(f"Ingestion failed at storage stage: {exc}") from exc
+            self.ingestion_graph.mark_error(source_id, stage="store", error=str(exc))
+            raise RuntimeError(f"Storage failed: {exc}") from exc
+        self.ingestion_graph.mark_stage(source_id, "store")
 
-        # ── Step 8: rebuild BM25 sparse index ────────────────────────────────
-        # get_all_chunks_for_bm25() returns [{id, content}, ...] from SQLite
-        # — no dependency on faiss.metadata which doesn't exist.
+        # ── Step 8: rebuild BM25 sparse index ─────────────────────────────────
         try:
             all_chunks = self.storage_manager.get_all_chunks_for_bm25()
             self.hybrid_retriever.build_sparse_index(all_chunks)
         except Exception as exc:
             logger.warning("BM25 rebuild failed (non-fatal): %s", exc)
 
-        self.ingestion_graph.mark_stage(source_id, "indexed", meta={"num_chunks": len(chunks)})
-
-        logger.info(
-            "MasterPipeline.ingest: source_id=%s type=%s chunks=%d",
-            source_id, resolved_type, len(chunks),
-        )
+        self.ingestion_graph.mark_stage(source_id, "complete")
         return {
             "source_id":  source_id,
-            "num_chunks": len(chunks),
-            "profile":    None,
+            "num_chunks": len(merged_chunks),
+            "profile":    result.get("profile"),
         }
 
     # ── Generation ────────────────────────────────────────────────────────────
 
-    def generate(self, query: str, stream: bool = False):
+    def generate(
+        self,
+        query: str,
+        stream: bool = False,
+    ):
         """
-        Generate a response for a user query.
+        Generate a response for *query* against the stored knowledge base.
 
-        Retrieves relevant chunks, hydrates them into LangChain Documents,
-        builds the prompt, calls the LLM, parses the response.
+        Parameters
+        ----------
+        query  : the user's question
+        stream : if True yield token-by-token strings, else return full string
 
-        Phase 5 will replace this method body with a LangGraph graph invocation.
+        Returns
+        -------
+        str  (stream=False)
+        Iterator[str]  (stream=True)
         """
         if not self.llm:
-            raise ValueError("LLM not configured — call set_llm() first.")
+            raise RuntimeError("LLM not configured.  Call set_llm() first.")
 
-        # Cache check
-        cache_key = f"{self.mode}:{query}"
-        if cache_key in self._response_cache and not stream:
-            return self._response_cache[cache_key]
-
-        # Step 1: embed query
+        # ── Embed query ───────────────────────────────────────────────────────
         query_embedding = self.embedder.embed_query(query)
 
-        # Step 2: retrieve — dim-keyed dict for MultiFAISSStore
+        # ── Retrieve ──────────────────────────────────────────────────────────
         raw_results = self.storage_manager.faiss.search(
             query_vectors={self._embed_dim: query_embedding},
             k=self.config.get("retrieval.top_k", 10),
         )
         chunk_ids = [cid for cid, _score in raw_results.get(self._embed_dim, [])]
 
-        # Step 3: hydrate to LangChain Documents
+        # Hydrate chunk IDs → LangChain Documents
         documents = self.storage_manager.get_chunks_as_documents(chunk_ids)
 
-        # Step 4: BM25 fusion (hybrid)
-        retrieved_dicts = [
-            {"content": doc.page_content, "id": doc.metadata.get("chunk_id", ""), **doc.metadata}
-            for doc in documents
-        ]
+        # ── Chat history ──────────────────────────────────────────────────────
+        history_context = self.chat_history.get_history_context(
+            query, max_messages=self.config.get("chat.history_window", 6)
+        )
 
-        # Step 5: chat history context
-        history_context = self.chat_history.get_history_context(query)
+        # ── Build prompt ──────────────────────────────────────────────────────
+        build_fn = {
+            "chat":     self.prompt_builder.build_chat_prompt,
+            "study":    self.prompt_builder.build_study_prompt,
+            "research": self.prompt_builder.build_research_prompt,
+        }.get(self.mode, self.prompt_builder.build_chat_prompt)
 
-        # Step 6: build prompt
-        context = self.prompt_builder.format_context(retrieved_dicts)
+        prompt = build_fn(
+            query=query,
+            documents=documents,
+            history=history_context,
+        )
 
-        if self.mode == "chat":
-            prompt = self.prompt_builder.build_chat_prompt(query, context, history_context)
-        elif self.mode == "deep_research":
-            prompt = self.prompt_builder.build_deep_research_prompt(query, context, history_context)
-        elif self.mode == "study":
-            prompt = self.prompt_builder.build_study_mode_prompt(query, context, [], history_context)
-        else:
-            raise ValueError(f"Unknown mode: '{self.mode}'")
-
-        # Step 7: generate
+        # ── Call LLM ──────────────────────────────────────────────────────────
         if stream:
-            return self._stream_response(prompt, query, retrieved_dicts)
-
-        response_text = self.llm.invoke(prompt)
-        parsed = self.response_parser.parse(response_text)
-
-        # Step 8: persist to chat history
-        source_ids = list({d.get("source_id", "") for d in retrieved_dicts})
-        self.chat_history.add_message("user",      query,                   sources_used=source_ids)
-        self.chat_history.add_message("assistant", parsed["content"],       sources_used=source_ids)
-
-        self._response_cache[cache_key] = parsed["content"]
-        return parsed["content"]
-
-    def _stream_response(
-        self,
-        prompt: str,
-        query: str,
-        retrieved: List[Dict[str, Any]],
-    ) -> Iterator[str]:
-        """Yield response tokens one at a time."""
-        full: List[str] = []
-        for token in self.llm.stream(prompt):
-            full.append(token)
-            yield token
-        complete = "".join(full)
-        self.chat_history.add_message("user",      query)
-        self.chat_history.add_message("assistant", complete)
+            def _stream_and_record() -> Iterator[str]:
+                full = ""
+                for token in self.llm.stream(prompt):
+                    full += token
+                    yield token
+                self.chat_history.add_message("user",      query)
+                self.chat_history.add_message("assistant", full)
+            return _stream_and_record()
+        else:
+            response = self.llm.invoke(prompt)
+            parsed   = self.response_parser.parse(response)
+            self.chat_history.add_message("user",      query)
+            self.chat_history.add_message("assistant", parsed)
+            return parsed
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
-    def clear_cache(self) -> None:
-        """Clear the in-memory response cache."""
-        self._response_cache.clear()
+    def delete_source(self, source_id: str) -> bool:
+        """Remove a source and all its chunks from every store."""
+        try:
+            self.storage_manager.delete_source(source_id)
+            # Rebuild BM25 after deletion
+            all_chunks = self.storage_manager.get_all_chunks_for_bm25()
+            self.hybrid_retriever.build_sparse_index(all_chunks)
+            return True
+        except Exception as exc:
+            logger.error("delete_source(%s) failed: %s", source_id, exc)
+            return False
 
     def get_stats(self) -> Dict[str, Any]:
-        """Return pipeline statistics from all stores."""
+        """Return a snapshot of what is currently stored."""
         return {
-            "mode":       self.mode,
             "session_id": self.session_id,
+            "mode":       self.mode,
+            "embed_dim":  self._embed_dim,
+            "embed_model": self._embed_model,
             "storage":    self.storage_manager.get_stats(),
-            "ingestion":  self.ingestion_graph.get_all_statuses(),
-            "cache_size": len(self._response_cache),
         }
