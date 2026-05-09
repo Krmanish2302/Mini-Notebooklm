@@ -4,47 +4,71 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
+.eggs/
 
-# Data and Storage (MiniNotebookLM specific)
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Environment / secrets
+*.env
+.env.*
+config.yaml
+
+# Data & model artefacts  (never commit these)
 data/
-test/test_reg.db
-test/test_reg_faiss/
-test/test_reg_graph/
-test/*.csv
+*.db
+*.sqlite
+*.sqlite3
+*.faiss
+*.index
+*.pkl
+*.pickle
 
-# Frontend
-frontend/node_modules/
-frontend/dist/
-frontend/.env
-frontend/.env.local
+# Temp media files (the Rick Astley incident)
+*.webm
+*.mp4
+*.mp3
+*.wav
+*.m4a
+tmp_*
+temp_*
 
-# Temporary / Scratch
-scratch/
-temp_*.webm
-text.txt
-
-# IDEs
-.vscode/
+# IDE
 .idea/
+.vscode/
 *.swp
 *.swo
-
-# OS
 .DS_Store
 Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+logs/
+
+# Coverage / test artefacts
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Dev / scratch scripts at repo root (move to scripts/ if needed)
+extract_and_save.py
+extract_missed.py
+extract_missed_v2.py
+exhaustive_extract.py
+text.txt
+cross_check.py
+check_db.py
+add_init.py
+test_reg.db
