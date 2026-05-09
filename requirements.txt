@@ -30,16 +30,19 @@ beautifulsoup4>=4.12.0
 trafilatura>=1.6.0
 crawl4ai>=0.2.0
 
+# YouTube (transcript API — no audio download needed)
+youtube-transcript-api>=0.6.1
+
 # PDF
 pymupdf>=1.23.0
-
-# Video/Audio
-faster-whisper>=0.10.0
-yt-dlp>=2023.10.0
 
 # Data
 pandas>=2.0.0
 numpy>=1.24.0
+
+# API Backend
+fastapi>=0.104.0
+uvicorn>=0.24.0
 
 # UI
 streamlit>=1.28.0
