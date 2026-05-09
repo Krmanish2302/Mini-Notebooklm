@@ -15,6 +15,7 @@ from src.ingestion.pipelines.website_pipeline import WebsitePipeline
 from src.ingestion.pipelines.youtube_pipeline import YouTubePipeline
 from src.ingestion.pipelines.csv_pipeline import CSVPipeline
 from src.ingestion.preprocessing.adaptive_preprocessor import AdaptivePreprocessor
+from src.ingestion.preprocessing.document_profiler import DocumentProfiler
 from src.ingestion.chunking.chunker_registry import ChunkerRegistry
 from src.ingestion.embedding.embedding_pipeline import EmbeddingPipeline
 from src.ingestion.merging.cross_modal_merger import CrossModalMerger
@@ -71,10 +72,9 @@ class MasterPipeline:
         self.graph_storage = GraphStorage()
 
         # Initialize ingestion components
-        # FileDetector is kept as a fallback for bulk/programmatic ingestion
-        # where source_type is not explicitly provided by the caller.
         self.file_detector = FileDetector()
         self.preprocessor = AdaptivePreprocessor()
+        self.document_profiler = DocumentProfiler(chunk_overlap=50)
         self.embedder = EmbeddingPipeline(
             model_name=self.config.get("embedding.default_model", "all-MiniLM-L6-v2")
         )
@@ -143,7 +143,7 @@ class MasterPipeline:
         file_path: str = None,
         url: str = None,
         source_type: str = None,
-    ) -> str:
+    ) -> Dict[str, Any]:
         """
         Ingest a file or URL into the knowledge base.
 
@@ -156,79 +156,131 @@ class MasterPipeline:
         source_type : str, optional
             Explicit type: 'pdf' | 'image' | 'video' | 'audio' | 'website' |
             'youtube' | 'csv'.  When provided the FileDetector is SKIPPED.
-            When None, FileDetector auto-detects the type (fallback path for
-            bulk / CLI / programmatic ingestion).
+            When None, FileDetector auto-detects the type.
 
         Returns
         -------
-        str
-            Unique source_id assigned to the ingested source.
+        Dict with keys:
+            source_id : str   — unique ID for the ingested source
+            profile   : dict  — DocumentProfiler output (PDF only, else None)
+                               Use master_pipeline.document_profiler.get_ui_summary(profile)
+                               to render in Streamlit.
         """
         # ── Step 1: Resolve source_type ──────────────────────────────────────
         if source_type:
-            # Caller explicitly told us the type — trust it, skip FileDetector.
             resolved_type = source_type.lower().strip()
         else:
-            # Fallback: auto-detect (bulk upload, CLI, programmatic ingestion).
             detection = self.file_detector.detect(file_path=file_path, url=url)
             resolved_type = detection["source_type"]
 
         source_id = str(uuid.uuid4())
 
         # ── Step 2: Extract content via the matching pipeline ────────────────
+        try:
+            if resolved_type == "pdf":
+                result = PDFPipeline.process(file_path, source_id)
+            elif resolved_type == "image":
+                result = ImagePipeline.process(file_path, source_id)
+            elif resolved_type in ("video", "audio"):
+                result = VideoAudioPipeline.process(file_path, source_id)
+            elif resolved_type == "website":
+                import asyncio
+                import nest_asyncio
+                nest_asyncio.apply()
+                loop = asyncio.get_event_loop()
+                result = loop.run_until_complete(WebsitePipeline.process(url, source_id))
+            elif resolved_type == "youtube":
+                result = YouTubePipeline.process(url, source_id)
+            elif resolved_type == "csv":
+                result = CSVPipeline.process(file_path, source_id)
+            else:
+                raise ValueError(
+                    f"Unsupported source type: '{resolved_type}'. "
+                    "Valid values: pdf, image, video, audio, website, youtube, csv."
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ingestion failed at pipeline stage for '{resolved_type}': {exc}"
+            ) from exc
+
+        # ── Step 2b: Document Profiling (PDF only) ───────────────────────────
+        # Run before chunking so the profile can inform strategy selection.
+        # For non-PDF sources the profile is None — callers should check.
+        document_profile: Optional[Dict[str, Any]] = None
         if resolved_type == "pdf":
-            result = PDFPipeline.process(file_path, source_id)
-        elif resolved_type == "image":
-            result = ImagePipeline.process(file_path, source_id)
-        elif resolved_type in ("video", "audio"):
-            result = VideoAudioPipeline.process(file_path, source_id)
-        elif resolved_type == "website":
-            import asyncio
-            import nest_asyncio
-            nest_asyncio.apply()          # safe inside Streamlit / Jupyter
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(WebsitePipeline.process(url, source_id))
-        elif resolved_type == "youtube":
-            result = YouTubePipeline.process(url, source_id)
-        elif resolved_type == "csv":
-            result = CSVPipeline.process(file_path, source_id)
-        else:
-            raise ValueError(
-                f"Unsupported source type: '{resolved_type}'. "
-                "Valid values: pdf, image, video, audio, website, youtube, csv."
-            )
+            try:
+                raw_text = result.get("content", "")
+                document_profile = self.document_profiler.profile(
+                    text=raw_text,
+                    source_type="pdf",
+                    file_path=file_path,
+                )
+            except Exception:
+                # Profiling failure is non-fatal — continue with defaults
+                document_profile = None
 
         # ── Step 3: Preprocess ───────────────────────────────────────────────
-        preprocessed = self.preprocessor.process(
-            result["content"], resolved_type, result.get("metadata", {})
-        )
+        try:
+            preprocessed = self.preprocessor.process(
+                result["content"], resolved_type, result.get("metadata", {})
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ingestion failed at preprocessing stage: {exc}"
+            ) from exc
 
         # ── Step 4: Chunk ────────────────────────────────────────────────────
-        strategy = preprocessed["recommendation"]["strategy"]
-        chunker = ChunkerRegistry.get_chunker(strategy)
-        chunks = chunker.chunk(
-            preprocessed["cleaned_content"],
-            {
-                "source_id": source_id,
-                "modality": result["modality"],
-                **result.get("metadata", {}),
-            },
-        )
+        # If DocumentProfiler ran and produced a recommendation, use it.
+        # Otherwise fall back to AdaptivePreprocessor's recommendation.
+        if document_profile and document_profile.get("recommendation"):
+            strategy = document_profile["recommendation"]["strategy"]
+        else:
+            strategy = preprocessed["recommendation"]["strategy"]
+
+        try:
+            chunker = ChunkerRegistry.get_chunker(strategy)
+            chunks = chunker.chunk(
+                preprocessed["cleaned_content"],
+                {
+                    "source_id": source_id,
+                    "modality": result["modality"],
+                    **result.get("metadata", {}),
+                    # embed the profiler recommendation in chunk metadata
+                    "profiler_strategy": strategy,
+                    "profiler_avg_tokens": (
+                        document_profile["recommendation"]["avg_tokens"]
+                        if document_profile else None
+                    ),
+                },
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ingestion failed at chunking stage (strategy='{strategy}'): {exc}"
+            ) from exc
 
         # ── Step 5: Embed ────────────────────────────────────────────────────
-        chunks = self.embedder.embed_chunks(chunks)
+        try:
+            chunks = self.embedder.embed_chunks(chunks)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ingestion failed at embedding stage: {exc}"
+            ) from exc
 
         # ── Step 6: Cross-modal merge ────────────────────────────────────────
         chunks = self.cross_modal_merger.merge(chunks)
 
         # ── Step 7: Store ────────────────────────────────────────────────────
+        source_meta = result.get("metadata", {})
+        if document_profile:
+            source_meta["document_profile"] = document_profile
+
         source = {
             "id": source_id,
-            "title": result.get("metadata", {}).get("title", "Untitled"),
+            "title": source_meta.get("title", "Untitled"),
             "source_type": resolved_type,
             "file_path": file_path,
             "url": url,
-            "metadata": result.get("metadata", {}),
+            "metadata": source_meta,
         }
         self.source_manager.add_source(source, chunks)
 
@@ -237,7 +289,10 @@ class MasterPipeline:
             list(self.faiss_store.metadata.values())
         )
 
-        return source_id
+        return {
+            "source_id": source_id,
+            "profile":   document_profile,
+        }
 
     # ------------------------------------------------------------------
     # Generation
