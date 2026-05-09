@@ -1,0 +1,3655 @@
+```markdown
+# Mini NotebookLM - Detailed Product Requirements Document (PRD)
+
+Document Information
+
+Project Name: Mini NotebookLM
+
+Version: 1.0
+
+Date: May 2026
+
+Python Version: 3.10+
+
+Status: Production-Ready Specification
+
+## 1. EXECUTIVE SUMMARY
+
+Mini NotebookLM is a local-first, multimodal RAG (Retrieval-Augmented Generation) research assistant inspired by Google's NotebookLM. It processes PDFs, images, videos, audio, websites, YouTube videos, and CSV files, converts them into searchable knowledge, and enables intelligent conversations with strict grounding to sources.
+
+**Key Innovation**: Three distinct modes (Chat, Deep Research, Study Mode) with mode-specific retrieval strategies, plus graph-based relationship tracking for educational use cases.
+
+**Target Models for Implementation**: Kimi K2.6 (256K context) [^41^] or Gemini 3 Flash (1M context) [^3^]. PRD is designed to work within 128K-256K context windows to prevent agent hallucination.
+
+---
+
+## 2. SYSTEM ARCHITECTURE OVERVIEW
+
+### 2.1 High-Level Architecture
+
+```
+User Input (File/URL/Query)
+    |
+    v
+[File Detector] --> [Modality Pipeline] --> [Adaptive Preprocessing]
+    |                                              |
+    v                                              v
+[Content Analyzer] <-- [Chunking] <-- [Cross-Modal Merger]
+    |
+    v
+[Embedding Pipeline] --> [Vector Store (FAISS)] + [Graph Store (NetworkX)] + [SQLite Metadata]
+    |
+    v
+[Retrieval System] --> [Generation Layer] --> [Streamlit UI]
+```
+
+### 2.2 Mode-Specific Architecture
+
+**Chat Mode**:
+```
+Query --> RAG Chat History --> HybridRetriever (FAISS + BM25) --> LLM --> Streaming Response
+```
+
+**Deep Research Mode**:
+```
+Query --> Query Expansion --> HybridRetriever --> Contextual Compression --> Reranker --> RAPTOR --> LLM
+```
+
+**Study Mode**:
+```
+Query --> Graph Chat History --> Broad Retrieval (Advanced Pipeline) + Graph Retrieval --> Smart Fusion --> LLM with Learning Path
+```
+
+---
+
+## 3. FOLDER STRUCTURE (EXACT)
+
+```
+MiniNotebookLM/
+├── src/
+│   ├── __init__.py
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── config.py              # Configuration management
+│   │   ├── models.py              # Pydantic data models
+│   │   └── exceptions.py          # Custom exceptions
+│   ├── ingestion/
+│   │   ├── __init__.py
+│   │   ├── file_detector.py       # Detect file type and route
+│   │   ├── ingestion_graph.py     # LangGraph orchestration (10 nodes)
+│   │   ├── pipelines/
+│   │   │   ├── __init__.py
+│   │   │   ├── pdf_pipeline.py           # PyMuPDF extraction
+│   │   │   ├── image_pipeline.py         # LLaVA via Ollama captioning
+│   │   │   ├── video_audio_pipeline.py   # faster-whisper + ffmpeg
+│   │   │   ├── website_pipeline.py       # Crawl4AI + trafilatura
+│   │   │   ├── youtube_pipeline.py       # yt-dlp + whisper
+│   │   │   └── csv_pipeline.py           # pandas extraction
+│   │   ├── preprocessing/
+│   │   │   ├── __init__.py
+│   │   │   ├── adaptive_preprocessor.py  # Main preprocessing router
+│   │   │   ├── content_analyzer.py       # Sample + token estimation
+│   │   │   └── source_cleaners/
+│   │   │       ├── __init__.py
+│   │   │       ├── pdf_cleaner.py
+│   │   │       ├── website_cleaner.py
+│   │   │       └── youtube_cleaner.py
+│   │   ├── chunking/
+│   │   │   ├── __init__.py
+│   │   │   ├── base_chunker.py           # Abstract interface
+│   │   │   ├── chunker_registry.py       # Pluggable registry
+│   │   │   ├── recursive_chunker.py      # Default - LangChain
+│   │   │   ├── semantic_chunker.py       # LangChain implementation
+│   │   │   ├── late_chunker.py           # Embed-first strategy
+│   │   │   ├── hierarchical_chunker.py   # Parent-child chunks
+│   │   │   ├── adaptive_chunker.py       # Auto-select strategy
+│   │   │   ├── page_chunker.py
+│   │   │   ├── chapter_chunker.py
+│   │   │   └── paragraph_chunker.py
+│   │   ├── embedding/
+│   │   │   ├── __init__.py
+│   │   │   ├── base_embedder.py
+│   │   │   ├── text_embedder.py          # all-MiniLM-L6-v2 + configurable
+│   │   │   ├── embedding_pipeline.py     # Batch + caching
+│   │   │   └── embedding_registry.py     # Model switching
+│   │   └── merging/
+│   │       ├── __init__.py
+│   │       └── cross_modal_merger.py     # Link related chunks
+│   ├── retrieval/
+│   │   ├── __init__.py
+│   │   ├── hybrid_retriever.py           # FAISS + BM25 + RRF
+│   │   ├── contextual_compressor.py      # Extract relevant sentences
+│   │   ├── reranker.py                   # Cross-encoder scoring
+│   │   ├── advanced_retriever.py         # Query expansion + RAPTOR
+│   │   ├── study_mode.py                 # Smart Fusion engine
+│   │   └── query_graph.py                # LangGraph for retrieval
+│   ├── graph/
+│   │   ├── __init__.py
+│   │   ├── graph_storage.py              # NetworkX knowledge graph
+│   │   ├── graph_retriever.py            # Relationship-based retrieval
+│   │   └── visual_graph.py               # Matplotlib visualization
+│   ├── generation/
+│   │   ├── __init__.py
+│   │   ├── llm_client.py                 # LangChain init_chat_model
+│   │   ├── prompt_builder.py             # Mode-specific prompts
+│   │   └── response_parser.py            # Citation extraction
+│   ├── chat_history/
+│   │   ├── __init__.py
+│   │   ├── rag_history.py                # Vector-based history
+│   │   ├── graph_history.py              # Graph-based history
+│   │   └── chat_history_manager.py       # Unified interface
+│   ├── agents/
+│   │   ├── __init__.py
+│   │   └── web_search_agent.py           # DuckDuckGo search
+│   ├── storage/
+│   │   ├── __init__.py
+│   │   ├── faiss_store.py                # FAISS vector operations
+│   │   ├── sqlite_manager.py             # SQLite metadata
+│   │   └── source_manager.py             # Add/remove sources
+│   └── ui/
+│       ├── __init__.py
+│       └── components.py                 # Reusable UI components
+├── app.py                                  # Streamlit entry point
+├── backend.py                              # Backend orchestrator
+├── config.yaml                             # Main configuration
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── check/                                  # Test notebooks (CRITICAL)
+│   ├── __init__.py
+│   ├── test_01_file_detector.ipynb
+│   ├── test_02_pdf_pipeline.ipynb
+│   ├── test_03_image_pipeline.ipynb
+│   ├── test_04_video_pipeline.ipynb
+│   ├── test_05_website_pipeline.ipynb
+│   ├── test_06_youtube_pipeline.ipynb
+│   ├── test_07_csv_pipeline.ipynb
+│   ├── test_08_adaptive_preprocessor.ipynb
+│   ├── test_09_content_analyzer.ipynb
+│   ├── test_10_chunkers.ipynb
+│   ├── test_11_embedding.ipynb
+│   ├── test_12_cross_modal_merger.ipynb
+│   ├── test_13_hybrid_retriever.ipynb
+│   ├── test_14_contextual_compressor.ipynb
+│   ├── test_15_reranker.ipynb
+│   ├── test_16_advanced_retriever.ipynb
+│   ├── test_17_study_mode.ipynb
+│   ├── test_18_graph_storage.ipynb
+│   ├── test_19_llm_client.ipynb
+│   ├── test_20_prompt_builder.ipynb
+│   ├── test_21_chat_history.ipynb
+│   ├── test_22_web_search.ipynb
+│   ├── test_23_source_manager.ipynb
+│   ├── test_24_full_pipeline.ipynb
+│   └── test_25_ui_integration.ipynb
+├── data/                                   # Runtime data (gitignored)
+│   ├── uploads/
+│   ├── vector_store/
+│   ├── knowledge_graph/
+│   ├── chat_history/
+│   ├── cache/
+│   └── logs/
+└── docs/
+    ├── ARCHITECTURE.md
+    └── API_REFERENCE.md
+```
+
+---
+
+## 4. PHASE-BY-PHASE IMPLEMENTATION
+
+### PHASE 1: PROJECT SETUP & CONFIGURATION
+
+**Goal**: Initialize project structure and configuration.
+
+**Files to Create**:
+1. `config.yaml` - Main configuration file
+2. `src/core/config.py` - Configuration loader
+3. `src/core/models.py` - Pydantic models
+4. `src/core/exceptions.py` - Custom exceptions
+5. `requirements.txt` - Dependencies
+6. `Dockerfile` - Container setup
+
+**Configuration Schema (config.yaml)**:
+```yaml
+project:
+  name: "MiniNotebookLM"
+  version: "1.0"
+  debug: false
+
+embedding:
+  default_model: "all-MiniLM-L6-v2"
+  dimension: 384
+  batch_size: 32
+  cache_enabled: true
+  available_models:
+    - "all-MiniLM-L6-v2"
+    - "nomic-embed-text-v1.5"
+    - "jina-embeddings-v3"
+
+chunking:
+  default_strategy: "recursive"
+  max_tokens: 384
+  overlap: 50
+  available_strategies:
+    - "recursive"
+    - "semantic"
+    - "late"
+    - "hierarchical"
+    - "adaptive"
+    - "page"
+    - "chapter"
+    - "paragraph"
+
+retrieval:
+  top_k: 5
+  similarity_threshold: 0.75
+  hybrid_weight_dense: 0.7
+  hybrid_weight_sparse: 0.3
+  rrf_k: 60
+
+llm:
+  default_provider: "groq"
+  default_model: "llama-3.1-70b-versatile"
+  temperature: 0.7
+  top_p: 0.9
+  max_tokens: 1024
+  streaming: true
+  strict_grounding: true
+
+storage:
+  vector_store: "faiss"
+  metadata_db: "sqlite"
+  graph_store: "networkx"
+  persist_directory: "./data"
+
+modes:
+  available:
+    - "chat"
+    - "deep_research"
+    - "study"
+  default: "chat"
+
+web_search:
+  engine: "duckduckgo"
+  max_results: 10
+  timeout: 30
+```
+
+**AFTER CREATING THESE FILES**:
+- [ ] Run `pip install -r requirements.txt`
+- [ ] Verify imports work
+- [ ] Create `check/test_00_config.ipynb` to test configuration loading
+
+**CONNECT TO PIPELINE**: These files are foundational. No pipeline connection yet.
+
+---
+
+### PHASE 2: DATA MODELS & EXCEPTIONS
+
+**Goal**: Define all data structures used across the system.
+
+**File**: `src/core/models.py`
+
+**Models to Implement**:
+```python
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Any, Literal
+from datetime import datetime
+import numpy as np
+
+class Source(BaseModel):
+    """Represents an uploaded or searched source."""
+    id: str
+    title: str
+    source_type: Literal["pdf", "image", "video", "audio", "website", "youtube", "csv", "text"]
+    file_path: Optional[str] = None
+    url: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=datetime.now)
+    status: Literal["processing", "ready", "error"] = "processing"
+
+class Chunk(BaseModel):
+    """Represents a text chunk with embedding."""
+    id: str
+    source_id: str
+    content: str
+    modality: Literal["text", "image_caption", "transcript", "table"]
+    embedding: Optional[List[float]] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    related_chunks: List[str] = Field(default_factory=list)
+    page_number: Optional[int] = None
+    timestamp: Optional[str] = None
+
+class Query(BaseModel):
+    """User query with mode and context."""
+    text: str
+    mode: Literal["chat", "deep_research", "study"] = "chat"
+    session_id: str
+    source_ids: Optional[List[str]] = None
+    history_context: Optional[str] = None
+
+class RetrievedChunk(BaseModel):
+    """Chunk retrieved from vector store."""
+    chunk: Chunk
+    score: float
+    retrieval_method: Literal["dense", "sparse", "graph", "hybrid"]
+
+class Citation(BaseModel):
+    """Citation with source reference."""
+    text: str
+    source_id: str
+    chunk_id: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+class LLMResponse(BaseModel):
+    """Structured LLM response."""
+    content: str
+    citations: List[Citation] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
+    mode: str
+    tokens_used: int
+    latency_ms: float
+
+class ChatMessage(BaseModel):
+    """Single chat message."""
+    id: str
+    session_id: str
+    role: Literal["user", "assistant", "system"]
+    content: str
+    timestamp: datetime = Field(default_factory=datetime.now)
+    sources_used: List[str] = Field(default_factory=list)
+
+class Session(BaseModel):
+    """Chat session."""
+    id: str
+    mode: Literal["chat", "deep_research", "study"]
+    created_at: datetime = Field(default_factory=datetime.now)
+    messages: List[ChatMessage] = Field(default_factory=list)
+    active_sources: List[str] = Field(default_factory=list)
+```
+
+**File**: `src/core/exceptions.py`
+```python
+class MiniNotebookLMError(Exception):
+    """Base exception."""
+    pass
+
+class IngestionError(MiniNotebookLMError):
+    """File processing failed."""
+    pass
+
+class RetrievalError(MiniNotebookLMError):
+    """Search failed."""
+    pass
+
+class GenerationError(MiniNotebookLMError):
+    """LLM call failed."""
+    pass
+
+class StorageError(MiniNotebookLMError):
+    """Database operation failed."""
+    pass
+
+class ConfigurationError(MiniNotebookLMError):
+    """Invalid configuration."""
+    pass
+```
+
+**AFTER CREATING THESE FILES**:
+- [ ] Create `check/test_01_models.ipynb`
+- [ ] Test all model instantiations
+- [ ] Verify validation works
+
+**CONNECT TO PIPELINE**: These models are imported by ALL other modules. Ensure they work before proceeding.
+
+---
+
+### PHASE 3: FILE DETECTION & ROUTING
+
+**Goal**: Detect file type and route to correct pipeline.
+
+**File**: `src/ingestion/file_detector.py`
+
+**Implementation**:
+```python
+import magic
+import os
+from pathlib import Path
+from typing import Dict, Any, Literal
+from urllib.parse import urlparse
+import re
+
+class FileDetector:
+    """Detects file type and returns routing information."""
+    
+    SUPPORTED_TYPES = {
+        'pdf': ['application/pdf'],
+        'image': ['image/jpeg', 'image/png', 'image/webp', 'image/gif'],
+        'video': ['video/mp4', 'video/avi', 'video/mov'],
+        'audio': ['audio/mp3', 'audio/wav', 'audio/m4a'],
+        'csv': ['text/csv', 'application/vnd.ms-excel'],
+        'text': ['text/plain', 'text/markdown']
+    }
+    
+    @staticmethod
+    def detect(file_path: str = None, url: str = None) -> Dict[str, Any]:
+        """
+        Detect source type from file path or URL.
+        Returns: {"source_type": str, "mime_type": str, "handler": str}
+        """
+        if url:
+            return FileDetector._detect_from_url(url)
+        elif file_path:
+            return FileDetector._detect_from_file(file_path)
+        else:
+            raise ValueError("Either file_path or url must be provided")
+    
+    @staticmethod
+    def _detect_from_file(file_path: str) -> Dict[str, Any]:
+        mime = magic.from_file(file_path, mime=True)
+        ext = Path(file_path).suffix.lower()
+        
+        for source_type, mimes in FileDetector.SUPPORTED_TYPES.items():
+            if mime in mimes:
+                return {
+                    "source_type": source_type,
+                    "mime_type": mime,
+                    "file_path": file_path,
+                    "handler": f"{source_type}_pipeline"
+                }
+        
+        # Fallback to extension
+        if ext in ['.pdf']:
+            return {"source_type": "pdf", "mime_type": "application/pdf", "file_path": file_path, "handler": "pdf_pipeline"}
+        elif ext in ['.jpg', '.jpeg', '.png', '.webp']:
+            return {"source_type": "image", "mime_type": f"image/{ext[1:]}", "file_path": file_path, "handler": "image_pipeline"}
+        elif ext in ['.mp4', '.avi', '.mov']:
+            return {"source_type": "video", "mime_type": f"video/{ext[1:]}", "file_path": file_path, "handler": "video_pipeline"}
+        elif ext in ['.mp3', '.wav', '.m4a']:
+            return {"source_type": "audio", "mime_type": f"audio/{ext[1:]}", "file_path": file_path, "handler": "audio_pipeline"}
+        elif ext in ['.csv', '.xlsx']:
+            return {"source_type": "csv", "mime_type": "text/csv", "file_path": file_path, "handler": "csv_pipeline"}
+        elif ext in ['.txt', '.md']:
+            return {"source_type": "text", "mime_type": "text/plain", "file_path": file_path, "handler": "text_pipeline"}
+        
+        raise IngestionError(f"Unsupported file type: {mime} / {ext}")
+    
+    @staticmethod
+    def _detect_from_url(url: str) -> Dict[str, Any]:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        
+        # YouTube detection
+        if 'youtube.com' in domain or 'youtu.be' in domain:
+            return {
+                "source_type": "youtube",
+                "mime_type": "text/html",
+                "url": url,
+                "handler": "youtube_pipeline"
+            }
+        
+        # Website detection
+        return {
+            "source_type": "website",
+            "mime_type": "text/html",
+            "url": url,
+            "handler": "website_pipeline"
+        }
+```
+
+**AFTER CREATING THIS FILE**:
+- [ ] Create `check/test_02_file_detector.ipynb`
+- [ ] Test with sample PDF, image, URL
+- [ ] Verify YouTube URL detection
+- [ ] Test error handling for unsupported files
+
+**CONNECT TO PIPELINE**: This is the entry point. All ingestion flows through here.
+
+---
+
+### PHASE 4: MODALITY PIPELINES
+
+**Goal**: Extract content from different file types.
+
+**CRITICAL**: Implement ONE pipeline at a time. Test each before moving to next.
+
+#### 4.1 PDF Pipeline
+
+**File**: `src/ingestion/pipelines/pdf_pipeline.py`
+
+```python
+import fitz  # PyMuPDF
+from typing import Dict, Any, List
+from src.core.models import Source
+
+class PDFPipeline:
+    """Extracts text from PDF with page numbers."""
+    
+    @staticmethod
+    def process(file_path: str, source_id: str) -> Dict[str, Any]:
+        """
+        Process PDF file.
+        Returns: {"content": str, "pages": List[Dict], "metadata": Dict}
+        """
+        doc = fitz.open(file_path)
+        pages = []
+        full_text = []
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text()
+            pages.append({
+                "page_number": page_num + 1,
+                "text": text,
+                "word_count": len(text.split())
+            })
+            full_text.append(f"[Page {page_num + 1}]\n{text}")
+        
+        metadata = {
+            "total_pages": len(doc),
+            "title": doc.metadata.get("title", ""),
+            "author": doc.metadata.get("author", ""),
+            "source_id": source_id
+        }
+        
+        doc.close()
+        
+        return {
+            "content": "\n\n".join(full_text),
+            "pages": pages,
+            "metadata": metadata,
+            "modality": "text"
+        }
+```
+
+**AFTER CREATING**: Test with `check/test_03_pdf_pipeline.ipynb`
+
+#### 4.2 Image Pipeline
+
+**File**: `src/ingestion/pipelines/image_pipeline.py`
+
+```python
+import base64
+import requests
+from typing import Dict, Any
+
+class ImagePipeline:
+    """Generates captions using LLaVA via Ollama."""
+    
+    OLLAMA_URL = "http://localhost:11434/api/generate"
+    DEFAULT_MODEL = "llava"
+    
+    @staticmethod
+    def process(file_path: str, source_id: str) -> Dict[str, Any]:
+        with open(file_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode()
+        
+        prompt = "Describe this image in detail. What is shown? What text is visible?"
+        
+        try:
+            response = requests.post(
+                ImagePipeline.OLLAMA_URL,
+                json={
+                    "model": ImagePipeline.DEFAULT_MODEL,
+                    "prompt": prompt,
+                    "images": [image_data],
+                    "stream": False
+                },
+                timeout=120
+            )
+            response.raise_for_status()
+            caption = response.json().get("response", "")
+            
+            return {
+                "content": caption,
+                "metadata": {
+                    "source_file": file_path,
+                    "model_used": ImagePipeline.DEFAULT_MODEL,
+                    "source_id": source_id
+                },
+                "modality": "image_caption"
+            }
+        except Exception as e:
+            # Fallback: return basic metadata if Ollama not available
+            return {
+                "content": f"[Image: {file_path}]",
+                "metadata": {"error": str(e), "source_id": source_id},
+                "modality": "image_caption"
+            }
+```
+
+**AFTER CREATING**: Test with `check/test_04_image_pipeline.ipynb`
+
+#### 4.3 Video/Audio Pipeline
+
+**File**: `src/ingestion/pipelines/video_audio_pipeline.py`
+
+```python
+import subprocess
+from faster_whisper import WhisperModel
+from typing import Dict, Any
+import os
+
+class VideoAudioPipeline:
+    """Transcribes video/audio using faster-whisper."""
+    
+    MODEL = WhisperModel("base", device="cpu", compute_type="int8")
+    
+    @staticmethod
+    def process(file_path: str, source_id: str) -> Dict[str, Any]:
+        # Extract audio if video
+        audio_path = file_path
+        if file_path.endswith(('.mp4', '.avi', '.mov')):
+            audio_path = file_path.rsplit('.', 1)[0] + '.wav'
+            subprocess.run([
+                'ffmpeg', '-i', file_path, '-vn', '-acodec', 'pcm_s16le', 
+                '-ar', '16000', '-ac', '1', audio_path
+            ], check=True, capture_output=True)
+        
+        segments, info = VideoAudioPipeline.MODEL.transcribe(audio_path, beam_size=5)
+        
+        transcript_parts = []
+        for segment in segments:
+            timestamp = f"[{int(segment.start // 60):02d}:{int(segment.start % 60):02d}]"
+            transcript_parts.append(f"{timestamp} {segment.text}")
+        
+        # Cleanup temp audio
+        if audio_path != file_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+        
+        return {
+            "content": "\n".join(transcript_parts),
+            "metadata": {
+                "language": info.language,
+                "duration": info.duration,
+                "source_id": source_id
+            },
+            "modality": "transcript"
+        }
+```
+
+**AFTER CREATING**: Test with `check/test_05_video_pipeline.ipynb`
+
+#### 4.4 Website Pipeline
+
+**File**: `src/ingestion/pipelines/website_pipeline.py`
+
+```python
+import trafilatura
+from crawl4ai import AsyncWebCrawler
+from typing import Dict, Any
+
+class WebsitePipeline:
+    """Extracts clean text from websites."""
+    
+    @staticmethod
+    async def process(url: str, source_id: str) -> Dict[str, Any]:
+        # Try Crawl4AI first
+        try:
+            async with AsyncWebCrawler() as crawler:
+                result = await crawler.arun(url=url)
+                content = result.markdown
+        except:
+            # Fallback to trafilatura
+            import requests
+            response = requests.get(url, timeout=30)
+            content = trafilatura.extract(response.text) or ""
+        
+        return {
+            "content": content,
+            "metadata": {
+                "url": url,
+                "word_count": len(content.split()),
+                "source_id": source_id
+            },
+            "modality": "text"
+        }
+```
+
+**AFTER CREATING**: Test with `check/test_06_website_pipeline.ipynb`
+
+#### 4.5 YouTube Pipeline
+
+**File**: `src/ingestion/pipelines/youtube_pipeline.py`
+
+```python
+import yt_dlp
+from faster_whisper import WhisperModel
+from typing import Dict, Any
+import os
+
+class YouTubePipeline:
+    """Downloads audio and transcribes YouTube videos."""
+    
+    WHISPER = WhisperModel("base", device="cpu", compute_type="int8")
+    
+    @staticmethod
+    def process(url: str, source_id: str) -> Dict[str, Any]:
+        # Download audio
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'wav',
+                'preferredquality': '192',
+            }],
+            'outtmpl': 'temp_%(id)s.%(ext)s'
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            audio_path = f"temp_{info['id']}.wav"
+        
+        # Transcribe
+        segments, _ = YouTubePipeline.WHISPER.transcribe(audio_path, beam_size=5)
+        transcript = "\n".join([f"[{int(s.start // 60):02d}:{int(s.start % 60):02d}] {s.text}" for s in segments])
+        
+        # Cleanup
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+        
+        return {
+            "content": transcript,
+            "metadata": {
+                "title": info.get("title", ""),
+                "uploader": info.get("uploader", ""),
+                "duration": info.get("duration", 0),
+                "source_id": source_id
+            },
+            "modality": "transcript"
+        }
+```
+
+**AFTER CREATING**: Test with `check/test_07_youtube_pipeline.ipynb`
+
+#### 4.6 CSV Pipeline
+
+**File**: `src/ingestion/pipelines/csv_pipeline.py`
+
+```python
+import pandas as pd
+from typing import Dict, Any
+
+class CSVPipeline:
+    """Extracts structured data from CSV/Excel."""
+    
+    @staticmethod
+    def process(file_path: str, source_id: str) -> Dict[str, Any]:
+        df = pd.read_csv(file_path) if file_path.endswith('.csv') else pd.read_excel(file_path)
+        
+        description = f"""
+Dataset: {file_path}
+Shape: {df.shape[0]} rows x {df.shape[1]} columns
+Columns: {', '.join(df.columns.tolist())}
+
+Sample Data:
+{df.head(5).to_markdown()}
+
+Statistics:
+{df.describe().to_markdown()}
+"""
+        
+        return {
+            "content": description,
+            "metadata": {
+                "shape": df.shape,
+                "columns": df.columns.tolist(),
+                "source_id": source_id
+            },
+            "modality": "table"
+        }
+```
+
+**AFTER CREATING**: Test with `check/test_08_csv_pipeline.ipynb`
+
+**CONNECT TO PIPELINE**: All pipelines must return consistent format:
+```json
+{
+    "content": str,           // Extracted text/content
+    "metadata": dict,         // Source metadata
+    "modality": str           // "text" | "image_caption" | "transcript" | "table"
+}
+```
+
+---
+
+### PHASE 5: ADAPTIVE PREPROCESSING
+
+**Goal**: Clean and analyze content before chunking.
+
+#### 5.1 Content Analyzer
+
+**File**: `src/ingestion/preprocessing/content_analyzer.py`
+
+```python
+import re
+from typing import Dict, Any
+
+class ContentAnalyzer:
+    """Analyzes content to recommend chunking strategy."""
+    
+    def __init__(self, sample_pages: int = 15, embedding_model_max_tokens: int = 384):
+        self.sample_pages = sample_pages
+        self.embedding_model_max_tokens = embedding_model_max_tokens
+    
+    def analyze(self, content: str, source_type: str) -> Dict[str, Any]:
+        """
+        Analyze content and recommend chunking strategy.
+        Returns analysis with token estimates and strategy recommendation.
+        """
+        # Sample first N pages/paragraphs
+        sample = self._get_sample(content)
+        
+        # Token estimation (rough: 1 token ≈ 0.75 words)
+        words = sample.split()
+        estimated_tokens = int(len(words) / 0.75)
+        paragraphs = [p for p in sample.split('\n\n') if p.strip()]
+        
+        avg_tokens_per_paragraph = estimated_tokens // max(len(paragraphs), 1)
+        
+        # Detect structure
+        has_chapters = bool(re.search(r'^(Chapter|CHAPTER)\s+\d+', sample, re.MULTILINE))
+        has_page_markers = '[Page' in content
+        
+        # Recommend strategy based on source type and structure
+        recommendation = self._recommend_strategy(
+            source_type, has_chapters, has_page_markers, avg_tokens_per_paragraph
+        )
+        
+        return {
+            "sampled_length": len(sample),
+            "estimated_tokens": estimated_tokens,
+            "avg_tokens_per_paragraph": avg_tokens_per_paragraph,
+            "paragraph_count": len(paragraphs),
+            "structure": {
+                "has_chapters": has_chapters,
+                "has_page_markers": has_page_markers,
+                "has_headings": bool(re.search(r'^#{1,3}\s', sample, re.MULTILINE))
+            },
+            "recommendation": recommendation
+        }
+    
+    def _get_sample(self, content: str) -> str:
+        """Get representative sample of content."""
+        paragraphs = content.split('\n\n')
+        if len(paragraphs) <= self.sample_pages:
+            return content
+        return '\n\n'.join(paragraphs[:self.sample_pages])
+    
+    def _recommend_strategy(self, source_type: str, has_chapters: bool, 
+                           has_page_markers: bool, avg_tokens: int) -> Dict[str, Any]:
+        """Recommend chunking strategy."""
+        if source_type == "website":
+            return {
+                "strategy": "topic_based",
+                "reason": "Website content benefits from topic-based chunking",
+                "chunk_size": "Topic/section based"
+            }
+        elif source_type == "youtube":
+            return {
+                "strategy": "semantic",
+                "reason": "YouTube transcripts are plain text",
+                "chunk_size": f"~{self.embedding_model_max_tokens} tokens"
+            }
+        elif has_chapters:
+            return {
+                "strategy": "chapter",
+                "reason": "Document has clear chapter structure",
+                "chunk_size": "1 chapter per chunk"
+            }
+        elif has_page_markers and avg_tokens > 200:
+            return {
+                "strategy": "page",
+                "reason": "Document has page markers with dense content",
+                "chunk_size": "1 page per chunk"
+            }
+        else:
+            return {
+                "strategy": "recursive",
+                "reason": "Default safe strategy",
+                "chunk_size": f"{self.embedding_model_max_tokens} tokens with overlap"
+            }
+```
+
+#### 5.2 Source Cleaners
+
+**Files**:
+- `src/ingestion/preprocessing/source_cleaners/pdf_cleaner.py`
+- `src/ingestion/preprocessing/source_cleaners/website_cleaner.py`
+- `src/ingestion/preprocessing/source_cleaners/youtube_cleaner.py`
+
+**PDF Cleaner**:
+```python
+import re
+
+class PDFCleaner:
+    """Cleans PDF text artifacts."""
+    
+    @staticmethod
+    def clean(text: str) -> str:
+        # Normalize page markers
+        text = re.sub(r'\[Page\s*(\d+)\]', r'\n\n## Page \1\n', text)
+        # Remove excessive whitespace
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        # Fix hyphenation
+        text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
+        return text.strip()
+```
+
+**Website Cleaner**:
+```python
+import re
+
+class WebsiteCleaner:
+    """Removes boilerplate from websites."""
+    
+    PATTERNS = [
+        r'(?i)(accept cookies|cookie policy|privacy policy).*',
+        r'(?i)(subscribe|sign up|newsletter).*',
+        r'(?i)(all rights reserved|copyright ©).*',
+        r'(?i)(share this|follow us on|connect with us).*',
+        r'(?i)(advertisement|sponsored content).*'
+    ]
+    
+    @staticmethod
+    def clean(text: str) -> str:
+        for pattern in WebsiteCleaner.PATTERNS:
+            text = re.sub(pattern, '', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+```
+
+**YouTube Cleaner**:
+```python
+import re
+
+class YouTubeCleaner:
+    """Cleans transcript formatting."""
+    
+    @staticmethod
+    def clean(text: str) -> str:
+        # Keep timestamps but normalize
+        text = re.sub(r'\[(\d+):?(\d*):?(\d*)\]', r'[\1:\2]', text)
+        # Remove music notes
+        text = re.sub(r'♪.*?♪', '', text)
+        return text.strip()
+```
+
+#### 5.3 Adaptive Preprocessor (Main Router)
+
+**File**: `src/ingestion/preprocessing/adaptive_preprocessor.py`
+
+```python
+from typing import Dict, Any
+from .content_analyzer import ContentAnalyzer
+from .source_cleaners.pdf_cleaner import PDFCleaner
+from .source_cleaners.website_cleaner import WebsiteCleaner
+from .source_cleaners.youtube_cleaner import YouTubeCleaner
+
+class AdaptivePreprocessor:
+    """Routes content to appropriate cleaner and analyzer."""
+    
+    def __init__(self):
+        self.analyzer = ContentAnalyzer()
+        self.cleaners = {
+            "pdf": PDFCleaner(),
+            "website": WebsiteCleaner(),
+            "youtube": YouTubeCleaner()
+        }
+    
+    def process(self, content: str, source_type: str, metadata: Dict = None) -> Dict[str, Any]:
+        """
+        Main preprocessing entry point.
+        Returns: {"cleaned_content": str, "analysis": dict, "recommendation": dict}
+        """
+        # Clean based on source type
+        cleaner = self.cleaners.get(source_type)
+        cleaned = cleaner.clean(content) if cleaner else content
+        
+        # Analyze
+        analysis = self.analyzer.analyze(cleaned, source_type)
+        
+        return {
+            "cleaned_content": cleaned,
+            "analysis": analysis,
+            "recommendation": analysis["recommendation"],
+            "preprocessing_applied": [source_type + "_cleaning", "content_analysis"]
+        }
+```
+
+**AFTER CREATING ALL PREPROCESSING FILES**:
+- [ ] Create `check/test_09_preprocessing.ipynb`
+- [ ] Test with PDF, website, YouTube samples
+- [ ] Verify strategy recommendations
+
+**CONNECT TO PIPELINE**: Preprocessing sits between pipeline extraction and chunking.
+
+---
+
+### PHASE 6: CHUNKING SYSTEM
+
+**Goal**: Split content into embeddable chunks using multiple strategies.
+
+**CRITICAL**: Use LangChain for semantic/recursive chunking to avoid reimplementation.
+
+#### 6.1 Base Chunker
+
+**File**: `src/ingestion/chunking/base_chunker.py`
+
+```python
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any
+
+class BaseChunker(ABC):
+    """Abstract base for all chunkers."""
+    
+    @abstractmethod
+    def chunk(self, content: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """Split content into chunks. Returns list of chunk dicts."""
+        pass
+    
+    @abstractmethod
+    def get_strategy_name(self) -> str:
+        pass
+```
+
+#### 6.2 Recursive Chunker (DEFAULT)
+
+**File**: `src/ingestion/chunking/recursive_chunker.py`
+
+```python
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from .base_chunker import BaseChunker
+from typing import List, Dict, Any
+
+class RecursiveChunker(BaseChunker):
+    """Default chunker using LangChain's recursive splitter."""
+    
+    def __init__(self, chunk_size: int = 384, chunk_overlap: int = 50):
+        self.splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+    
+    def chunk(self, content: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        docs = self.splitter.create_documents([content])
+        chunks = []
+        for i, doc in enumerate(docs):
+            chunks.append({
+                "id": f"{metadata.get('source_id', 'unknown')}_chunk_{i}",
+                "content": doc.page_content,
+                "metadata": {**(metadata or {}), "chunk_index": i},
+                "modality": metadata.get("modality", "text")
+            })
+        return chunks
+    
+    def get_strategy_name(self) -> str:
+        return "recursive"
+```
+
+#### 6.3 Semantic Chunker
+
+**File**: `src/ingestion/chunking/semantic_chunker.py`
+
+```python
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain.embeddings import HuggingFaceEmbeddings
+from .base_chunker import BaseChunker
+from typing import List, Dict, Any
+
+class SemanticChunker(BaseChunker):
+    """Chunks based on semantic similarity using embeddings."""
+    
+    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2", 
+                 breakpoint_threshold: float = 0.85):
+        embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
+        self.splitter = SemanticChunker(
+            embeddings=embeddings,
+            breakpoint_threshold_type="percentile",
+            breakpoint_threshold_amount=breakpoint_threshold
+        )
+    
+    def chunk(self, content: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        docs = self.splitter.create_documents([content])
+        chunks = []
+        for i, doc in enumerate(docs):
+            chunks.append({
+                "id": f"{metadata.get('source_id', 'unknown')}_chunk_{i}",
+                "content": doc.page_content,
+                "metadata": {**(metadata or {}), "chunk_index": i},
+                "modality": metadata.get("modality", "text")
+            })
+        return chunks
+    
+    def get_strategy_name(self) -> str:
+        return "semantic"
+```
+
+#### 6.4 Late Chunker
+
+**File**: `src/ingestion/chunking/late_chunker.py`
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from .base_chunker import BaseChunker
+from typing import List, Dict, Any
+
+class LateChunker(BaseChunker):
+    """
+    Embed entire document first, then chunk.
+    This preserves global context in each chunk.
+    """
+    
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", 
+                 chunk_size: int = 384, overlap: int = 50):
+        self.model = SentenceTransformer(model_name)
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+    
+    def chunk(self, content: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        # Step 1: Embed entire document
+        doc_embedding = self.model.encode(content)
+        
+        # Step 2: Chunk with overlap
+        words = content.split()
+        chunks = []
+        step = self.chunk_size - self.overlap
+        
+        for i in range(0, len(words), step):
+            chunk_words = words[i:i + self.chunk_size]
+            chunk_text = " ".join(chunk_words)
+            
+            # Step 3: Each chunk gets document-level context
+            chunks.append({
+                "id": f"{metadata.get('source_id', 'unknown')}_chunk_{i}",
+                "content": chunk_text,
+                "metadata": {
+                    **(metadata or {}),
+                    "chunk_index": i // step,
+                    "doc_embedding": doc_embedding.tolist(),  # Global context
+                    "late_chunking": True
+                },
+                "modality": metadata.get("modality", "text")
+            })
+        
+        return chunks
+    
+    def get_strategy_name(self) -> str:
+        return "late"
+```
+
+#### 6.5 Hierarchical Chunker
+
+**File**: `src/ingestion/chunking/hierarchical_chunker.py`
+
+```python
+from .base_chunker import BaseChunker
+from typing import List, Dict, Any
+
+class HierarchicalChunker(BaseChunker):
+    """
+    Creates parent-child chunk relationships.
+    Parent = large section, Children = smaller chunks within.
+    """
+    
+    def __init__(self, parent_size: int = 1000, child_size: int = 200, overlap: int = 50):
+        self.parent_size = parent_size
+        self.child_size = child_size
+        self.overlap = overlap
+    
+    def chunk(self, content: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        words = content.split()
+        chunks = []
+        parent_idx = 0
+        
+        for i in range(0, len(words), self.parent_size):
+            parent_words = words[i:i + self.parent_size]
+            parent_text = " ".join(parent_words)
+            parent_id = f"{metadata.get('source_id', 'unknown')}_parent_{parent_idx}"
+            
+            # Create child chunks within parent
+            child_idx = 0
+            for j in range(0, len(parent_words), self.child_size - self.overlap):
+                child_words = parent_words[j:j + self.child_size]
+                child_text = " ".join(child_words)
+                
+                chunks.append({
+                    "id": f"{parent_id}_child_{child_idx}",
+                    "content": child_text,
+                    "metadata": {
+                        **(metadata or {}),
+                        "parent_id": parent_id,
+                        "parent_content": parent_text,
+                        "chunk_level": "child",
+                        "chunk_index": child_idx
+                    },
+                    "modality": metadata.get("modality", "text")
+                })
+                child_idx += 1
+            
+            parent_idx += 1
+        
+        return chunks
+    
+    def get_strategy_name(self) -> str:
+        return "hierarchical"
+```
+
+#### 6.6 Chunker Registry
+
+**File**: `src/ingestion/chunking/chunker_registry.py`
+
+```python
+from typing import Dict, Type
+from .base_chunker import BaseChunker
+from .recursive_chunker import RecursiveChunker
+from .semantic_chunker import SemanticChunker
+from .late_chunker import LateChunker
+from .hierarchical_chunker import HierarchicalChunker
+from .page_chunker import PageChunker
+from .chapter_chunker import ChapterChunker
+from .paragraph_chunker import ParagraphChunker
+
+class ChunkerRegistry:
+    """Registry for pluggable chunking strategies."""
+    
+    _chunkers: Dict[str, Type[BaseChunker]] = {
+        "recursive": RecursiveChunker,
+        "semantic": SemanticChunker,
+        "late": LateChunker,
+        "hierarchical": HierarchicalChunker,
+        "page": PageChunker,
+        "chapter": ChapterChunker,
+        "paragraph": ParagraphChunker
+    }
+    
+    @classmethod
+    def get_chunker(cls, strategy: str, **kwargs) -> BaseChunker:
+        if strategy not in cls._chunkers:
+            raise ValueError(f"Unknown strategy: {strategy}. Available: {list(cls._chunkers.keys())}")
+        return cls._chunkers[strategy](**kwargs)
+    
+    @classmethod
+    def list_strategies(cls) -> list:
+        return list(cls._chunkers.keys())
+```
+
+**AFTER CREATING ALL CHUNKERS**:
+- [ ] Create `check/test_10_chunkers.ipynb`
+- [ ] Test each chunker with sample text
+- [ ] Verify chunk sizes and overlap
+- [ ] Test registry functionality
+
+**CONNECT TO PIPELINE**: Chunking follows preprocessing. Output goes to embedding.
+
+---
+
+### PHASE 7: EMBEDDING PIPELINE
+
+**Goal**: Convert chunks to vector embeddings.
+
+#### 7.1 Text Embedder
+
+**File**: `src/ingestion/embedding/text_embedder.py`
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from typing import List
+
+class TextEmbedder:
+    """Embedding with configurable models."""
+    
+    MODEL_DIMENSIONS = {
+        "all-MiniLM-L6-v2": 384,
+        "nomic-embed-text-v1.5": 768,
+        "jina-embeddings-v3": 1024
+    }
+    
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name)
+        self.dimension = self.MODEL_DIMENSIONS.get(model_name, 384)
+    
+    def embed(self, texts: List[str]) -> np.ndarray:
+        """Batch embed texts."""
+        if not texts:
+            return np.array([])
+        return self.model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+    
+    def embed_single(self, text: str) -> np.ndarray:
+        """Embed single text."""
+        return self.embed([text])[0]
+    
+    def get_dimension(self) -> int:
+        return self.dimension
+```
+
+#### 7.2 Embedding Pipeline with Caching
+
+**File**: `src/ingestion/embedding/embedding_pipeline.py`
+
+```python
+from typing import List, Dict, Any, Optional
+import hashlib
+import numpy as np
+from .text_embedder import TextEmbedder
+
+class EmbeddingPipeline:
+    """Manages embedding with semantic caching."""
+    
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", use_cache: bool = True):
+        self.embedder = TextEmbedder(model_name)
+        self.use_cache = use_cache
+        self._cache: Dict[str, np.ndarray] = {}
+    
+    def _get_cache_key(self, text: str) -> str:
+        return hashlib.md5(text.encode()).hexdigest()
+    
+    def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Embed list of chunks, using cache where possible."""
+        texts = [c["content"] for c in chunks]
+        embeddings = self.embed_batch(texts)
+        
+        for chunk, embedding in zip(chunks, embeddings):
+            chunk["embedding"] = embedding.tolist()
+        
+        return chunks
+    
+    def embed_batch(self, texts: List[str]) -> np.ndarray:
+        """Embed batch with cache lookup."""
+        if not self.use_cache:
+            return self.embedder.embed(texts)
+        
+        results = []
+        texts_to_embed = []
+        indices = []
+        
+        for i, text in enumerate(texts):
+            key = self._get_cache_key(text)
+            if key in self._cache:
+                results.append((i, self._cache[key]))
+            else:
+                texts_to_embed.append(text)
+                indices.append(i)
+        
+        if texts_to_embed:
+            new_embeddings = self.embedder.embed(texts_to_embed)
+            for idx, text, emb in zip(indices, texts_to_embed, new_embeddings):
+                key = self._get_cache_key(text)
+                self._cache[key] = emb
+                results.append((idx, emb))
+        
+        # Sort by original index
+        results.sort(key=lambda x: x[0])
+        return np.array([r[1] for r in results])
+    
+    def embed_query(self, query: str) -> np.ndarray:
+        """Embed user query."""
+        return self.embedder.embed_single(query)
+    
+    def clear_cache(self):
+        self._cache.clear()
+```
+
+**AFTER CREATING**:
+- [ ] Create `check/test_11_embedding.ipynb`
+- [ ] Test embedding dimensions
+- [ ] Verify caching works (second call should be faster)
+
+**CONNECT TO PIPELINE**: Embedding follows chunking. Output goes to vector store.
+
+---
+
+### PHASE 8: CROSS-MODAL MERGER
+
+**Goal**: Link related chunks across modalities (text + image + video).
+
+**File**: `src/ingestion/merging/cross_modal_merger.py`
+
+```python
+from typing import List, Dict, Any, Optional
+import numpy as np
+
+class CrossModalMerger:
+    """Links chunks from different modalities using embedding similarity."""
+    
+    def __init__(self, similarity_threshold: float = 0.75, embedder=None):
+        self.similarity_threshold = similarity_threshold
+        self.embedder = embedder  # Must be provided (from EmbeddingPipeline)
+    
+    def merge(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Add related_chunks field to each chunk based on embedding similarity.
+        Only links image_caption and transcript chunks to text chunks.
+        """
+        text_chunks = [c for c in chunks if c.get("modality") == "text"]
+        
+        for chunk in chunks:
+            if chunk.get("modality") in ["image_caption", "transcript"]:
+                related = self._find_related(chunk, text_chunks)
+                chunk["related_chunks"] = related
+        
+        return chunks
+    
+    def _find_related(self, chunk: Dict, text_chunks: List[Dict]) -> List[str]:
+        """Find related text chunks using cosine similarity."""
+        if not text_chunks or self.embedder is None:
+            return []
+        
+        chunk_emb = self.embedder.embed_single(chunk["content"])
+        text_embs = self.embedder.embed([t["content"] for t in text_chunks])
+        
+        # Cosine similarity
+        similarities = np.dot(text_embs, chunk_emb) / (
+            np.linalg.norm(text_embs, axis=1) * np.linalg.norm(chunk_emb)
+        )
+        
+        related = []
+        for i, sim in enumerate(similarities):
+            if sim >= self.similarity_threshold:
+                related.append({
+                    "chunk_id": text_chunks[i]["id"],
+                    "similarity": float(sim)
+                })
+        
+        # Sort by similarity, take top 3
+        related.sort(key=lambda x: x["similarity"], reverse=True)
+        return related[:3]
+```
+
+**AFTER CREATING**:
+- [ ] Create `check/test_12_cross_modal.ipynb`
+- [ ] Test with mixed text + image caption chunks
+- [ ] Verify similarity threshold works
+
+**CONNECT TO PIPELINE**: Cross-modal merging happens after embedding. Links are stored in chunk metadata.
+
+---
+
+### PHASE 9: STORAGE LAYER
+
+**Goal**: Persist embeddings, metadata, and graphs.
+
+#### 9.1 FAISS Vector Store
+
+**File**: `src/storage/faiss_store.py`
+
+```python
+import faiss
+import numpy as np
+import pickle
+import os
+from typing import List, Dict, Any, Optional
+
+class FAISSStore:
+    """FAISS vector store with metadata."""
+    
+    def __init__(self, dimension: int = 384, index_path: str = "./data/vector_store/index.faiss"):
+        self.dimension = dimension
+        self.index_path = index_path
+        self.metadata_path = index_path.replace(".faiss", "_meta.pkl")
+        self.metadata: Dict[str, Any] = {}
+        self._load_or_create()
+    
+    def _load_or_create(self):
+        if os.path.exists(self.index_path):
+            self.index = faiss.read_index(self.index_path)
+            with open(self.metadata_path, 'rb') as f:
+                self.metadata = pickle.load(f)
+        else:
+            self.index = faiss.IndexFlatIP(self.dimension)  # Inner product = cosine if normalized
+            os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
+    
+    def add(self, chunks: List[Dict[str, Any]]):
+        """Add chunks with embeddings."""
+        embeddings = []
+        for chunk in chunks:
+            if "embedding" not in chunk:
+                raise ValueError(f"Chunk {chunk['id']} missing embedding")
+            embeddings.append(chunk["embedding"])
+            self.metadata[chunk["id"]] = chunk
+        
+        embeddings = np.array(embeddings).astype('float32')
+        faiss.normalize_L2(embeddings)  # Normalize for cosine similarity
+        self.index.add(embeddings)
+        self._save()
+    
+    def search(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
+        """Search for similar chunks."""
+        query_embedding = np.array([query_embedding]).astype('float32')
+        faiss.normalize_L2(query_embedding)
+        
+        distances, indices = self.index.search(query_embedding, k)
+        
+        results = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if idx == -1:
+                continue
+            chunk_id = list(self.metadata.keys())[idx]
+            chunk = self.metadata[chunk_id].copy()
+            chunk["score"] = float(dist)
+            results.append(chunk)
+        
+        return results
+    
+    def delete(self, chunk_ids: List[str]):
+        """Remove chunks by ID. Requires rebuilding index."""
+        for cid in chunk_ids:
+            if cid in self.metadata:
+                del self.metadata[cid]
+        self._rebuild_index()
+    
+    def _rebuild_index(self):
+        """Rebuild FAISS index from metadata."""
+        self.index = faiss.IndexFlatIP(self.dimension)
+        if self.metadata:
+            embeddings = []
+            for chunk in self.metadata.values():
+                embeddings.append(chunk["embedding"])
+            embeddings = np.array(embeddings).astype('float32')
+            faiss.normalize_L2(embeddings)
+            self.index.add(embeddings)
+        self._save()
+    
+    def _save(self):
+        faiss.write_index(self.index, self.index_path)
+        with open(self.metadata_path, 'wb') as f:
+            pickle.dump(self.metadata, f)
+    
+    def get_stats(self) -> Dict[str, int]:
+        return {
+            "total_chunks": len(self.metadata),
+            "index_size": self.index.ntotal
+        }
+```
+
+#### 9.2 SQLite Manager
+
+**File**: `src/storage/sqlite_manager.py`
+
+```python
+import sqlite3
+import json
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+
+class SQLiteManager:
+    """SQLite for metadata, sources, and chat history."""
+    
+    def __init__(self, db_path: str = "./data/metadata.db"):
+        self.db_path = db_path
+        self._init_tables()
+    
+    def _init_tables(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS sources (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    source_type TEXT,
+                    file_path TEXT,
+                    url TEXT,
+                    metadata TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'processing'
+                );
+                
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT,
+                    content TEXT,
+                    modality TEXT,
+                    metadata TEXT,
+                    FOREIGN KEY (source_id) REFERENCES sources(id)
+                );
+                
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    mode TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                CREATE TABLE IF NOT EXISTS messages (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    role TEXT,
+                    content TEXT,
+                    sources_used TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                );
+                
+                CREATE TABLE IF NOT EXISTS chat_history_graph (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    node_type TEXT,
+                    content TEXT,
+                    related_nodes TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+    
+    def add_source(self, source: Dict[str, Any]):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO sources (id, title, source_type, file_path, url, metadata, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                source["id"], source.get("title", ""), source["source_type"],
+                source.get("file_path"), source.get("url"),
+                json.dumps(source.get("metadata", {})), source.get("status", "ready")
+            ))
+    
+    def get_sources(self) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM sources WHERE status = 'ready'").fetchall()
+            return [dict(r) for r in rows]
+    
+    def add_message(self, message: Dict[str, Any]):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO messages (id, session_id, role, content, sources_used)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                message["id"], message["session_id"], message["role"],
+                message["content"], json.dumps(message.get("sources_used", []))
+            ))
+    
+    def get_session_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp",
+                (session_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+```
+
+#### 9.3 Graph Storage
+
+**File**: `src/graph/graph_storage.py`
+
+```python
+import networkx as nx
+import pickle
+import os
+from typing import List, Dict, Any, Optional
+
+class GraphStorage:
+    """NetworkX knowledge graph for relationships."""
+    
+    def __init__(self, graph_path: str = "./data/knowledge_graph/graph.pkl"):
+        self.graph_path = graph_path
+        self.graph = nx.DiGraph()
+        self._load_or_create()
+    
+    def _load_or_create(self):
+        if os.path.exists(self.graph_path):
+            with open(self.graph_path, 'rb') as f:
+                self.graph = pickle.load(f)
+        else:
+            os.makedirs(os.path.dirname(self.graph_path), exist_ok=True)
+    
+    def add_chunk(self, chunk: Dict[str, Any]):
+        """Add chunk as node with metadata."""
+        self.graph.add_node(
+            chunk["id"],
+            content=chunk["content"][:200],  # Truncate for storage
+            modality=chunk.get("modality", "text"),
+            source_id=chunk.get("source_id", ""),
+            metadata=chunk.get("metadata", {})
+        )
+    
+    def add_relationship(self, from_id: str, to_id: str, relation_type: str, weight: float = 1.0):
+        """Add directed edge between chunks."""
+        self.graph.add_edge(from_id, to_id, relation=relation_type, weight=weight)
+    
+    def get_related(self, chunk_id: str, depth: int = 1) -> List[Dict[str, Any]]:
+        """Get related chunks up to N hops."""
+        if chunk_id not in self.graph:
+            return []
+        
+        related = []
+        for neighbor in nx.single_source_shortest_path_length(self.graph, chunk_id, cutoff=depth):
+            if neighbor != chunk_id:
+                node_data = self.graph.nodes[neighbor]
+                edge_data = self.graph.edges[chunk_id, neighbor] if self.graph.has_edge(chunk_id, neighbor) else {}
+                related.append({
+                    "chunk_id": neighbor,
+                    "content": node_data.get("content", ""),
+                    "relation": edge_data.get("relation", "related"),
+                    "weight": edge_data.get("weight", 1.0)
+                })
+        
+        return related
+    
+    def find_path(self, start: str, end: str) -> Optional[List[str]]:
+        """Find shortest path between two chunks."""
+        try:
+            return nx.shortest_path(self.graph, start, end)
+        except nx.NetworkXNoPath:
+            return None
+    
+    def save(self):
+        with open(self.graph_path, 'wb') as f:
+            pickle.dump(self.graph, f)
+    
+    def get_stats(self) -> Dict[str, int]:
+        return {
+            "nodes": self.graph.number_of_nodes(),
+            "edges": self.graph.number_of_edges()
+        }
+```
+
+**AFTER CREATING STORAGE**:
+- [ ] Create `check/test_13_storage.ipynb`
+- [ ] Test FAISS add/search/delete
+- [ ] Test SQLite CRUD operations
+- [ ] Test Graph add/query/path finding
+
+**CONNECT TO PIPELINE**: Storage receives data after embedding/merging. Retrieval reads from here.
+
+---
+
+### PHASE 10: RETRIEVAL SYSTEM
+
+**Goal**: Retrieve relevant chunks using multiple strategies.
+
+#### 10.1 Hybrid Retriever (Dense + Sparse)
+
+**File**: `src/retrieval/hybrid_retriever.py`
+
+```python
+from typing import List, Dict, Any
+import numpy as np
+from rank_bm25 import BM25Okapi
+
+class HybridRetriever:
+    """Combines FAISS (dense) + BM25 (sparse) with Reciprocal Rank Fusion."""
+    
+    def __init__(self, faiss_store, top_k: int = 5, 
+                 dense_weight: float = 0.7, sparse_weight: float = 0.3):
+        self.faiss_store = faiss_store
+        self.top_k = top_k
+        self.dense_weight = dense_weight
+        self.sparse_weight = sparse_weight
+        self.bm25 = None
+        self.corpus = []
+        self.corpus_ids = []
+    
+    def build_sparse_index(self, chunks: List[Dict[str, Any]]):
+        """Build BM25 index from chunks."""
+        self.corpus = [c["content"].split() for c in chunks]
+        self.corpus_ids = [c["id"] for c in chunks]
+        self.bm25 = BM25Okapi(self.corpus)
+    
+    def retrieve(self, query: str, query_embedding: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        Retrieve using both dense and sparse methods.
+        Returns fused results.
+        """
+        # Dense retrieval
+        dense_results = self.faiss_store.search(query_embedding, k=self.top_k * 2)
+        
+        # Sparse retrieval
+        sparse_results = []
+        if self.bm25:
+            tokenized_query = query.split()
+            scores = self.bm25.get_scores(tokenized_query)
+            top_indices = np.argsort(scores)[-self.top_k * 2:][::-1]
+            for idx in top_indices:
+                if scores[idx] > 0:
+                    sparse_results.append({
+                        "chunk_id": self.corpus_ids[idx],
+                        "score": scores[idx],
+                        "method": "sparse"
+                    })
+        
+        # Reciprocal Rank Fusion
+        fused = self._reciprocal_rank_fusion(dense_results, sparse_results)
+        return fused[:self.top_k]
+    
+    def _reciprocal_rank_fusion(self, dense: List[Dict], sparse: List[Dict], k: int = 60) -> List[Dict]:
+        """RRF: score = sum(1 / (k + rank))"""
+        scores = {}
+        
+        for rank, item in enumerate(dense):
+            cid = item.get("id", item.get("chunk_id"))
+            scores[cid] = scores.get(cid, 0) + self.dense_weight * (1 / (k + rank))
+        
+        for rank, item in enumerate(sparse):
+            cid = item["chunk_id"]
+            scores[cid] = scores.get(cid, 0) + self.sparse_weight * (1 / (k + rank))
+        
+        # Sort by score
+        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Return full chunk data
+        results = []
+        for cid, score in sorted_scores:
+            chunk = self.faiss_store.metadata.get(cid, {})
+            chunk["score"] = score
+            chunk["retrieval_method"] = "hybrid"
+            results.append(chunk)
+        
+        return results
+```
+
+#### 10.2 Contextual Compressor
+**File**: `src/retrieval/contextual_compressor.py`
+
+```python
+from typing import List, Dict, Any
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+class ContextualCompressor:
+    """Extracts only relevant sentences from retrieved chunks."""
+    
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", 
+                 relevance_threshold: float = 0.6):
+        self.model = SentenceTransformer(model_name)
+        self.threshold = relevance_threshold
+    
+    def compress(self, chunks: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+        """Compress chunks by keeping only relevant sentences."""
+        query_emb = self.model.encode(query)
+        compressed = []
+        
+        for chunk in chunks:
+            sentences = chunk["content"].split(". ")
+            if len(sentences) <= 2:
+                compressed.append(chunk)
+                continue
+            
+            sent_embeddings = self.model.encode(sentences)
+            similarities = np.dot(sent_embeddings, query_emb) / (
+                np.linalg.norm(sent_embeddings, axis=1) * np.linalg.norm(query_emb)
+            )
+            
+            relevant_sentences = [
+                s for s, sim in zip(sentences, similarities) 
+                if sim >= self.threshold
+            ]
+            
+            if relevant_sentences:
+                chunk["content"] = ". ".join(relevant_sentences)
+                chunk["compressed"] = True
+                compressed.append(chunk)
+        
+        return compressed
+```
+
+#### 10.3 Reranker
+**File**: `src/retrieval/reranker.py`
+
+```python
+from typing import List, Dict, Any
+from sentence_transformers import CrossEncoder
+
+class Reranker:
+    """Cross-encoder reranker for precise scoring."""
+    
+    def __init__(self, model_name: str = "BAAI/bge-reranker-base"):
+        self.model = CrossEncoder(model_name)
+    
+    def rerank(self, query: str, chunks: List[Dict[str, Any]], 
+               top_k: int = 5) -> List[Dict[str, Any]]:
+        """Rerank chunks by query relevance."""
+        if not chunks:
+            return []
+        
+        pairs = [(query, c["content"]) for c in chunks]
+        scores = self.model.predict(pairs)
+        
+        for chunk, score in zip(chunks, scores):
+            chunk["rerank_score"] = float(score)
+        
+        # Sort by rerank score
+        chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
+        return chunks[:top_k]
+```
+
+#### 10.4 Advanced Retriever (Query Expansion + RAPTOR)
+**File**: `src/retrieval/advanced_retriever.py`
+
+```python
+from typing import List, Dict, Any
+import numpy as np
+
+class AdvancedRetriever:
+    """Deep Research mode: Query expansion + RAPTOR + full pipeline."""
+    
+    def __init__(self, hybrid_retriever, contextual_compressor, reranker, raptor=None):
+        self.hybrid = hybrid_retriever
+        self.compressor = contextual_compressor
+        self.reranker = reranker
+        self.raptor = raptor
+    
+    def retrieve(self, query: str, query_embedding: np.ndarray) -> List[Dict[str, Any]]:
+        """Full advanced retrieval pipeline."""
+        # Step 1: Query expansion (simple synonym expansion)
+        expanded_queries = self._expand_query(query)
+        
+        # Step 2: Retrieve for each expanded query
+        all_results = []
+        for q in expanded_queries:
+            # Note: In production, embed each expanded query
+            results = self.hybrid.retrieve(q, query_embedding)
+            all_results.extend(results)
+        
+        # Step 3: Deduplicate
+        seen = set()
+        unique = []
+        for r in all_results:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                unique.append(r)
+        
+        # Step 4: Contextual compression
+        compressed = self.compressor.compress(unique, query)
+        
+        # Step 5: Rerank
+        reranked = self.reranker.rerank(query, compressed)
+        
+        # Step 6: RAPTOR (if available)
+        if self.raptor:
+            raptor_results = self.raptor.retrieve(query)
+            # Merge RAPTOR results
+            for r in raptor_results:
+                if r["id"] not in seen:
+                    reranked.append(r)
+        
+        return reranked
+    
+    def _expand_query(self, query: str) -> List[str]:
+        """Simple query expansion."""
+        # In production, use LLM or synonym database
+        expansions = [query]
+        # Add variations
+        if "how" in query.lower():
+            expansions.append(query.replace("how", "what is the way"))
+        if "why" in query.lower():
+            expansions.append(query.replace("why", "what is the reason"))
+        return expansions
+```
+
+#### 10.5 Study Mode - Smart Fusion
+**File**: `src/retrieval/study_mode.py`
+
+```python
+from typing import List, Dict, Any
+import numpy as np
+
+class StudyModeRetriever:
+    """
+    Study Mode: Graph-Augmented Retrieval with Smart Fusion.
+    Combines broad retrieval (quality) + graph retrieval (relationships).
+    """
+    
+    def __init__(self, advanced_retriever, graph_storage, graph_retriever):
+        self.advanced = advanced_retriever
+        self.graph_storage = graph_storage
+        self.graph_retriever = graph_retriever
+    
+    def retrieve(self, query: str, query_embedding: np.ndarray) -> Dict[str, Any]:
+        """
+        Returns: {"chunks": List[Dict], "learning_path": List[Dict]}
+        """
+        # Step 1: Broad retrieval (Advanced Pipeline)
+        broad_results = self.advanced.retrieve(query, query_embedding)
+        
+        # Step 2: Graph retrieval (find relationship paths)
+        graph_results = self.graph_retriever.find_related_concepts(query)
+        
+        # Step 3: Smart Fusion
+        final_chunks = self._smart_fusion(broad_results, graph_results)
+        
+        # Step 4: Extract learning path from graph
+        learning_path = self._extract_learning_path(graph_results)
+        
+        return {
+            "chunks": final_chunks,
+            "learning_path": learning_path
+        }
+    
+    def _smart_fusion(self, broad: List[Dict], graph: List[Dict], max_chunks: int = 8) -> List[Dict]:
+        """
+        Combine broad retrieval (quality) with graph (relationships).
+        Priority: Keep top broad results, add graph relationships.
+        """
+        seen = set()
+        final = []
+        
+        # Add top 6 from broad retrieval (quality first)
+        for chunk in broad[:6]:
+            cid = chunk["id"]
+            if cid not in seen:
+                seen.add(cid)
+                chunk["source"] = "broad"
+                final.append(chunk)
+        
+        # Add up to 3 from graph (relationships)
+        for chunk in graph:
+            cid = chunk["id"]
+            if cid not in seen and len(final) < max_chunks:
+                seen.add(cid)
+                chunk["source"] = "graph"
+                final.append(chunk)
+        
+        return final
+    
+    def _extract_learning_path(self, graph_results: List[Dict]) -> List[Dict]:
+        """Extract concept relationships for learning path display."""
+        paths = []
+        for result in graph_results:
+            if "path" in result:
+                paths.append({
+                    "from": result["path"][0],
+                    "to": result["path"][-1],
+                    "steps": result["path"],
+                    "relationship": result.get("relation", "related")
+                })
+        return paths
+```
+
+#### 10.6 Graph Retriever
+**File**: `src/graph/graph_retriever.py`
+
+```python
+from typing import List, Dict, Any, Optional
+from .graph_storage import GraphStorage
+
+class GraphRetriever:
+    """Retrieves information using graph relationships."""
+    
+    def __init__(self, graph_storage: GraphStorage):
+        self.graph = graph_storage
+    
+    def find_related_concepts(self, query: str, depth: int = 2) -> List[Dict[str, Any]]:
+        """Find concepts related to query through graph traversal."""
+        # In production, extract entities from query first
+        # For now, search all nodes
+        results = []
+        
+        for node_id in self.graph.graph.nodes():
+            node_data = self.graph.graph.nodes[node_id]
+            content = node_data.get("content", "").lower()
+            
+            # Simple keyword matching (replace with semantic search in production)
+            if any(word in content for word in query.lower().split()[:3]):
+                related = self.graph.get_related(node_id, depth=depth)
+                results.append({
+                    "id": node_id,
+                    "content": node_data.get("content", ""),
+                    "related": related,
+                    "path": [node_id] + [r["chunk_id"] for r in related[:2]]
+                })
+        
+        return results
+    
+    def get_learning_sequence(self, start_concept: str, end_concept: str) -> Optional[List[str]]:
+        """Get learning sequence from concept A to concept B."""
+        # Find nodes matching concepts
+        start_nodes = self._find_nodes(start_concept)
+        end_nodes = self._find_nodes(end_concept)
+        
+        if not start_nodes or not end_nodes:
+            return None
+        
+        # Find shortest path
+        path = self.graph.find_path(start_nodes[0], end_nodes[0])
+        return path
+    
+    def _find_nodes(self, concept: str) -> List[str]:
+        """Find nodes matching concept."""
+        matches = []
+        for node_id, data in self.graph.graph.nodes(data=True):
+            if concept.lower() in data.get("content", "").lower():
+                matches.append(node_id)
+        return matches
+```
+
+**AFTER CREATING RETRIEVAL FILES**:
+- [ ] Create `check/test_14_hybrid_retriever.ipynb`
+- [ ] Create `check/test_15_contextual_compressor.ipynb`
+- [ ] Create `check/test_16_reranker.ipynb`
+- [ ] Create `check/test_17_study_mode.ipynb`
+- [ ] Create `check/test_18_graph_retriever.ipynb`
+- [ ] Test each component individually
+- [ ] Test full retrieval pipeline end-to-end
+
+**CONNECT TO PIPELINE**: Retrieval reads from storage. Output goes to generation layer.
+
+---
+
+### PHASE 11: GENERATION LAYER
+
+**Goal**: Generate responses using LLM with strict grounding.
+
+#### 11.1 LLM Client (LangChain-based)
+**File**: `src/generation/llm_client.py`
+
+```python
+from langchain.chat_models import init_chat_model
+from typing import Optional, Dict, Any, Iterator
+import os
+
+class LLMClient:
+    """
+    Flexible LLM client using LangChain's init_chat_model.
+    Supports: Groq, Ollama, OpenAI, Gemini, and any OpenAI-compatible API.
+    """
+    
+    def __init__(
+        self,
+        provider: str = "groq",
+        model: str = "llama-3.1-70b-versatile",
+        api_key: Optional[str] = None,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        max_tokens: int = 1024,
+        **kwargs
+    ):
+        self.provider = provider
+        self.model_name = model
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
+        
+        # Set API key if provided
+        if api_key:
+            env_var = f"{provider.upper()}_API_KEY"
+            os.environ[env_var] = api_key
+        
+        # Initialize model
+        self.model = init_chat_model(
+            model,
+            model_provider=provider,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            **kwargs
+        )
+    
+    def invoke(self, prompt: str) -> str:
+        """Generate response (blocking)."""
+        response = self.model.invoke(prompt)
+        return response.content
+    
+    def stream(self, prompt: str) -> Iterator[str]:
+        """Generate response (streaming)."""
+        for chunk in self.model.stream(prompt):
+            yield chunk.content
+    
+    def update_tuning(self, **kwargs):
+        """Update generation parameters at runtime."""
+        if "temperature" in kwargs:
+            self.temperature = kwargs["temperature"]
+        if "top_p" in kwargs:
+            self.top_p = kwargs["top_p"]
+        if "max_tokens" in kwargs:
+            self.max_tokens = kwargs["max_tokens"]
+        
+        # Reinitialize with new params
+        self.model = init_chat_model(
+            self.model_name,
+            model_provider=self.provider,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            max_tokens=self.max_tokens
+        )
+```
+
+#### 11.2 Prompt Builder
+**File**: `src/generation/prompt_builder.py`
+
+```python
+from typing import List, Dict, Any
+
+class PromptBuilder:
+    """Builds mode-specific prompts with citations and grounding."""
+    
+    GROUNDING_INSTRUCTION = """
+CRITICAL INSTRUCTIONS:
+- Answer using ONLY the provided sources below
+- Never make up information not in the sources
+- If the answer is not in the sources, say "I don't have enough information"
+- Always cite sources using [SOURCE_X] format
+- Be concise but complete
+"""
+    
+    @staticmethod
+    def build_chat_prompt(query: str, context: str, history: str = "") -> str:
+        """Build prompt for Chat mode."""
+        prompt = f"""{PromptBuilder.GROUNDING_INSTRUCTION}
+
+CONVERSATION HISTORY:
+{history}
+
+RELEVANT SOURCES:
+{context}
+
+USER QUESTION: {query}
+
+ANSWER (with citations):"""
+        return prompt
+    
+    @staticmethod
+    def build_deep_research_prompt(query: str, context: str, history: str = "") -> str:
+        """Build prompt for Deep Research mode."""
+        prompt = f"""{PromptBuilder.GROUNDING_INSTRUCTION}
+
+You are in Deep Research mode. Provide a comprehensive, well-structured answer.
+
+CONVERSATION HISTORY:
+{history}
+
+RELEVANT SOURCES (ranked by relevance):
+{context}
+
+USER QUESTION: {query}
+
+DETAILED ANSWER (with citations and analysis):"""
+        return prompt
+    
+    @staticmethod
+    def build_study_mode_prompt(query: str, context: str, learning_path: List[Dict], history: str = "") -> str:
+        """Build prompt for Study Mode with learning path."""
+        path_str = "\n".join([
+            f"{i+1}. {step['from']} → {step['to']} ({step['relationship']})"
+            for i, step in enumerate(learning_path[:3])
+        ])
+        
+        prompt = f"""{PromptBuilder.GROUNDING_INSTRUCTION}
+
+You are in Study Mode. Explain concepts clearly and show relationships.
+
+LEARNING PATH:
+{path_str}
+
+CONVERSATION HISTORY:
+{history}
+
+RELEVANT SOURCES:
+{context}
+
+USER QUESTION: {query}
+
+EDUCATIONAL ANSWER (with citations and concept connections):"""
+        return prompt
+    
+    @staticmethod
+    def format_context(chunks: List[Dict[str, Any]]) -> str:
+        """Format chunks into context string with source labels."""
+        context_parts = []
+        for i, chunk in enumerate(chunks, 1):
+            source_label = f"[SOURCE_{i}]"
+            content = chunk["content"][:500]  # Limit length
+            context_parts.append(f"{source_label} {content}")
+        return "\n\n".join(context_parts)
+```
+
+#### 11.3 Response Parser
+**File**: `src/generation/response_parser.py`
+
+```python
+import re
+from typing import List, Dict, Any
+
+class ResponseParser:
+    """Parse LLM response to extract citations and content."""
+    
+    @staticmethod
+    def parse(response_text: str) -> Dict[str, Any]:
+        """
+        Parse response into content and citations.
+        Returns: {"content": str, "citations": List[Dict]}
+        """
+        # Extract citations [SOURCE_X]
+        citation_pattern = r'\[SOURCE_(\d+)\]'
+        citations_found = re.findall(citation_pattern, response_text)
+        
+        citations = []
+        for cid in set(citations_found):
+            citations.append({
+                "source_index": int(cid),
+                "source_id": f"source_{cid}",
+                "confidence": 1.0
+            })
+        
+        # Clean response (remove citation markers for display)
+        clean_content = re.sub(citation_pattern, '', response_text)
+        clean_content = re.sub(r'\s+', ' ', clean_content).strip()
+        
+        return {
+            "content": clean_content,
+            "citations": citations,
+            "has_citations": len(citations) > 0
+        }
+    
+    @staticmethod
+    def validate_grounding(response: str, context: str) -> bool:
+        """
+        Basic validation: check if response contains content from context.
+        Returns True if grounded, False if potentially hallucinated.
+        """
+        # Extract key phrases from context (simple approach)
+        context_words = set(context.lower().split())
+        response_words = set(response.lower().split())
+        
+        # Check overlap
+        overlap = len(context_words & response_words)
+        total = len(response_words)
+        
+        if total == 0:
+            return False
+        
+        ratio = overlap / total
+        return ratio > 0.3  # At least 30% words from context
+```
+
+**AFTER CREATING GENERATION FILES**:
+- [ ] Create `check/test_19_llm_client.ipynb`
+- [ ] Create `check/test_20_prompt_builder.ipynb`
+- [ ] Test LLM client with different providers
+- [ ] Verify prompt formatting for each mode
+- [ ] Test response parsing and citation extraction
+
+**CONNECT TO PIPELINE**: Generation receives retrieved chunks + query. Output goes to UI.
+
+---
+
+### PHASE 12: CHAT HISTORY MANAGEMENT
+
+**Goal**: Manage conversation history with mode-specific storage.
+
+#### 12.1 RAG-Based Chat History (Chat + Deep Research)
+**File**: `src/chat_history/rag_history.py`
+
+```python
+from typing import List, Dict, Any, Optional
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+class RAGChatHistory:
+    """
+    Vector-based chat history for Chat and Deep Research modes.
+    Stores messages and retrieves relevant past messages using similarity.
+    """
+    
+    def __init__(self, session_id: str, embedding_model: str = "all-MiniLM-L6-v2"):
+        self.session_id = session_id
+        self.messages: List[Dict[str, Any]] = []
+        self.embedder = SentenceTransformer(embedding_model)
+        self.message_embeddings: List[np.ndarray] = []
+    
+    def add_message(self, role: str, content: str, sources_used: List[str] = None):
+        """Add message to history."""
+        message = {
+            "id": f"{self.session_id}_{len(self.messages)}",
+            "session_id": self.session_id,
+            "role": role,
+            "content": content,
+            "sources_used": sources_used or [],
+            "index": len(self.messages)
+        }
+        self.messages.append(message)
+        
+        # Embed for retrieval
+        embedding = self.embedder.encode(content)
+        self.message_embeddings.append(embedding)
+    
+    def get_relevant_history(self, query: str, k: int = 5) -> str:
+        """Retrieve relevant past messages for query context."""
+        if not self.messages:
+            return ""
+        
+        query_emb = self.embedder.encode(query)
+        
+        # Calculate similarities
+        similarities = [
+            np.dot(query_emb, msg_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(msg_emb))
+            for msg_emb in self.message_embeddings
+        ]
+        
+        # Get top-k most relevant
+        top_indices = np.argsort(similarities)[-k:][::-1]
+        
+        relevant_messages = []
+        for idx in top_indices:
+            msg = self.messages[idx]
+            relevant_messages.append(f"{msg['role']}: {msg['content']}")
+        
+        return "\n".join(relevant_messages)
+    
+    def get_recent_messages(self, n: int = 10) -> List[Dict[str, Any]]:
+        """Get last N messages."""
+        return self.messages[-n:]
+    
+    def clear(self):
+        """Clear all history."""
+        self.messages = []
+        self.message_embeddings = []
+```
+
+#### 12.2 Graph-Based Chat History (Study Mode)
+**File**: `src/chat_history/graph_history.py`
+
+```python
+from typing import List, Dict, Any, Optional
+from src.graph.graph_storage import GraphStorage
+
+class GraphChatHistory:
+    """
+    Graph-based chat history for Study Mode.
+    Tracks concept relationships and learning sequences.
+    """
+    
+    def __init__(self, session_id: str, graph_storage: GraphStorage):
+        self.session_id = session_id
+        self.graph = graph_storage
+        self.messages: List[Dict[str, Any]] = []
+    
+    def add_message(self, role: str, content: str, concepts: List[str] = None, 
+                   sources_used: List[str] = None):
+        """Add message with concept tracking."""
+        message_id = f"{self.session_id}_{len(self.messages)}"
+        
+        message = {
+            "id": message_id,
+            "session_id": self.session_id,
+            "role": role,
+            "content": content,
+            "concepts": concepts or [],
+            "sources_used": sources_used or [],
+            "index": len(self.messages)
+        }
+        self.messages.append(message)
+        
+        # Add to graph as node
+        self.graph.add_chunk({
+            "id": message_id,
+            "content": content,
+            "modality": "chat_message",
+            "source_id": self.session_id,
+            "metadata": {"role": role, "concepts": concepts}
+        })
+        
+        # Link to previous message
+        if len(self.messages) > 1:
+            prev_id = self.messages[-2]["id"]
+            self.graph.add_relationship(
+                prev_id, message_id, "followed_by", weight=1.0
+            )
+        
+        # Link concepts
+        if concepts:
+            for concept in concepts:
+                # Create concept node if not exists
+                concept_id = f"concept_{concept}_{self.session_id}"
+                if concept_id not in self.graph.graph:
+                    self.graph.add_chunk({
+                        "id": concept_id,
+                        "content": concept,
+                        "modality": "concept",
+                        "source_id": self.session_id
+                    })
+                self.graph.add_relationship(
+                    message_id, concept_id, "mentions", weight=0.8
+                )
+    
+    def get_learning_path(self, concept: str) -> List[Dict[str, Any]]:
+        """Get learning sequence for a concept."""
+        concept_id = f"concept_{concept}_{self.session_id}"
+        if concept_id not in self.graph.graph:
+            return []
+        
+        # Find all messages mentioning this concept
+        related = self.graph.get_related(concept_id, depth=2)
+        return related
+    
+    def get_concept_connections(self) -> List[Dict[str, Any]]:
+        """Get all concept relationships in this session."""
+        connections = []
+        for node_id, data in self.graph.graph.nodes(data=True):
+            if data.get("modality") == "concept":
+                related = self.graph.get_related(node_id, depth=1)
+                connections.append({
+                    "concept": data.get("content", ""),
+                    "related": related
+                })
+        return connections
+```
+
+#### 12.3 Chat History Manager
+**File**: `src/chat_history/chat_history_manager.py`
+
+```python
+from typing import Dict, Any, Optional
+from .rag_history import RAGChatHistory
+from .graph_history import GraphChatHistory
+from src.graph.graph_storage import GraphStorage
+
+class ChatHistoryManager:
+    """
+    Unified interface for chat history management.
+    Automatically selects appropriate backend based on mode.
+    """
+    
+    def __init__(self, session_id: str, mode: str = "chat", graph_storage: GraphStorage = None):
+        self.session_id = session_id
+        self.mode = mode
+        
+        if mode == "study":
+            if graph_storage is None:
+                raise ValueError("Graph storage required for Study Mode")
+            self.backend = GraphChatHistory(session_id, graph_storage)
+        else:
+            self.backend = RAGChatHistory(session_id)
+    
+    def add_message(self, role: str, content: str, **kwargs):
+        """Add message to history."""
+        if self.mode == "study":
+            self.backend.add_message(role, content, 
+                                   concepts=kwargs.get("concepts"),
+                                   sources_used=kwargs.get("sources_used"))
+        else:
+            self.backend.add_message(role, content, 
+                                   sources_used=kwargs.get("sources_used"))
+    
+    def get_history_context(self, query: str = "", max_messages: int = 10) -> str:
+        """Get formatted history for LLM context."""
+        if self.mode == "study":
+            # For study mode, return concept connections
+            connections = self.backend.get_concept_connections()
+            if connections:
+                return f"Previous concepts discussed: {', '.join([c['concept'] for c in connections])}"
+            return ""
+        else:
+            # For chat/deep research, return relevant messages
+            if query:
+                return self.backend.get_relevant_history(query)
+            else:
+                recent = self.backend.get_recent_messages(max_messages)
+                return "\n".join([f"{m['role']}: {m['content']}" for m in recent])
+    
+    def clear(self):
+        """Clear history."""
+        self.backend.clear()
+```
+
+**AFTER CREATING CHAT HISTORY FILES**:
+- [ ] Create `check/test_21_chat_history.ipynb`
+- [ ] Test RAG history with sample queries
+- [ ] Test Graph history with concept tracking
+- [ ] Test manager mode switching
+
+**CONNECT TO PIPELINE**: Chat history is queried during retrieval and included in prompts.
+
+---
+
+### PHASE 13: WEB SEARCH AGENT
+
+**Goal**: Search web and add sources dynamically.
+
+**File**: `src/agents/web_search_agent.py`
+
+```python
+from typing import List, Dict, Any
+import requests
+from urllib.parse import quote
+
+class WebSearchAgent:
+    """
+    Searches web using DuckDuckGo and returns formatted results.
+    Results can be added as sources like uploaded files.
+    """
+    
+    DUCKDUCKGO_URL = "https://html.duckduckgo.com/html/"
+    
+    def __init__(self, max_results: int = 10):
+        self.max_results = max_results
+    
+    def search(self, query: str) -> List[Dict[str, Any]]:
+        """Perform web search."""
+        try:
+            response = requests.get(
+                self.DUCKDUCKGO_URL,
+                params={"q": query},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            # Parse results (simplified - use BeautifulSoup in production)
+            results = self._parse_results(response.text)
+            return results[:self.max_results]
+        except Exception as e:
+            return [{"error": str(e)}]
+    
+    def _parse_results(self, html: str) -> List[Dict[str, Any]]:
+        """Parse search results from HTML."""
+        # In production, use BeautifulSoup for proper parsing
+        # This is a simplified version
+        results = []
+        # TODO: Implement proper HTML parsing
+        return results
+    
+    def search_and_format(self, query: str) -> List[Dict[str, Any]]:
+        """Search and format for UI display."""
+        raw_results = self.search(query)
+        
+        formatted = []
+        for i, result in enumerate(raw_results):
+            if "error" in result:
+                continue
+            formatted.append({
+                "id": f"web_{i}_{hash(result.get('title', ''))}",
+                "title": result.get("title", "Untitled"),
+                "url": result.get("url", ""),
+                "snippet": result.get("snippet", ""),
+                "source_type": "website",
+                "selected": False
+            })
+        
+        return formatted
+    
+    def fetch_content(self, url: str) -> str:
+        """Fetch full content from URL."""
+        try:
+            response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            
+            # Use trafilatura for content extraction
+            import trafilatura
+            content = trafilatura.extract(response.text)
+            return content or ""
+        except Exception as e:
+            return f"Error fetching content: {e}"
+```
+
+**AFTER CREATING**:
+- [ ] Create `check/test_22_web_search.ipynb`
+- [ ] Test search with sample queries
+- [ ] Verify result formatting
+- [ ] Test content fetching
+
+**CONNECT TO PIPELINE**: Web search results are treated as sources. They go through same ingestion pipeline.
+
+---
+
+### PHASE 14: SOURCE MANAGEMENT
+
+**Goal**: Add, remove, and manage sources with storage cleanup.
+
+**File**: `src/storage/source_manager.py`
+
+```python
+from typing import List, Dict, Any, Optional
+import uuid
+from .faiss_store import FAISSStore
+from .sqlite_manager import SQLiteManager
+from src.graph.graph_storage import GraphStorage
+
+class SourceManager:
+    """
+    Manages sources with full lifecycle:
+    - Add sources (upload or web search)
+    - Remove sources (with storage cleanup)
+    - Batch operations
+    - Duplicate detection
+    """
+    
+    def __init__(self, faiss_store: FAISSStore, sqlite_manager: SQLiteManager, 
+                 graph_storage: GraphStorage = None):
+        self.faiss = faiss_store
+        self.sqlite = sqlite_manager
+        self.graph = graph_storage
+        self.sources: Dict[str, Dict[str, Any]] = {}
+    
+    def add_source(self, source: Dict[str, Any], chunks: List[Dict[str, Any]]) -> str:
+        """Add source with chunks to all storage."""
+        source_id = source.get("id", str(uuid.uuid4()))
+        source["id"] = source_id
+        
+        # Store metadata
+        self.sqlite.add_source(source)
+        self.sources[source_id] = source
+        
+        # Store chunks in FAISS
+        if chunks:
+            self.faiss.add(chunks)
+        
+        # Add to graph
+        if self.graph:
+            for chunk in chunks:
+                self.graph.add_chunk(chunk)
+                # Link chunks from same source
+                for other_chunk in chunks:
+                    if chunk["id"] != other_chunk["id"]:
+                        self.graph.add_relationship(
+                            chunk["id"], other_chunk["id"], "same_source", 0.5
+                        )
+        
+        return source_id
+    
+    def remove_source(self, source_id: str) -> bool:
+        """Remove source and all associated data."""
+        if source_id not in self.sources:
+            return False
+        
+        # Get chunk IDs for this source
+        chunk_ids = [
+            cid for cid, chunk in self.faiss.metadata.items()
+            if chunk.get("source_id") == source_id
+        ]
+        
+        # Remove from FAISS
+        if chunk_ids:
+            self.faiss.delete(chunk_ids)
+        
+        # Remove from graph
+        if self.graph:
+            for cid in chunk_ids:
+                if cid in self.graph.graph:
+                    self.graph.graph.remove_node(cid)
+        
+        # Remove from SQLite
+        with self.sqlite:
+            # Implementation depends on SQLiteManager methods
+            pass
+        
+        # Remove from memory
+        del self.sources[source_id]
+        return True
+    
+    def batch_remove_sources(self, source_ids: List[str]) -> Dict[str, bool]:
+        """Remove multiple sources."""
+        results = {}
+        for sid in source_ids:
+            results[sid] = self.remove_source(sid)
+        return results
+    
+    def remove_duplicates(self) -> int:
+        """Remove duplicate chunks based on content hash."""
+        # Calculate content hashes
+        content_hashes = {}
+        duplicates = []
+        
+        for cid, chunk in self.faiss.metadata.items():
+            content_hash = hash(chunk["content"])
+            if content_hash in content_hashes:
+                duplicates.append(cid)
+            else:
+                content_hashes[content_hash] = cid
+        
+        # Remove duplicates
+        if duplicates:
+            self.faiss.delete(duplicates)
+        
+        return len(duplicates)
+    
+    def get_all_sources(self) -> List[Dict[str, Any]]:
+        """Get all active sources."""
+        return list(self.sources.values())
+    
+    def get_source_stats(self, source_id: str) -> Dict[str, int]:
+        """Get statistics for a source."""
+        chunk_count = sum(
+            1 for c in self.faiss.metadata.values()
+            if c.get("source_id") == source_id
+        )
+        return {
+            "chunk_count": chunk_count,
+            "source_type": self.sources.get(source_id, {}).get("source_type", "unknown")
+        }
+```
+
+**AFTER CREATING**:
+- [ ] Create `check/test_23_source_manager.ipynb`
+- [ ] Test add/remove sources
+- [ ] Test batch removal
+- [ ] Test duplicate detection
+- [ ] Verify storage cleanup
+
+**CONNECT TO PIPELINE**: Source manager is called by ingestion pipeline and UI.
+
+---
+
+### PHASE 15: MASTER PIPELINE
+
+**Goal**: Connect all components into unified pipeline.
+
+**File**: `src/master_pipeline.py`
+
+```python
+from typing import List, Dict, Any, Optional, Iterator
+import uuid
+import time
+
+# Core
+from src.core.config import Config
+from src.core.models import Query, LLMResponse
+
+# Ingestion
+from src.ingestion.file_detector import FileDetector
+from src.ingestion.pipelines.pdf_pipeline import PDFPipeline
+from src.ingestion.pipelines.image_pipeline import ImagePipeline
+from src.ingestion.pipelines.video_audio_pipeline import VideoAudioPipeline
+from src.ingestion.pipelines.website_pipeline import WebsitePipeline
+from src.ingestion.pipelines.youtube_pipeline import YouTubePipeline
+from src.ingestion.pipelines.csv_pipeline import CSVPipeline
+from src.ingestion.preprocessing.adaptive_preprocessor import AdaptivePreprocessor
+from src.ingestion.chunking.chunker_registry import ChunkerRegistry
+from src.ingestion.embedding.embedding_pipeline import EmbeddingPipeline
+from src.ingestion.merging.cross_modal_merger import CrossModalMerger
+
+# Storage
+from src.storage.faiss_store import FAISSStore
+from src.storage.sqlite_manager import SQLiteManager
+from src.storage.source_manager import SourceManager
+
+# Graph
+from src.graph.graph_storage import GraphStorage
+from src.graph.graph_retriever import GraphRetriever
+
+# Retrieval
+from src.retrieval.hybrid_retriever import HybridRetriever
+from src.retrieval.contextual_compressor import ContextualCompressor
+from src.retrieval.reranker import Reranker
+from src.retrieval.advanced_retriever import AdvancedRetriever
+from src.retrieval.study_mode import StudyModeRetriever
+
+# Generation
+from src.generation.llm_client import LLMClient
+from src.generation.prompt_builder import PromptBuilder
+from src.generation.response_parser import ResponseParser
+
+# Chat History
+from src.chat_history.chat_history_manager import ChatHistoryManager
+
+# Agents
+from src.agents.web_search_agent import WebSearchAgent
+
+class MasterPipeline:
+    """
+    Main orchestrator connecting all components.
+    Provides unified interface for ingestion, retrieval, and generation.
+    """
+    
+    def __init__(self, mode: str = "chat", config_path: str = "config.yaml"):
+        self.config = Config(config_path)
+        self.mode = mode
+        self.session_id = str(uuid.uuid4())
+        
+        # Initialize storage
+        self.faiss_store = FAISSStore(dimension=self.config.embedding.dimension)
+        self.sqlite = SQLiteManager()
+        self.graph_storage = GraphStorage()
+        
+        # Initialize ingestion components
+        self.file_detector = FileDetector()
+        self.preprocessor = AdaptivePreprocessor()
+        self.embedder = EmbeddingPipeline(model_name=self.config.embedding.default_model)
+        self.cross_modal_merger = CrossModalMerger(embedder=self.embedder.embedder)
+        
+        # Initialize retrieval components
+        self.hybrid_retriever = HybridRetriever(self.faiss_store)
+        self.compressor = ContextualCompressor()
+        self.reranker = Reranker()
+        self.advanced_retriever = AdvancedRetriever(
+            self.hybrid_retriever, self.compressor, self.reranker
+        )
+        self.graph_retriever = GraphRetriever(self.graph_storage)
+        self.study_retriever = StudyModeRetriever(
+            self.advanced_retriever, self.graph_storage, self.graph_retriever
+        )
+        
+        # Initialize generation
+        self.llm: Optional[LLMClient] = None
+        self.prompt_builder = PromptBuilder()
+        self.response_parser = ResponseParser()
+        
+        # Initialize chat history
+        self.chat_history = ChatHistoryManager(
+            self.session_id, mode, self.graph_storage
+        )
+        
+        # Initialize source manager
+        self.source_manager = SourceManager(
+            self.faiss_store, self.sqlite, self.graph_storage
+        )
+        
+        # Initialize web search
+        self.web_search = WebSearchAgent()
+        
+        # Response cache for repeated queries
+        self._response_cache: Dict[str, str] = {}
+    
+    def set_mode(self, mode: str):
+        """Switch conversation mode."""
+        self.mode = mode
+        self.chat_history = ChatHistoryManager(
+            self.session_id, mode, self.graph_storage
+        )
+    
+    def set_llm(self, provider: str, model: str, api_key: str, **kwargs):
+        """Configure LLM."""
+        self.llm = LLMClient(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            **kwargs
+        )
+    
+    def ingest(self, file_path: str = None, url: str = None, 
+               source_type: str = None) -> str:
+        """
+        Ingest file or URL into knowledge base.
+        Returns source_id.
+        """
+        # Step 1: Detect type
+        if not source_type:
+            detection = self.file_detector.detect(file_path=file_path, url=url)
+            source_type = detection["source_type"]
+        
+        source_id = str(uuid.uuid4())
+        
+        # Step 2: Extract content based on type
+        if source_type == "pdf":
+            result = PDFPipeline.process(file_path, source_id)
+        elif source_type == "image":
+            result = ImagePipeline.process(file_path, source_id)
+        elif source_type in ["video", "audio"]:
+            result = VideoAudioPipeline.process(file_path, source_id)
+        elif source_type == "website":
+            import asyncio
+            result = asyncio.run(WebsitePipeline.process(url, source_id))
+        elif source_type == "youtube":
+            result = YouTubePipeline.process(url, source_id)
+        elif source_type == "csv":
+            result = CSVPipeline.process(file_path, source_id)
+        else:
+            raise ValueError(f"Unsupported source type: {source_type}")
+        
+        # Step 3: Preprocess
+        preprocessed = self.preprocessor.process(
+            result["content"], source_type, result.get("metadata", {})
+        )
+        
+        # Step 4: Chunk
+        strategy = preprocessed["recommendation"]["strategy"]
+        chunker = ChunkerRegistry.get_chunker(strategy)
+        chunks = chunker.chunk(preprocessed["cleaned_content"], {
+            "source_id": source_id,
+            "modality": result["modality"],
+            **result.get("metadata", {})
+        })
+        
+        # Step 5: Embed
+        chunks = self.embedder.embed_chunks(chunks)
+        
+        # Step 6: Cross-modal merge
+        chunks = self.cross_modal_merger.merge(chunks)
+        
+        # Step 7: Store
+        source = {
+            "id": source_id,
+            "title": result.get("metadata", {}).get("title", "Untitled"),
+            "source_type": source_type,
+            "file_path": file_path,
+            "url": url,
+            "metadata": result.get("metadata", {})
+        }
+        self.source_manager.add_source(source, chunks)
+        
+        # Step 8: Update sparse index for BM25
+        self.hybrid_retriever.build_sparse_index(list(self.faiss_store.metadata.values()))
+        
+        return source_id
+    
+    def generate(self, query: str, stream: bool = False) -> str:
+        """
+        Generate response for user query.
+        Uses mode-specific retrieval and prompting.
+        """
+        if not self.llm:
+            raise ValueError("LLM not configured. Call set_llm() first.")
+        
+        start_time = time.time()
+        
+        # Check cache
+        cache_key = f"{self.mode}:{query}"
+        if cache_key in self._response_cache and not stream:
+            return self._response_cache[cache_key]
+        
+        # Step 1: Embed query
+        query_embedding = self.embedder.embed_query(query)
+        
+        # Step 2: Retrieve based on mode
+        if self.mode == "chat":
+            retrieved = self.hybrid_retriever.retrieve(query, query_embedding)
+            learning_path = []
+        elif self.mode == "deep_research":
+            retrieved = self.advanced_retriever.retrieve(query, query_embedding)
+            learning_path = []
+        elif self.mode == "study":
+            study_result = self.study_retriever.retrieve(query, query_embedding)
+            retrieved = study_result["chunks"]
+            learning_path = study_result["learning_path"]
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+        
+        # Step 3: Get chat history context
+        history_context = self.chat_history.get_history_context(query)
+        
+        # Step 4: Build prompt
+        context = self.prompt_builder.format_context(retrieved)
+        
+        if self.mode == "chat":
+            prompt = self.prompt_builder.build_chat_prompt(query, context, history_context)
+        elif self.mode == "deep_research":
+            prompt = self.prompt_builder.build_deep_research_prompt(query, context, history_context)
+        elif self.mode == "study":
+            prompt = self.prompt_builder.build_study_mode_prompt(
+                query, context, learning_path, history_context
+            )
+        
+        # Step 5: Generate
+        if stream:
+            return self._stream_response(prompt, query, retrieved)
+        else:
+            response_text = self.llm.invoke(prompt)
+            
+            # Parse response
+            parsed = self.response_parser.parse(response_text)
+            
+            # Validate grounding
+            is_grounded = self.response_parser.validate_grounding(
+                parsed["content"], context
+            )
+            
+            # Store in chat history
+            self.chat_history.add_message(
+                "user", query, sources_used=[c.get("source_id") for c in retrieved]
+            )
+            self.chat_history.add_message(
+                "assistant", parsed["content"],
+                sources_used=[c.get("source_id") for c in retrieved]
+            )
+            
+            # Cache response
+            self._response_cache[cache_key] = parsed["content"]
+            
+            latency = (time.time() - start_time) * 1000
+            
+            return parsed["content"]
+    
+    def _stream_response(self, prompt: str, query: str, retrieved: List[Dict]) -> Iterator[str]:
+        """Stream response tokens."""
+        full_response = []
+        for token in self.llm.stream(prompt):
+            full_response.append(token)
+            yield token
+        
+        # Store complete response after streaming
+        complete = "".join(full_response)
+        self.chat_history.add_message("user", query)
+        self.chat_history.add_message("assistant", complete)
+    
+    def clear_cache(self):
+        """Clear response cache."""
+        self._response_cache.clear()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get pipeline statistics."""
+        return {
+            "mode": self.mode,
+            "session_id": self.session_id,
+            "sources": len(self.source_manager.sources),
+            "chunks": self.faiss_store.get_stats(),
+            "graph": self.graph_storage.get_stats(),
+            "cache_size": len(self._response_cache)
+        }
+```
+
+**AFTER CREATING**:
+- [ ] Create `check/test_24_full_pipeline.ipynb`
+- [ ] Test ingestion end-to-end
+- [ ] Test generation in each mode
+- [ ] Verify chat history tracking
+- [ ] Test mode switching
+
+**THIS IS THE CENTRAL PIPELINE**: All components connect here.
+
+---
+
+### PHASE 16: STREAMLIT UI
+
+**Goal**: Clean, efficient single-sidebar UI.
+
+**File**: `app.py`
+
+```python
+import streamlit as st
+from src.master_pipeline import MasterPipeline
+import os
+
+st.set_page_config(page_title="Mini NotebookLM", layout="wide")
+
+# Initialize session state
+if "pipeline" not in st.session_state:
+    st.session_state.pipeline = MasterPipeline(mode="chat")
+    st.session_state.messages = []
+    st.session_state.sources = []
+
+# Top bar
+col1, col2, col3 = st.columns([2, 3, 2])
+
+with col1:
+    st.title("Mini NotebookLM")
+
+with col2:
+    mode = st.radio(
+        "Mode",
+        options=["Chat", "Deep Research", "Study Mode"],
+        horizontal=True
+    )
+    mode_map = {"Chat": "chat", "Deep Research": "deep_research", "Study Mode": "study"}
+    st.session_state.pipeline.set_mode(mode_map[mode])
+
+with col3:
+    provider = st.selectbox("Provider", ["Groq", "Ollama", "OpenAI", "Gemini"])
+    api_key = st.text_input("API Key", type="password")
+    
+    if api_key:
+        st.session_state.pipeline.set_llm(
+            provider=provider.lower(),
+            model="llama-3.1-70b-versatile" if provider == "Groq" else "gpt-4",
+            api_key=api_key
+        )
+
+# Main layout
+left_col, main_col = st.columns([1, 3])
+
+# Left sidebar - Sources
+with left_col:
+    st.header("📚 Sources")
+    
+    # File upload
+    uploaded_file = st.file_uploader(
+        "Upload File",
+        type=["pdf", "txt", "csv", "png", "jpg", "mp4"]
+    )
+    if uploaded_file:
+        with st.spinner("Processing..."):
+            temp_path = f"temp_{uploaded_file.name}"
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            source_id = st.session_state.pipeline.ingest(file_path=temp_path)
+            st.success(f"Added: {uploaded_file.name}")
+            os.remove(temp_path)
+    
+    # Web search
+    st.subheader("🔍 Web Search")
+    web_query = st.text_input("Search query")
+    if st.button("Search", use_container_width=True) and web_query:
+        with st.spinner("Searching..."):
+            results = st.session_state.pipeline.web_search.search_and_format(web_query)
+            st.session_state.web_results = results
+    
+    # Display web results with checkboxes
+    if "web_results" in st.session_state:
+        st.write("Select sources to add:")
+        for result in st.session_state.web_results:
+            if st.checkbox(result["title"], key=result["id"]):
+                # Add selected source
+                pass
+    
+    # Source list
+    st.subheader("Added Sources")
+    sources = st.session_state.pipeline.source_manager.get_all_sources()
+    for source in sources:
+        col_a, col_b = st.columns([4, 1])
+        with col_a:
+            st.write(f"• {source.get('title', 'Untitled')[:30]}...")
+        with col_b:
+            if st.button("🗑️", key=f"del_{source['id']}"):
+                st.session_state.pipeline.source_manager.remove_source(source["id"])
+                st.rerun()
+
+# Main chat area
+with main_col:
+    st.header(f"💬 {mode} Mode")
+    
+    # Display messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask anything..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        with st.chat_message("assistant"):
+            if not st.session_state.pipeline.llm:
+                st.warning("Please enter API Key")
+            else:
+                with st.spinner("Thinking..."):
+                    response = st.session_state.pipeline.generate(prompt)
+                st.markdown(response)
+                st.session_state.messages.append({"role": "assistant", "content": response})
+
+# Bottom settings
+with st.expander("⚙️ Settings", expanded=False):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        temp = st.slider("Temperature", 0.0, 2.0, 0.7)
+    with col2:
+        top_p = st.slider("Top-p", 0.0, 1.0, 0.9)
+    with col3:
+        max_tokens = st.slider("Max Tokens", 128, 4096, 1024)
+    
+    if st.button("Apply"):
+        if st.session_state.pipeline.llm:
+            st.session_state.pipeline.llm.update_tuning(
+                temperature=temp, top_p=top_p, max_tokens=max_tokens
+            )
+            st.success("Settings applied!")
+    
+    if st.button("🕸️ Show Knowledge Graph"):
+        # Display graph visualization
+        pass
+```
+
+**AFTER CREATING**:
+- [ ] Create `check/test_25_ui_integration.ipynb`
+- [ ] Test UI components
+- [ ] Verify mode switching
+- [ ] Test file upload flow
+
+---
+
+### PHASE 17: BACKEND ORCHESTRATOR
+
+**Goal**: Separate backend process for initialization.
+
+**File**: `backend.py`
+
+```python
+#!/usr/bin/env python3
+"""
+Backend orchestrator for Mini NotebookLM.
+Run this first, then run Streamlit UI.
+"""
+
+import time
+import sys
+from src.master_pipeline import MasterPipeline
+
+def main():
+    print("🚀 Starting Mini NotebookLM Backend...")
+    
+    # Initialize pipeline (loads models, indexes, etc.)
+    pipeline = MasterPipeline(mode="chat")
+    
+    print("✅ Backend initialized successfully!")
+    print(f"📊 Stats: {pipeline.get_stats()}")
+    print("📡 Ready to serve requests...")
+    print("\nPress Ctrl+C to stop\n")
+    
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down...")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### PHASE 18: DOCKER DEPLOYMENT
+
+**File**: `Dockerfile`
+
+```dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libmagic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY . .
+
+# Create data directories
+RUN mkdir -p data/uploads data/vector_store data/knowledge_graph data/chat_history data/cache data/logs
+
+# Expose port for Streamlit
+EXPOSE 8501
+
+# Default command
+CMD ["streamlit", "run", "app.py"]
+```
+
+**File**: `docker-compose.yml`
+
+```yaml
+version: '3.8'
+
+services:
+  mininotebooklm:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: streamlit run app.py
+```
+
+---
+
+## 5. TESTING STRATEGY
+
+### 5.1 Notebook-Based Testing (Primary)
+
+Every component MUST have a corresponding Jupyter notebook in `check/` folder:
+
+| Test File | What to Test | Success Criteria |
+|-----------|--------------|------------------|
+| `test_01_file_detector.ipynb` | File type detection | All 6 types detected correctly |
+| `test_02_pdf_pipeline.ipynb` | PDF extraction | Text extracted with page numbers |
+| `test_03_image_pipeline.ipynb` | Image captioning | Caption generated (or fallback works) |
+| `test_04_video_pipeline.ipynb` | Video transcription | Timestamps present |
+| `test_05_website_pipeline.ipynb` | Website scraping | Clean text extracted |
+| `test_06_youtube_pipeline.ipynb` | YouTube download | Audio transcribed |
+| `test_07_csv_pipeline.ipynb` | CSV processing | Table structure preserved |
+| `test_08_preprocessing.ipynb` | Content cleaning | Boilerplate removed |
+| `test_09_analyzer.ipynb` | Strategy recommendation | Correct strategy suggested |
+| `test_10_chunkers.ipynb` | All chunking strategies | Chunks created correctly |
+| `test_11_embedding.ipynb` | Embedding generation | Correct dimensions |
+| `test_12_cross_modal.ipynb` | Cross-modal linking | Related chunks found |
+| `test_13_storage.ipynb` | FAISS/SQLite/Graph | CRUD operations work |
+| `test_14_hybrid.ipynb` | Hybrid retrieval | Both dense + sparse used |
+| `test_15_compressor.ipynb` | Contextual compression | Only relevant sentences kept |
+| `test_16_reranker.ipynb` | Cross-encoder | Results reordered |
+| `test_17_study_mode.ipynb` | Smart fusion | Learning path extracted |
+| `test_18_graph.ipynb` | Graph traversal | Paths found |
+| `test_19_llm.ipynb` | LLM client | Response generated |
+| `test_20_prompts.ipynb` | Prompt building | Correct format |
+| `test_21_chat_history.ipynb` | History management | Relevant messages retrieved |
+| `test_22_web_search.ipynb` | Web search | Results returned |
+| `test_23_source_manager.ipynb` | Source lifecycle | Add/remove/cleanup work |
+| `test_24_pipeline.ipynb` | Full pipeline | End-to-end ingestion + query |
+| `test_25_ui.ipynb` | UI components | Streamlit renders |
+
+### 5.2 PyTest Testing (Secondary)
+
+For CI/CD, create `tests/` folder with pytest tests:
+
+```python
+# tests/test_ingestion.py
+import pytest
+from src.ingestion.file_detector import FileDetector
+
+def test_pdf_detection():
+    result = FileDetector._detect_from_file("test.pdf")
+    assert result["source_type"] == "pdf"
+
+def test_youtube_url_detection():
+    result = FileDetector._detect_from_url("https://youtube.com/watch?v=123")
+    assert result["source_type"] == "youtube"
+```
+
+---
+
+## 6. ANTI-HALLUCINATION CHECKLIST
+
+For implementation agents, follow this strictly:
+
+### 6.1 Before Implementing
+- [ ] Read the EXACT file path from this PRD
+- [ ] Check if dependent files exist (import them)
+- [ ] Verify function signatures match this PRD
+
+### 6.2 During Implementation
+- [ ] Write code for ONE file at a time
+- [ ] Add type hints to all functions
+- [ ] Add docstrings to all classes/methods
+- [ ] Handle exceptions with try/except
+- [ ] Never assume dependencies exist - import and check
+
+### 6.3 After Implementing
+- [ ] Create test notebook in `check/` folder
+- [ ] Run the notebook - ALL cells must pass
+- [ ] If any cell fails, fix before moving on
+- [ ] Verify the file connects to pipeline (can be imported by master_pipeline.py)
+
+### 6.4 Forbidden Actions
+- [ ] NEVER skip testing after implementing a file
+- [ ] NEVER change function signatures without updating all callers
+- [ ] NEVER use global variables for state
+- [ ] NEVER ignore exceptions with bare `except:`
+- [ ] NEVER create files not in this PRD
+- [ ] NEVER skip the `CONNECT TO PIPELINE` step
+
+---
+
+## 7. DEPENDENCIES
+
+**File**: `requirements.txt`
+
+```text
+# Core
+python-magic>=0.4.27
+pydantic>=2.0.0
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# LangChain
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-experimental>=0.0.50
+
+# Embeddings & LLM
+sentence-transformers>=2.2.0
+transformers>=4.30.0
+torch>=2.0.0
+
+# Vector Store
+faiss-cpu>=1.7.4
+
+# Sparse Retrieval
+rank-bm25>=0.2.2
+
+# Graph
+networkx>=3.1
+
+# Database
+sqlite3
+
+# Web & Documents
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+trafilatura>=1.6.0
+crawl4ai>=0.2.0
+
+# PDF
+pymupdf>=1.23.0
+
+# Video/Audio
+faster-whisper>=0.10.0
+yt-dlp>=2023.10.0
+
+# Data
+pandas>=2.0.0
+numpy>=1.24.0
+
+# UI
+streamlit>=1.28.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# Visualization
+matplotlib>=3.7.0
+```
+
+---
+
+## 8. IMPLEMENTATION ORDER FOR AI AGENTS
+
+### Week 1: Foundation
+1. Phase 1: Project setup (config, models, exceptions)
+2. Phase 2: File detector
+3. Phase 3: PDF pipeline + test
+
+### Week 2: Ingestion
+4. Image pipeline + test
+5. Video/audio pipeline + test
+6. Website/YouTube/CSV pipelines + tests
+
+### Week 3: Preprocessing & Chunking
+7. Adaptive preprocessing + analyzers
+8. All chunking strategies + registry
+9. Test all chunkers
+
+### Week 4: Embedding & Storage
+10. Embedding pipeline + caching
+11. Cross-modal merger
+12. FAISS + SQLite + Graph storage
+
+### Week 5: Retrieval
+13. Hybrid retriever
+14. Contextual compressor + reranker
+15. Advanced retriever + study mode
+
+### Week 6: Generation & History
+16. LLM client + prompt builder
+17. Chat history (RAG + Graph)
+18. Web search agent
+
+### Week 7: Integration
+19. Source manager
+20. Master pipeline
+21. Full pipeline testing
+
+### Week 8: UI & Deployment
+22. Streamlit UI
+23. Backend orchestrator
+24. Docker setup
+25. Final integration testing
+
+---
+
+## 9. MODEL LIMITATIONS & CONSIDERATIONS
+
+### Kimi K2.6 (256K Context)
+- **Strengths**: Large context window, good for long documents
+- **Limitations**: Keep prompts under 128K to avoid truncation
+- **Strategy**: Use contextual compression to limit context size
+
+### Gemini 3 Flash (1M Context)
+- **Strengths**: Very large context, fast responses
+- **Limitations**: May lose focus with very long contexts
+- **Strategy**: Use hierarchical chunking to maintain structure
+
+### General Guidelines
+- Never send more than 8-10 chunks to LLM at once
+- Use compression to reduce token usage
+- Cache responses to avoid repeated calls
+- Stream responses for better UX
+
+---
+
+## 10. PIPELINE CONNECTION VERIFICATION
+
+After implementing EACH phase, verify:
+
+```python
+# Verification script for each component
+def verify_component(component_name, import_path, test_func):
+    try:
+        module = __import__(import_path, fromlist=[component_name])
+        component = getattr(module, component_name)
+        result = test_func(component)
+        print(f"✅ {component_name}: PASSED")
+        return True
+    except Exception as e:
+        print(f"❌ {component_name}: FAILED - {e}")
+        return False
+
+# Example verifications
+verify_component("FileDetector", "src.ingestion.file_detector", 
+                lambda x: x.detect(file_path="test.pdf"))
+verify_component("PDFPipeline", "src.ingestion.pipelines.pdf_pipeline",
+                lambda x: x.process("test.pdf", "source_1"))
+verify_component("MasterPipeline", "src.master_pipeline",
+                lambda x: x.get_stats())
+```
+
+---
+
+## 11. TROUBLESHOOTING GUIDE
+
+### Common Issues
+
+**Issue**: FAISS index not found
+**Solution**: Ensure `data/vector_store/` directory exists
+
+**Issue**: Ollama not responding
+**Solution**: Check if Ollama is running: `curl http://localhost:11434/api/tags`
+
+**Issue**: Out of memory during embedding
+**Solution**: Reduce batch size in config.yaml
+
+**Issue**: Slow retrieval
+**Solution**: Enable caching, reduce top_k, use simpler chunking
+
+**Issue**: Hallucinated responses
+**Solution**: Enable strict grounding, validate context overlap > 30%
+
+---
+
+## 12. PERFORMANCE TARGETS
+
+| Metric | Chat Mode | Deep Research | Study Mode |
+|--------|-----------|---------------|------------|
+| Ingestion (100 pages) | < 30s | < 60s | < 60s |
+| Query Latency | < 2s | < 5s | < 5s |
+| Streaming Start | < 500ms | < 1s | < 1s |
+| Memory Usage | < 2GB | < 4GB | < 4GB |
+| Context Window | < 4K tokens | < 8K tokens | < 8K tokens |
+
+---
+
+## 13. SECURITY CONSIDERATIONS
+
+- API keys stored in environment variables only
+- File uploads validated by type and size
+- SQLite parameterized queries

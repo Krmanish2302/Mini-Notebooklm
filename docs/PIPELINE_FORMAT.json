@@ -1,0 +1,5 @@
+{
+    "content": str,           // Extracted text/content
+    "metadata": dict,         // Source metadata
+    "modality": str           // "text" | "image_caption" | "transcript" | "table"
+}
