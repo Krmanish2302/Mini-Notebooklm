@@ -1,130 +1,161 @@
-from typing import List, Dict, Any, Optional
+"""
+source_manager.py  —  Source lifecycle manager
+
+Fixes vs original:
+    - sources dict hydrated from SQLite on __init__ (was always empty on restart)
+    - remove_source uses per-dim FAISS deletion via MultiFAISSStore
+    - tracks embedding_model + faiss_dim per chunk for correct deletion routing
+"""
+from __future__ import annotations
+
+import logging
 import uuid
-from .faiss_store import FAISSStore
+from collections import defaultdict
+from typing import Dict, List, Any, Optional
+
+from .faiss_store import MultiFAISSStore
 from .sqlite_manager import SQLiteManager
-from src.graph.graph_storage import GraphStorage
+
+logger = logging.getLogger(__name__)
+
 
 class SourceManager:
     """
-    Manages sources with full lifecycle:
-    - Add sources (upload or web search)
-    - Remove sources (with storage cleanup)
-    - Batch operations
-    - Duplicate detection
+    Manages source lifecycle across MultiFAISSStore + SQLite + KnowledgeGraph.
     """
-    
-    def __init__(self, faiss_store: FAISSStore, sqlite_manager: SQLiteManager, 
-                 graph_storage: GraphStorage = None):
+
+    def __init__(
+        self,
+        faiss_store: MultiFAISSStore,
+        sqlite_manager: SQLiteManager,
+        graph_storage=None,
+    ):
         self.faiss = faiss_store
         self.sqlite = sqlite_manager
         self.graph = graph_storage
-        self.sources: Dict[str, Dict[str, Any]] = {}
-    
-    def add_source(self, source: Dict[str, Any], chunks: List[Dict[str, Any]]) -> str:
-        """Add source with chunks to all storage."""
-        source_id = source.get("id", str(uuid.uuid4()))
+        # Hydrate from DB — fixes the "sources always empty" bug
+        self.sources: Dict[str, Dict[str, Any]] = {
+            s["id"]: s for s in self.sqlite.get_sources()
+        }
+        logger.info("SourceManager: hydrated %d sources from DB", len(self.sources))
+
+    # ── add ───────────────────────────────────────────────────────────────────
+
+    def add_source(
+        self,
+        source: Dict[str, Any],
+        chunks: List[Dict[str, Any]],
+        embedding_model: str,
+        dim: int,
+    ) -> str:
+        """
+        Persist a source + its embedded chunks.
+
+        Args:
+            source:          Source metadata dict (must have 'id').
+            chunks:          List of chunk dicts, each with 'embedding' field.
+            embedding_model: Name/id of the embedding model used.
+            dim:             Embedding dimensionality.
+        """
+        source_id = source.get("id") or str(uuid.uuid4())
         source["id"] = source_id
-        
-        # Store metadata
+
+        # 1. SQLite source row
         self.sqlite.add_source(source)
         self.sources[source_id] = source
-        
-        # Store chunks in FAISS
-        if chunks:
-            self.faiss.add(chunks)
-        
-        # Persist chunks to SQLite for durability
+
+        # 2. FAISS — multi-dim store handles dim routing
+        self.faiss.add_chunks(chunks, dim=dim)
+
+        # 3. SQLite chunk rows — annotated with embedding provenance
         for chunk in chunks:
-            chunk_record = {
-                "id": chunk.get("id"),
-                "source_id": source_id,
-                "content": chunk.get("content", ""),
-                "modality": chunk.get("modality", "text"),
-                "metadata": chunk.get("metadata", {})
-            }
-            self.sqlite.add_chunk(chunk_record)
-        
-        # Add to graph
+            cid = chunk["id"]
+            self.sqlite.add_chunk({
+                "id":               cid,
+                "source_id":        source_id,
+                "content":          chunk.get("content", ""),
+                "modality":         chunk.get("modality", "text"),
+                "metadata":         chunk.get("metadata", {}),
+                "embedding_model":  embedding_model,
+                "faiss_dim":        dim,
+                "faiss_internal_id": self.faiss._indexes[dim].id_map.get(cid),
+            })
+
+        # 4. KnowledgeGraph nodes
         if self.graph:
             for chunk in chunks:
                 self.graph.add_chunk(chunk)
-                # Link chunks from same source
-                for other_chunk in chunks:
-                    if chunk["id"] != other_chunk["id"]:
-                        self.graph.add_relationship(
-                            chunk["id"], other_chunk["id"], "same_source", 0.5
-                        )
-        
-        return source_id
-    
-    def remove_source(self, source_id: str) -> bool:
-        """Remove source and all associated data."""
-        if source_id not in self.sources:
-            return False
-        
-        # Get chunk IDs for this source
-        chunk_ids = [
-            cid for cid, chunk in self.faiss.metadata.items()
-            if chunk.get("source_id") == source_id
-        ]
-        
-        # Remove from FAISS
-        if chunk_ids:
-            self.faiss.delete(chunk_ids)
-        
-        # Remove from graph
-        if self.graph:
-            for cid in chunk_ids:
-                if cid in self.graph.graph:
-                    self.graph.graph.remove_node(cid)
-        
-        # Remove from SQLite
-        import sqlite3
-        with sqlite3.connect(self.sqlite.db_path) as conn:
-            conn.execute("DELETE FROM chunks WHERE source_id = ?", (source_id,))
-            conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
-        
-        # Remove from memory
-        del self.sources[source_id]
-        return True
-    
-    def batch_remove_sources(self, source_ids: List[str]) -> Dict[str, bool]:
-        """Remove multiple sources."""
-        results = {}
-        for sid in source_ids:
-            results[sid] = self.remove_source(sid)
-        return results
-    
-    def remove_duplicates(self) -> int:
-        """Remove duplicate chunks based on content hash."""
-        # Calculate content hashes
-        content_hashes = {}
-        duplicates = []
-        
-        for cid, chunk in self.faiss.metadata.items():
-            content_hash = hash(chunk["content"])
-            if content_hash in content_hashes:
-                duplicates.append(cid)
-            else:
-                content_hashes[content_hash] = cid
-        
-        # Remove duplicates
-        if duplicates:
-            self.faiss.delete(duplicates)
-        
-        return len(duplicates)
-    
-    def get_all_sources(self) -> List[Dict[str, Any]]:
-        """Get all active sources."""
-        return list(self.sources.values())
-    
-    def get_source_stats(self, source_id: str) -> Dict[str, int]:
-        """Get statistics for a source."""
-        chunk_count = sum(
-            1 for c in self.faiss.metadata.values()
-            if c.get("source_id") == source_id
+
+        logger.info(
+            "SourceManager: added source %s — %d chunks (model=%s dim=%d)",
+            source_id, len(chunks), embedding_model, dim,
         )
+        return source_id
+
+    # ── delete ────────────────────────────────────────────────────────────────
+
+    def remove_source(self, source_id: str) -> bool:
+        """
+        Fully delete a source and all its chunks from every store.
+
+        Steps:
+            1. Lookup chunk rows from SQLite (has faiss_dim + faiss_internal_id)
+            2. Group chunk IDs by faiss_dim
+            3. Call MultiFAISSStore.delete_chunks(chunk_ids, dim) per group
+            4. Remove KnowledgeGraph nodes
+            5. Purge SQLite rows
+            6. Drop in-memory entry
+        """
+        if source_id not in self.sources:
+            logger.warning("SourceManager.remove_source: unknown source %s", source_id)
+            return False
+
+        # Step 1: get chunk metadata
+        chunk_rows = self.sqlite.get_chunks_for_deletion(source_id)
+
+        # Step 2: group by dim
+        by_dim: Dict[int, List[str]] = defaultdict(list)
+        for row in chunk_rows:
+            d = row.get("faiss_dim")
+            if d is not None:
+                by_dim[d].append(row["id"])
+
+        # Step 3: FAISS deletion per dim
+        for dim, chunk_ids in by_dim.items():
+            self.faiss.delete_chunks(chunk_ids, dim=dim)
+
+        # Step 4: KnowledgeGraph
+        if self.graph:
+            for row in chunk_rows:
+                cid = row["id"]
+                try:
+                    self.graph.graph.remove_node(cid)
+                except Exception:
+                    pass
+
+        # Step 5: SQLite purge
+        self.sqlite.delete_source(source_id)
+
+        # Step 6: memory
+        del self.sources[source_id]
+
+        logger.info(
+            "SourceManager: removed source %s — %d chunks across %d FAISS indexes",
+            source_id, len(chunk_rows), len(by_dim),
+        )
+        return True
+
+    # ── utils ─────────────────────────────────────────────────────────────────
+
+    def get_all_sources(self) -> List[Dict[str, Any]]:
+        return list(self.sources.values())
+
+    def get_source_count(self) -> int:
+        return len(self.sources)
+
+    def get_source_stats(self, source_id: str) -> Dict:
+        chunks = self.sqlite.get_chunks_by_source(source_id)
         return {
-            "chunk_count": chunk_count,
-            "source_type": self.sources.get(source_id, {}).get("source_type", "unknown")
+            "chunk_count": len(chunks),
+            "source_type": self.sources.get(source_id, {}).get("source_type", "unknown"),
         }

@@ -1,60 +1,37 @@
 # Core
-python-magic>=0.4.27
-pydantic>=2.0.0
-pyyaml>=6.0
-python-dotenv>=1.0.0
-nest_asyncio>=1.6.0
-
-# LangChain
-langchain>=0.1.0
-langchain-community>=0.0.10
-langchain-experimental>=0.0.50
-
-# Embeddings & LLM
-sentence-transformers>=2.2.0
-transformers>=4.30.0
-torch>=2.0.0
-
-# Vector Store
-faiss-cpu>=1.7.4
-
-# Sparse Retrieval
-rank-bm25>=0.2.2
-
-# Graph
-networkx>=3.1
-
-# Web & Documents
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-trafilatura>=1.6.0
-crawl4ai>=0.2.0
-
-# YouTube (transcript API -- no audio download needed)
-youtube-transcript-api>=0.6.1
-
-# PDF
-pymupdf>=1.23.0
-
-# Data
-pandas>=2.0.0
-numpy>=1.24.0
-
-# Document Profiler
-nltk>=3.8.1
-scipy>=1.11.0
-
-# API Backend
+streamlit>=1.28.0
 fastapi>=0.104.0
 uvicorn>=0.24.0
+nest_asyncio>=1.5.6
 
-# UI
-streamlit>=1.28.0
+# LangChain + LangGraph
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
+langgraph>=0.2.0
 
-# Testing
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
+# Embeddings
+sentence-transformers>=2.2.2
 
-# Visualization
-matplotlib>=3.7.0
-tabulate
+# Vector store
+faiss-cpu>=1.7.4
+
+# Document parsing
+pypdf>=3.17.0
+trafilatura>=1.6.0
+crawl4ai>=0.3.0
+youtube-transcript-api>=0.6.1
+
+# Data
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Graph
+networkx>=3.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+httpx>=0.25.0
+aiohttp>=3.9.0

@@ -1,105 +1,223 @@
+"""
+faiss_store.py  —  Multi-dimensional FAISS store
+
+Design:
+    One IndexIDMap2(IndexFlatIP) per embedding dimension.
+    IndexIDMap2 + DirectMap.Hashtable enables O(1) deletion by FAISS internal
+    ID without scanning the full index.
+
+    dim_registry maps:  dim (int) → FAISSIndex dataclass
+    Each index is persisted at:  <base_dir>/faiss_<dim>.index
+
+Deletion flow:
+    delete_by_source(source_id)
+      → SQLite lookup: all (chunk_id, faiss_internal_id, dim) for source
+      → group by dim
+      → per dim: index.remove_ids(faiss_internal_ids)
+      → SQLite purge
+
+Retrieval flow:
+    search(query_vectors_by_dim, k)
+      → for each dim: search that index with correct query vector
+      → return {dim: [(chunk_id, score), ...]}
+      → caller applies RRF fusion
+"""
+from __future__ import annotations
+
+import os
+import pickle
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
+
 import faiss
 import numpy as np
-import pickle
-import os
-from typing import List, Dict, Any, Optional
 
-class FAISSStore:
-    """FAISS vector store with metadata."""
-    
-    def __init__(self, dimension: int = 384, index_path: str = "./data/vector_store/index.faiss"):
-        self.dimension = dimension
-        self.index_path = index_path
-        self.metadata_path = index_path.replace(".faiss", "_meta.pkl")
-        self.metadata: Dict[str, Any] = {}
-        # Ordered list of chunk IDs that maps 1:1 with FAISS internal indices
-        self._id_map: List[str] = []
-        self._load_or_create()
-    
-    def _load_or_create(self):
-        if os.path.exists(self.index_path):
-            self.index = faiss.read_index(self.index_path)
-            with open(self.metadata_path, 'rb') as f:
-                saved = pickle.load(f)
-                self.metadata = saved.get("metadata", saved) if isinstance(saved, dict) and "metadata" in saved else saved
-                self._id_map   = saved.get("id_map", list(self.metadata.keys())) if isinstance(saved, dict) and "id_map" in saved else list(self.metadata.keys())
-        else:
-            self.index = faiss.IndexFlatIP(self.dimension)  # Inner product = cosine if normalized
-            os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
-    
-    def add(self, chunks: List[Dict[str, Any]]):
-        """Add chunks with embeddings."""
-        embeddings = []
+logger = logging.getLogger(__name__)
+
+_BASE_DIR = "./data/vector_store"
+
+
+@dataclass
+class _DimIndex:
+    """One FAISS index for a specific embedding dimension."""
+    dim: int
+    index: faiss.Index
+    # chunk_id → faiss internal int64 ID
+    id_map: Dict[str, int] = field(default_factory=dict)
+    # faiss internal int64 ID → chunk_id  (reverse map)
+    rev_map: Dict[int, str] = field(default_factory=dict)
+    _next_id: int = 0
+
+    def next_id(self) -> int:
+        fid = self._next_id
+        self._next_id += 1
+        return fid
+
+
+class MultiFAISSStore:
+    """
+    Multi-dimensional FAISS store backed by LangChain-compatible metadata.
+
+    Each embedding model produces a fixed dimension.  Documents embedded with
+    different models are stored in separate per-dim indexes.  At query time the
+    caller provides a query vector per active dimension; results are merged by
+    the HybridRetriever using RRF.
+    """
+
+    def __init__(self, base_dir: str = _BASE_DIR):
+        self.base_dir = base_dir
+        os.makedirs(base_dir, exist_ok=True)
+        # dim → _DimIndex
+        self._indexes: Dict[int, _DimIndex] = {}
+        self._load_all()
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def add_chunks(self, chunks: List[Dict], dim: int) -> None:
+        """
+        Add embedded chunks to the index for *dim*.
+
+        Each chunk must have:
+            chunk["id"]        : str
+            chunk["embedding"] : List[float] | np.ndarray  — length == dim
+        """
+        if not chunks:
+            return
+        idx = self._get_or_create(dim)
+        vectors, ids = [], []
         for chunk in chunks:
-            if "embedding" not in chunk:
-                raise ValueError(f"Chunk {chunk['id']} missing embedding")
-            chunk_id = chunk["id"]
-            embeddings.append(chunk["embedding"])
-            self.metadata[chunk_id] = chunk
-            self._id_map.append(chunk_id)  # Track positional order
-        
-        embeddings = np.array(embeddings).astype('float32')
-        faiss.normalize_L2(embeddings)  # Normalize for cosine similarity
-        self.index.add(embeddings)
-        self._save()
-    
-    def search(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for similar chunks."""
-        if self.index.ntotal == 0:
-            return []
-        
-        k = min(k, self.index.ntotal)
-        query_embedding = np.array([query_embedding]).astype('float32')
-        faiss.normalize_L2(query_embedding)
-        
-        distances, indices = self.index.search(query_embedding, k)
-        
-        results = []
-        for idx, dist in zip(indices[0], distances[0]):
-            if idx == -1 or idx >= len(self._id_map):
+            emb = np.array(chunk["embedding"], dtype="float32")
+            if emb.shape[0] != dim:
+                raise ValueError(
+                    f"Embedding dim mismatch: expected {dim}, got {emb.shape[0]}"
+                )
+            fid = idx.next_id()
+            idx.id_map[chunk["id"]] = fid
+            idx.rev_map[fid] = chunk["id"]
+            vectors.append(emb)
+            ids.append(fid)
+
+        mat = np.stack(vectors).astype("float32")
+        faiss.normalize_L2(mat)
+        idx.index.add_with_ids(mat, np.array(ids, dtype=np.int64))
+        self._save(dim)
+        logger.debug("MultiFAISSStore: added %d chunks to dim=%d", len(chunks), dim)
+
+    def search(
+        self,
+        query_vectors: Dict[int, np.ndarray],
+        k: int = 10,
+    ) -> Dict[int, List[Tuple[str, float]]]:
+        """
+        Search all requested dimensions in parallel.
+
+        Args:
+            query_vectors: {dim: query_vector (1-D np.ndarray)}
+            k:             top-K per index
+
+        Returns:
+            {dim: [(chunk_id, score), ...]}  — sorted by score desc per dim
+        """
+        results: Dict[int, List[Tuple[str, float]]] = {}
+        for dim, qvec in query_vectors.items():
+            if dim not in self._indexes:
+                results[dim] = []
                 continue
-            chunk_id = self._id_map[idx]  # Use positional map — correct!
-            if chunk_id not in self.metadata:
+            idx = self._indexes[dim]
+            if idx.index.ntotal == 0:
+                results[dim] = []
                 continue
-            chunk = self.metadata[chunk_id].copy()
-            chunk["score"] = float(dist)
-            results.append(chunk)
-        
+            q = qvec.astype("float32").reshape(1, -1)
+            faiss.normalize_L2(q)
+            actual_k = min(k, idx.index.ntotal)
+            distances, indices = idx.index.search(q, actual_k)
+            hits = []
+            for fid, score in zip(indices[0], distances[0]):
+                if fid < 0:
+                    continue
+                cid = idx.rev_map.get(int(fid))
+                if cid:
+                    hits.append((cid, float(score)))
+            results[dim] = hits
         return results
-    
-    def delete(self, chunk_ids: List[str]):
-        """Remove chunks by ID. Requires rebuilding index."""
-        id_set = set(chunk_ids)
+
+    def delete_chunks(self, chunk_ids: List[str], dim: int) -> None:
+        """
+        Physically remove vectors from the index for *dim*.
+        Uses IndexIDMap2 + Hashtable direct map — O(1) per deletion.
+        """
+        if dim not in self._indexes:
+            return
+        idx = self._indexes[dim]
+        fids = [idx.id_map[cid] for cid in chunk_ids if cid in idx.id_map]
+        if not fids:
+            return
+        sel = faiss.IDSelectorArray(np.array(fids, dtype=np.int64))
+        idx.index.remove_ids(sel)
         for cid in chunk_ids:
-            if cid in self.metadata:
-                del self.metadata[cid]
-        self._id_map = [cid for cid in self._id_map if cid not in id_set]
-        self._rebuild_index()
-    
-    def _rebuild_index(self):
-        """Rebuild FAISS index from metadata (preserving id_map order)."""
-        self.index = faiss.IndexFlatIP(self.dimension)
-        new_id_map = []
-        if self._id_map:
-            embeddings = []
-            for cid in self._id_map:
-                if cid in self.metadata:
-                    embeddings.append(self.metadata[cid]["embedding"])
-                    new_id_map.append(cid)
-            self._id_map = new_id_map
-            if embeddings:
-                embeddings = np.array(embeddings).astype('float32')
-                faiss.normalize_L2(embeddings)
-                self.index.add(embeddings)
-        self._save()
-    
-    def _save(self):
-        faiss.write_index(self.index, self.index_path)
-        with open(self.metadata_path, 'wb') as f:
-            pickle.dump({"metadata": self.metadata, "id_map": self._id_map}, f)
-    
-    def get_stats(self) -> Dict[str, int]:
+            fid = idx.id_map.pop(cid, None)
+            if fid is not None:
+                idx.rev_map.pop(fid, None)
+        self._save(dim)
+        logger.info("MultiFAISSStore: deleted %d vectors from dim=%d", len(fids), dim)
+
+    def active_dims(self) -> List[int]:
+        """Return list of dimensions that have at least one vector."""
+        return [d for d, idx in self._indexes.items() if idx.index.ntotal > 0]
+
+    def get_stats(self) -> Dict:
         return {
-            "total_chunks": len(self.metadata),
-            "index_size": self.index.ntotal
+            str(d): {"total": idx.index.ntotal, "tracked": len(idx.id_map)}
+            for d, idx in self._indexes.items()
         }
+
+    # ── persistence ───────────────────────────────────────────────────────────
+
+    def _index_path(self, dim: int) -> str:
+        return os.path.join(self.base_dir, f"faiss_{dim}.index")
+
+    def _meta_path(self, dim: int) -> str:
+        return os.path.join(self.base_dir, f"faiss_{dim}_meta.pkl")
+
+    def _get_or_create(self, dim: int) -> _DimIndex:
+        if dim not in self._indexes:
+            flat = faiss.IndexFlatIP(dim)
+            idmap = faiss.IndexIDMap2(flat)
+            idmap.set_direct_map(faiss.DirectMap.Hashtable)
+            self._indexes[dim] = _DimIndex(dim=dim, index=idmap)
+        return self._indexes[dim]
+
+    def _save(self, dim: int) -> None:
+        idx = self._indexes[dim]
+        faiss.write_index(idx.index, self._index_path(dim))
+        with open(self._meta_path(dim), "wb") as f:
+            pickle.dump(
+                {"id_map": idx.id_map, "rev_map": idx.rev_map, "next_id": idx._next_id},
+                f,
+            )
+
+    def _load_all(self) -> None:
+        """Reload all persisted indexes on startup."""
+        for fname in os.listdir(self.base_dir):
+            if not fname.startswith("faiss_") or not fname.endswith(".index"):
+                continue
+            try:
+                dim = int(fname.replace("faiss_", "").replace(".index", ""))
+                index = faiss.read_index(self._index_path(dim))
+                meta_path = self._meta_path(dim)
+                if os.path.exists(meta_path):
+                    with open(meta_path, "rb") as f:
+                        meta = pickle.load(f)
+                    di = _DimIndex(
+                        dim=dim, index=index,
+                        id_map=meta.get("id_map", {}),
+                        rev_map=meta.get("rev_map", {}),
+                        _next_id=meta.get("next_id", 0),
+                    )
+                else:
+                    di = _DimIndex(dim=dim, index=index)
+                self._indexes[dim] = di
+                logger.info("MultiFAISSStore: loaded dim=%d (%d vectors)", dim, index.ntotal)
+            except Exception as e:
+                logger.warning("MultiFAISSStore: failed to load %s — %s", fname, e)

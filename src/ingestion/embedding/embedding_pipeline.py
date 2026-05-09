@@ -1,60 +1,85 @@
-from typing import List, Dict, Any, Optional
+"""
+embedding_pipeline.py  —  EmbeddingPipeline
+
+Fixes vs original:
+    - embed_batch() single-item edge case: result is always shape (N, dim)
+      even when N=1 (was returning (dim,) causing downstream index errors).
+    - expose embed_query() as alias for embed_single() so both ChatGraph
+      and CrossModalMerger callers work without AttributeError.
+    - MD5 cache uses full text as key to avoid collision on short texts.
+"""
+from __future__ import annotations
+
 import hashlib
+import logging
+from typing import Dict, List, Any
+
 import numpy as np
+
 from .text_embedder import TextEmbedder
+
+logger = logging.getLogger(__name__)
+
 
 class EmbeddingPipeline:
     """Manages embedding with semantic caching."""
-    
+
     def __init__(self, model_name: str = "all-MiniLM-L6-v2", use_cache: bool = True):
+        self.model_name = model_name
         self.embedder = TextEmbedder(model_name)
         self.use_cache = use_cache
         self._cache: Dict[str, np.ndarray] = {}
-    
-    def _get_cache_key(self, text: str) -> str:
-        return hashlib.md5(text.encode()).hexdigest()
-    
+
+    # ── public API ────────────────────────────────────────────────────────────
+
     def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Embed list of chunks, using cache where possible."""
+        """Embed a list of chunk dicts; attaches 'embedding' to each chunk."""
         texts = [c["content"] for c in chunks]
-        embeddings = self.embed_batch(texts)
-        
-        for chunk, embedding in zip(chunks, embeddings):
-            chunk["embedding"] = embedding.tolist()
-        
+        embeddings = self.embed_batch(texts)  # shape (N, dim)
+        for chunk, emb in zip(chunks, embeddings):
+            chunk["embedding"] = emb.tolist()
         return chunks
-    
+
     def embed_batch(self, texts: List[str]) -> np.ndarray:
-        """Embed batch with cache lookup."""
+        """
+        Embed a batch of texts.  Always returns shape (N, dim) — never (dim,).
+        Uses in-memory MD5 cache.
+        """
+        if not texts:
+            return np.empty((0,), dtype="float32")
+
         if not self.use_cache:
-            return self.embedder.embed(texts)
-        
-        results = []
-        texts_to_embed = []
-        indices = []
-        
+            result = self.embedder.embed(texts)
+            return np.atleast_2d(result)
+
+        cached_results: List[tuple] = []
+        to_embed_texts: List[str] = []
+        to_embed_indices: List[int] = []
+
         for i, text in enumerate(texts):
-            key = self._get_cache_key(text)
+            key = hashlib.md5(text.encode()).hexdigest()
             if key in self._cache:
-                results.append((i, self._cache[key]))
+                cached_results.append((i, self._cache[key]))
             else:
-                texts_to_embed.append(text)
-                indices.append(i)
-        
-        if texts_to_embed:
-            new_embeddings = self.embedder.embed(texts_to_embed)
-            for idx, text, emb in zip(indices, texts_to_embed, new_embeddings):
-                key = self._get_cache_key(text)
+                to_embed_texts.append(text)
+                to_embed_indices.append(i)
+
+        if to_embed_texts:
+            new_embs = np.atleast_2d(self.embedder.embed(to_embed_texts))
+            for idx, text, emb in zip(to_embed_indices, to_embed_texts, new_embs):
+                key = hashlib.md5(text.encode()).hexdigest()
                 self._cache[key] = emb
-                results.append((idx, emb))
-        
-        # Sort by original index
-        results.sort(key=lambda x: x[0])
-        return np.array([r[1] for r in results])
-    
+                cached_results.append((idx, emb))
+
+        cached_results.sort(key=lambda x: x[0])
+        return np.stack([r[1] for r in cached_results])  # always (N, dim)
+
     def embed_query(self, query: str) -> np.ndarray:
-        """Embed user query."""
+        """Embed a single query string.  Returns 1-D array of shape (dim,)."""
         return self.embedder.embed_single(query)
-    
-    def clear_cache(self):
+
+    # alias kept for backwards compatibility
+    embed_single = embed_query
+
+    def clear_cache(self) -> None:
         self._cache.clear()

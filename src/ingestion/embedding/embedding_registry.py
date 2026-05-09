@@ -1,75 +1,94 @@
 """
-embedding_registry.py
+embedding_registry.py  —  Singleton registry for embedding models
 
-Registry of available embedding models.
-Allows swapping models at runtime without changing calling code.
-
-Usage:
-    embedder = EmbeddingRegistry.get("all-MiniLM-L6-v2")
-    vecs = embedder.embed(["hello world"])
+Additions vs original:
+    - get_by_dim(dim): reverse lookup — given a FAISS index dimension,
+      return the EmbeddingPipeline that produced it.  Required for
+      ChatGraph to know which model to use when querying each index.
+    - register(model_name, dim): explicit dim registration.
+    - Thread-safe singleton per model_name.
 """
-from typing import Dict, Type
-from .base_embedder import BaseEmbedder
-from .text_embedder import TextEmbedder
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Dict, List, Optional
+
+from .embedding_pipeline import EmbeddingPipeline
+
+logger = logging.getLogger(__name__)
+
+# Known model → dimension mapping (extend as needed)
+_MODEL_DIMS: Dict[str, int] = {
+    "all-MiniLM-L6-v2":      384,
+    "all-MiniLM-L12-v2":     384,
+    "all-mpnet-base-v2":     768,
+    "multi-qa-mpnet-base-v2": 768,
+    "e5-large-v2":           1024,
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+}
 
 
 class EmbeddingRegistry:
     """
-    Central registry mapping model-name aliases to TextEmbedder instances.
+    Thread-safe singleton cache of EmbeddingPipeline instances.
 
-    All listed names resolve to HuggingFace sentence-transformer models.
-    Add entries here to expose new models to the rest of the pipeline.
+    Usage:
+        pipeline = EmbeddingRegistry.get("all-MiniLM-L6-v2")
+        pipeline = EmbeddingRegistry.get_by_dim(768)   # → mpnet pipeline
     """
 
-    # Canonical name → model path on HuggingFace Hub
-    _MODEL_MAP: Dict[str, str] = {
-        # Fast, lightweight — default for most use-cases
-        "all-MiniLM-L6-v2":   "sentence-transformers/all-MiniLM-L6-v2",
-        "minilm":              "sentence-transformers/all-MiniLM-L6-v2",
-        # Balanced quality / speed
-        "all-mpnet-base-v2":  "sentence-transformers/all-mpnet-base-v2",
-        "mpnet":               "sentence-transformers/all-mpnet-base-v2",
-        # Highest quality, multilingual
-        "e5-large-v2":         "intfloat/e5-large-v2",
-        "e5":                  "intfloat/e5-large-v2",
-        # Multilingual
-        "multilingual-e5-large": "intfloat/multilingual-e5-large",
-    }
-
-    # Singleton cache — one instance per model name
-    _instances: Dict[str, BaseEmbedder] = {}
+    _lock = threading.Lock()
+    _by_name: Dict[str, EmbeddingPipeline] = {}
+    _by_dim:  Dict[int, EmbeddingPipeline] = {}  # dim → pipeline
 
     @classmethod
-    def get(cls, model_name: str = "all-MiniLM-L6-v2") -> BaseEmbedder:
+    def get(cls, model_name: str) -> EmbeddingPipeline:
         """
-        Return a (cached) embedder for *model_name*.
-
-        Args:
-            model_name: Alias or full HuggingFace path.
-
-        Returns:
-            BaseEmbedder instance.
-
-        Raises:
-            ValueError: If the alias is not registered.
+        Return (or create) an EmbeddingPipeline for *model_name*.
+        Subsequent calls with the same name return the cached instance.
         """
-        key = model_name.strip().lower()
-        if key in cls._instances:
-            return cls._instances[key]
-
-        # Resolve alias → full model path
-        resolved = cls._MODEL_MAP.get(key, model_name)  # fall through for full paths
-
-        embedder = TextEmbedder(resolved)
-        cls._instances[key] = embedder
-        return embedder
-
-    @classmethod
-    def list_models(cls) -> list:
-        """Return all registered model aliases."""
-        return sorted(cls._MODEL_MAP.keys())
+        with cls._lock:
+            if model_name not in cls._by_name:
+                logger.info("EmbeddingRegistry: loading model %s", model_name)
+                pipeline = EmbeddingPipeline(model_name=model_name)
+                cls._by_name[model_name] = pipeline
+                # Register dim reverse-lookup
+                dim = _MODEL_DIMS.get(model_name)
+                if dim and dim not in cls._by_dim:
+                    cls._by_dim[dim] = pipeline
+                    logger.info("EmbeddingRegistry: dim %d → %s", dim, model_name)
+            return cls._by_name[model_name]
 
     @classmethod
-    def clear_cache(cls) -> None:
-        """Free all cached model instances (useful for testing)."""
-        cls._instances.clear()
+    def get_by_dim(cls, dim: int) -> Optional[EmbeddingPipeline]:
+        """
+        Return the EmbeddingPipeline whose output dimension is *dim*.
+        Returns None if no model for that dim has been loaded yet.
+        """
+        with cls._lock:
+            return cls._by_dim.get(dim)
+
+    @classmethod
+    def register_dim(cls, model_name: str, dim: int) -> None:
+        """Explicitly register a (model_name, dim) pair for custom models."""
+        with cls._lock:
+            if model_name in cls._by_name and dim not in cls._by_dim:
+                cls._by_dim[dim] = cls._by_name[model_name]
+
+    @classmethod
+    def list_models(cls) -> List[str]:
+        return list(cls._by_name.keys())
+
+    @classmethod
+    def available_models(cls) -> Dict[str, int]:
+        """Return {model_name: dim} for all known models (loaded or not)."""
+        return dict(_MODEL_DIMS)
+
+    @classmethod
+    def clear(cls) -> None:
+        """Clear all cached instances (useful for testing)."""
+        with cls._lock:
+            cls._by_name.clear()
+            cls._by_dim.clear()
