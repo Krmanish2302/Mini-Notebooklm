@@ -1,117 +1,172 @@
-"""Chat Mode Pipeline
+"""
+chat_pipeline.py  —  Chat mode pipeline.
 
-Retrieval strategy
-------------------
-* History  : RAG-based (top-3 similar + last-2 recency anchor).
-* Retrieval: Hybrid — Dense (ALL active FAISS dims queried in parallel)
-             + Sparse (BM25) fused with RRF (dense 0.7 / sparse 0.3).
-* Post-proc : none — Chat mode prioritises speed.
-* No reranker, no query expansion, no RAPTOR.
-
-Token budget awareness
-----------------------
-The prompt builder enforces a hard cap so that
-  history_tokens + chunk_tokens + query_tokens < model_max_context.
+Flow
+----
+1. QueryRewriter   : HyDE / expand / both based on query shape
+2. HybridRetriever : BM25 + FAISS RRF fusion
+3. ContextBuilder  : dedup + token budget + citation labels
+4. PromptBuilder   : assembles system + history + sources + query
+5. LLM call        : invoke / stream
+6. ResponseGenerator: structured output with citations + follow-ups
+7. RAGChatHistory  : persist user + assistant turns
 """
 from __future__ import annotations
-from typing import List, Dict, Any, Optional
+
+import logging
+from typing import Any, Callable, Dict, Iterator, List, Optional
+
+from src.generation.prompt_builder import PromptBuilder, QueryRewriter
+from src.generation.response_generator import ResponseGenerator
+from src.retrieval.context_builder import ContextBuilder
+from src.chat_history.rag_history import RAGChatHistory
+
+logger = logging.getLogger(__name__)
 
 
 class ChatPipeline:
     """
-    Entry point for Chat Mode.
-
     Parameters
     ----------
     hybrid_retriever : HybridRetriever
-        Pre-built with faiss_store, storage_manager, and ALL active embedders.
     rag_history      : RAGChatHistory
-        Per-session history instance.
-    llm              : callable(prompt: str) -> str
-        Any LLM wrapper (OpenAI, Ollama, etc.).
-    top_k            : chunks to include in context (default 5).
-    history_k        : similar history messages to retrieve (default 3).
+    llm              : callable (str) -> str   (invoke, NOT the LLMClient object)
+    top_k            : int   chunks to retrieve
+    history_k        : int   recent turns to include in prompt
+    max_ctx_tokens   : int   token budget for context block
     """
 
     def __init__(
         self,
         hybrid_retriever,
-        rag_history,
-        llm,
+        rag_history: RAGChatHistory,
+        llm: Callable[[str], str],
         top_k: int = 5,
         history_k: int = 3,
+        max_ctx_tokens: int = 3000,
     ):
-        self.retriever = hybrid_retriever
-        self.history = rag_history
-        self.llm = llm
-        self.top_k = top_k
-        self.history_k = history_k
+        self.retriever  = hybrid_retriever
+        self.history    = rag_history
+        self.llm        = llm
+        self.top_k      = top_k
+        self.history_k  = history_k
+        self._ctx_builder = ContextBuilder(max_tokens=max_ctx_tokens)
+        self._rewriter    = QueryRewriter()
 
-    def run(self, query: str) -> Dict[str, Any]:
+    # ─────────────────────────────────────────────────────────────────────
+    #  Non-streaming run
+    # ─────────────────────────────────────────────────────────────────────
+
+    def run(
+        self,
+        query: str,
+        persona_config=None,
+    ) -> Dict[str, Any]:
         """
-        Full chat turn.
+        Run a full non-streaming chat turn.
 
         Returns
         -------
-        {
-          "answer"  : str,
-          "sources" : List[Dict],   # chunks used
-          "history_used": List[Dict]
-        }
+        dict with: answer, citations, follow_ups, sources_used,
+                   chunks_used, retrieved_chunks, tokens_estimate
         """
-        # ── 1. Retrieve relevant history ──────────────────────────────
-        history_context = self.history.format_for_prompt(
-            query, k=self.history_k
-        )   # top-3 RAG + last-2 recency anchor, formatted string
+        # 1. Retrieve
+        raw_chunks = self._retrieve(query)
 
-        # ── 2. Hybrid retrieval across ALL active FAISS dims ─────────
-        chunks: List[Dict] = self.retriever.retrieve(query, top_k=self.top_k)
-        # HybridRetriever:
-        #   a) embeds query with EVERY active model (all dims)
-        #   b) fires FAISS search on EVERY index in parallel
-        #   c) BM25 sparse search
-        #   d) RRF fusion: best_dense_rank(chunk) + sparse_rank(chunk)
-        #   e) hydrates chunk_ids → content from SQLite
+        # 2. Build context
+        context_chunks, _sources = self._ctx_builder.build(raw_chunks, query=query)
 
-        # ── 3. Build prompt ───────────────────────────────────────────
-        prompt = self._build_prompt(query, chunks, history_context)
+        # 3. Build prompt
+        history_str = self.history.format_for_prompt(query, k=self.history_k)
+        prompt = PromptBuilder.build_chat_prompt(
+            query,
+            context_chunks,
+            history=history_str,
+            persona_config=persona_config,
+            rewrite=True,
+        )
 
-        # ── 4. Generate ───────────────────────────────────────────────
-        answer = self.llm(prompt)
+        # 4. LLM call
+        raw_output = self.llm(prompt)
 
-        # ── 5. Update history ─────────────────────────────────────────
-        source_ids = [c["id"] for c in chunks]
+        # 5. Structure response
+        gen = ResponseGenerator(context_chunks=context_chunks)
+        result = gen.assemble(raw_output, query=query, generate_follow_ups=True)
+        result["retrieved_chunks"] = raw_chunks
+
+        # 6. Persist history
         self.history.add_message("user", query)
-        self.history.add_message("assistant", answer, sources_used=source_ids)
+        self.history.add_message("assistant", result["answer"])
 
-        return {
-            "answer": answer,
-            "sources": chunks,
-            "history_used": self.history.get_relevant_history(query, k=self.history_k),
-        }
+        return result
 
-    # ------------------------------------------------------------------
-    # Prompt builder
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────────
+    #  Internal prompt builder (used by master_pipeline streaming path)
+    # ─────────────────────────────────────────────────────────────────────
 
     def _build_prompt(
         self,
         query: str,
-        chunks: List[Dict],
+        raw_chunks: List[Dict],
         history_context: str,
+        persona_config=None,
     ) -> str:
-        context_block = "\n\n".join(
-            f"[Source {i+1} | page {c.get('page_number','?')}]\n{c['content']}"
-            for i, c in enumerate(chunks)
+        context_chunks, _ = self._ctx_builder.build(raw_chunks, query=query)
+        return PromptBuilder.build_chat_prompt(
+            query,
+            context_chunks,
+            history=history_context,
+            persona_config=persona_config,
+            rewrite=True,
         )
-        history_block = (
-            f"\n\nRELEVANT CONVERSATION HISTORY:\n{history_context}"
-            if history_context else ""
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Streaming helper
+    # ─────────────────────────────────────────────────────────────────────
+
+    def stream(
+        self,
+        query: str,
+        persona_config=None,
+        llm_stream_fn: Optional[Callable[[str], Iterator[str]]] = None,
+    ) -> Iterator[str]:
+        """
+        Streaming variant.  Yields tokens from the LLM.
+        Persists history after the stream is exhausted.
+
+        Parameters
+        ----------
+        llm_stream_fn : optional alternative streaming callable.
+                        Falls back to self.llm (non-streaming) if not provided.
+        """
+        raw_chunks = self._retrieve(query)
+        context_chunks, _ = self._ctx_builder.build(raw_chunks, query=query)
+        history_str = self.history.format_for_prompt(query, k=self.history_k)
+        prompt = PromptBuilder.build_chat_prompt(
+            query,
+            context_chunks,
+            history=history_str,
+            persona_config=persona_config,
+            rewrite=True,
         )
-        return (
-            f"You are a helpful assistant. Answer using ONLY the provided sources.\n"
-            f"{history_block}\n\n"
-            f"SOURCES:\n{context_block}\n\n"
-            f"USER QUESTION: {query}\n\n"
-            f"ANSWER:"
-        )
+
+        stream_fn = llm_stream_fn or self.llm
+        full_response = ""
+        for token in stream_fn(prompt):  # type: ignore[call-arg]
+            full_response += token
+            yield token
+
+        self.history.add_message("user", query)
+        self.history.add_message("assistant", full_response)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Retrieval helper
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _retrieve(self, query: str) -> List[Dict]:
+        """Embed-query rewrite then retrieve top_k chunks."""
+        try:
+            return self.retriever.retrieve(query, top_k=self.top_k)
+        except Exception as exc:
+            logger.warning("ChatPipeline._retrieve failed: %s", exc)
+            return []

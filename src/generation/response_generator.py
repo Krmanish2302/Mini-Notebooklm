@@ -1,94 +1,166 @@
-"""ResponseGenerator — orchestrates retrieval → prompt → LLM → parse.
+"""
+response_generator.py  —  Structured response assembly.
 
-This is the single entry-point for the generation half of the pipeline.
-MasterPipeline calls it indirectly through generate(); in Phase 4 it will
-grow to handle streaming, grounding validation, and citation injection.
+Takes a raw LLM output string and enriches it into a full response dict:
+  {
+    "answer"         : str,         # cleaned LLM answer
+    "citations"      : list[dict],  # [{label, source_id, content_snippet}]
+    "follow_ups"     : list[str],   # 2-3 suggested follow-up questions
+    "sources_used"   : list[str],   # unique [S1], [S2]… labels that appear in answer
+    "chunks_used"    : list[dict],  # context chunks that were cited
+    "tokens_estimate": int,         # rough token count
+  }
 
-Phase 3 deliverable: correct interface + full wire-up.  No logic gaps.
+Also handles:
+  - follow-up question extraction (if the LLM produced them in a known format)
+  - citation label normalisation  (e.g. [s1] → [S1])
+  - stripping LLM artefacts ("A:", "ANSWER:", stray markdown fences)
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Iterator, List, Optional, Union
+import re
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Approximate chars per token
+_CHARS_PER_TOKEN = 3.5
+
+# Pattern for citation labels like [S1], [s2], [S12]
+_CITE_PATTERN = re.compile(r"\[([Ss]\d{1,2})\]")
+
+# Patterns the LLM sometimes emits at the start of its answer
+_STRIP_PREFIXES = re.compile(
+    r"^(?:A|ANSWER|DETAILED\s+ANSWER|EXPLAIN|RESPONSE)\s*:\s*",
+    re.IGNORECASE,
+)
+
+# Follow-up questions block that some prompts elicit
+_FOLLOWUP_BLOCK = re.compile(
+    r"(?:follow[- ]?up|suggested|you\s+might\s+also\s+ask)[:\s\n]+(.*?)(?:\n\n|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 class ResponseGenerator:
-    """Orchestrates a single query through the full generation stack.
+    """
+    Thin stateless utility — call assemble() after every LLM invocation.
 
     Parameters
     ----------
-    prompt_builder:  PromptBuilder instance
-    llm_client:      LLMClient instance
-    response_parser: ResponseParser instance
-    citation_extractor: CitationExtractor instance (optional)
+    context_chunks : list of dicts returned by ContextBuilder.build()
+                     Must include 'citation_label' key added by ContextBuilder.
     """
 
-    def __init__(
-        self,
-        prompt_builder,
-        llm_client,
-        response_parser,
-        citation_extractor=None,
-    ):
-        self.prompt_builder = prompt_builder
-        self.llm = llm_client
-        self.parser = response_parser
-        self.citation_extractor = citation_extractor
+    def __init__(self, context_chunks: Optional[List[Dict[str, Any]]] = None):
+        self.context_chunks: List[Dict[str, Any]] = context_chunks or []
 
-    def generate(
+    def assemble(
         self,
-        query: str,
-        documents: List[Any],
-        history: str = "",
-        mode: str = "chat",
-        stream: bool = False,
-        learning_path: Optional[List[Dict]] = None,
-    ) -> Union[str, Iterator[str]]:
-        """Run query through prompt → LLM → parse.  Returns str or Iterator[str].
-
-        Parameters
-        ----------
-        query       : user question
-        documents   : LangChain Documents (or plain dicts) from retrieval
-        history     : formatted chat history string
-        mode        : 'chat' | 'study' | 'research'
-        stream      : if True, yield token-by-token strings
-        learning_path: optional study-mode concept graph steps
+        raw_llm_output: str,
+        query: str = "",
+        generate_follow_ups: bool = True,
+    ) -> Dict[str, Any]:
         """
-        # ─ Build prompt ──────────────────────────────────────────────────
-        build_fn = {
-            "chat":     self.prompt_builder.build_chat_prompt,
-            "study":    self.prompt_builder.build_study_prompt,
-            "research": self.prompt_builder.build_research_prompt,
-        }.get(mode, self.prompt_builder.build_chat_prompt)
+        Parse and enrich the raw LLM output.
 
-        if mode == "study" and learning_path is not None:
-            prompt = build_fn(query=query, documents=documents,
-                              history=history, learning_path=learning_path)
-        else:
-            prompt = build_fn(query=query, documents=documents, history=history)
+        Returns
+        -------
+        dict with keys: answer, citations, follow_ups, sources_used,
+                        chunks_used, tokens_estimate
+        """
+        cleaned   = self._clean(raw_llm_output)
+        answer    = self._strip_follow_up_block(cleaned)
+        follow_ups = self._extract_follow_ups(cleaned, query, generate_follow_ups)
 
-        logger.debug("ResponseGenerator: prompt built, mode=%s stream=%s", mode, stream)
+        # Normalise citation labels
+        answer    = _CITE_PATTERN.sub(lambda m: f"[{m.group(1).upper()}]", answer)
 
-        # ─ Call LLM ──────────────────────────────────────────────────────
-        if stream:
-            return self._stream(prompt)
+        # Which sources are actually cited in the answer?
+        used_labels = list(dict.fromkeys(_CITE_PATTERN.findall(answer)))  # ordered unique
 
-        raw = self.llm.invoke(prompt)
-        parsed = self.parser.parse(raw)
+        # Build citation objects from context_chunks
+        citations  = self._build_citations(used_labels)
+        chunks_used = [
+            c for c in self.context_chunks
+            if c.get("citation_label", "") in used_labels
+        ]
 
-        # ─ Optional citation injection ─────────────────────────────────
-        if self.citation_extractor is not None and documents:
-            parsed = self.citation_extractor.inject(
-                response=parsed,
-                documents=documents,
-            )
+        return {
+            "answer":          answer.strip(),
+            "citations":       citations,
+            "follow_ups":      follow_ups,
+            "sources_used":    used_labels,
+            "chunks_used":     chunks_used,
+            "tokens_estimate": self._token_estimate(answer),
+        }
 
-        return parsed
+    # ─────────────────────────────────────────────────────────────────────
+    #  Private helpers
+    # ─────────────────────────────────────────────────────────────────────
 
-    def _stream(self, prompt: str) -> Iterator[str]:
-        """Yield raw tokens from LLM stream."""
-        for token in self.llm.stream(prompt):
-            yield token
+    @staticmethod
+    def _clean(text: str) -> str:
+        """Remove common LLM artefacts: markdown fences, leading answer tags."""
+        # Strip markdown code fences
+        text = re.sub(r"```[\s\S]*?```", "", text)
+        # Strip leading answer prefix ("A:", "ANSWER:", etc.)
+        text = _STRIP_PREFIXES.sub("", text.strip())
+        return text.strip()
+
+    @staticmethod
+    def _strip_follow_up_block(text: str) -> str:
+        """Remove follow-up question block from the end of the answer."""
+        return _FOLLOWUP_BLOCK.sub("", text).strip()
+
+    @staticmethod
+    def _extract_follow_ups(
+        text: str,
+        query: str,
+        enabled: bool,
+    ) -> List[str]:
+        """Extract follow-up questions if the LLM emitted them, else return []."""
+        if not enabled:
+            return []
+
+        match = _FOLLOWUP_BLOCK.search(text)
+        if not match:
+            return []
+
+        block = match.group(1)
+        lines = re.findall(r"^\s*[-•*\d.)]+\s*(.+)$", block, re.MULTILINE)
+        questions = [l.strip().rstrip(".") + "?" if not l.strip().endswith("?") else l.strip()
+                     for l in lines if len(l.strip()) > 8]
+        return questions[:3]
+
+    def _build_citations(
+        self, used_labels: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Build citation objects for each used source label."""
+        # Build a lookup: label -> chunk
+        label_map: Dict[str, Dict] = {}
+        for chunk in self.context_chunks:
+            lbl = chunk.get("citation_label", "")
+            if lbl and lbl not in label_map:
+                label_map[lbl] = chunk
+
+        citations = []
+        for lbl in used_labels:
+            chunk = label_map.get(lbl)
+            if chunk:
+                citations.append({
+                    "label":           lbl,
+                    "source_id":       chunk.get("source_id", ""),
+                    "source_name":     chunk.get("source", chunk.get("source_name", "")),
+                    "content_snippet": chunk.get("content", "")[:200],
+                    "score":           chunk.get("rrf_score", 0.0),
+                })
+            else:
+                citations.append({"label": lbl, "source_id": "", "source_name": "", "content_snippet": "", "score": 0.0})
+
+        return citations
+
+    @staticmethod
+    def _token_estimate(text: str) -> int:
+        return max(1, int(len(text) / _CHARS_PER_TOKEN))

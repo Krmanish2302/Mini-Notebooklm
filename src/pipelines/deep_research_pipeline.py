@@ -1,28 +1,35 @@
-"""Deep Research Mode Pipeline
+"""
+deep_research_pipeline.py  —  Deep Research mode pipeline.
 
-Retrieval strategy
-------------------
-* Step 1 : RAG-based chat history (k=5).
-* Step 2 : LLM query expansion → N sub-queries.
-* Step 3 : Hybrid retrieval (Dense ALL-dims + BM25 + RRF) per sub-query.
-* Step 4 : Deduplicate.
-* Step 5 : Contextual compression.
-* Step 6 : Cross-encoder rerank + score threshold.
-* Step 7 : RAPTOR summary nodes (optional macro-context).
-* Step 8 : Build prompt → generate.
+Multi-hop research flow
+-----------------------
+1. SubQueryDecomposer   : break query into N focused sub-queries (LLM call)
+2. Per-sub-query retrieval via HybridRetriever
+3. ContextualCompressor : compress each sub-result to fit token budget
+4. Reranker             : global rerank across all sub-results
+5. ContextBuilder       : dedup + budget + citation labels
+6. PromptBuilder        : research prompt (fixed Sagan researcher persona)
+7. LLM synthesis call
+8. ResponseGenerator    : structured output with citations
+9. RAGChatHistory       : persist turns
 
-Persona: Carl Sagan as a chill classmate. Strictly source-grounded.
+Fallback
+--------
+If SubQueryDecomposer returns only the original query (LLM unavailable),
+the pipeline degrades gracefully to a single-pass retrieval.
 """
 from __future__ import annotations
-from typing import List, Dict, Any, Optional
 
-# ── Persona + grounding (token-efficient) ────────────────────────────────
-_SYSTEM = (
-    "You're Carl Sagan if he were a chill classmate. "
-    "Go deep — structured, thorough, cite everything as [S1], [S2]… "
-    "Use ONLY the sources below. Never invent facts. "
-    "If it’s not there, say: 'Not in my notes, bro.'"
-)
+import logging
+from typing import Any, Callable, Dict, List, Optional
+
+from src.generation.prompt_builder import PromptBuilder
+from src.generation.response_generator import ResponseGenerator
+from src.retrieval.context_builder import ContextBuilder
+from src.retrieval.query_expander import SubQueryDecomposer
+from src.chat_history.rag_history import RAGChatHistory
+
+logger = logging.getLogger(__name__)
 
 
 class DeepResearchPipeline:
@@ -31,132 +38,114 @@ class DeepResearchPipeline:
     ----------
     hybrid_retriever      : HybridRetriever
     rag_history           : RAGChatHistory
-    contextual_compressor : ContextualCompressor
-    reranker              : Reranker (BAAI/bge-reranker-base, lazy-loaded)
-    llm                   : callable(prompt) -> str
-    raptor                : RaptorRetriever | None
-    top_k                 : final chunks to LLM (default 8)
-    score_threshold       : drop chunks below this rerank score (default 0.0)
-    history_k             : history messages (default 5)
-    expansion_n           : sub-queries to generate (default 3)
+    contextual_compressor : ContextualCompressor (may be None)
+    reranker              : Reranker             (may be None)
+    llm                   : callable (str) -> str
+    raptor                : unused — kept for API compat
+    top_k                 : chunks per sub-query
+    history_k             : turns in prompt
+    expansion_n           : number of sub-queries to decompose into
+    max_ctx_tokens        : token budget for final context block
     """
 
     def __init__(
         self,
         hybrid_retriever,
-        rag_history,
-        contextual_compressor,
-        reranker,
-        llm,
+        rag_history: RAGChatHistory,
+        contextual_compressor=None,
+        reranker=None,
+        llm: Optional[Callable[[str], str]] = None,
         raptor=None,
         top_k: int = 8,
-        score_threshold: float = 0.0,
         history_k: int = 5,
         expansion_n: int = 3,
+        max_ctx_tokens: int = 4000,
     ):
-        self.retriever = hybrid_retriever
-        self.history = rag_history
-        self.compressor = contextual_compressor
-        self.reranker = reranker
-        self.llm = llm
-        self.raptor = raptor
-        self.top_k = top_k
-        self.score_threshold = score_threshold
-        self.history_k = history_k
+        self.retriever   = hybrid_retriever
+        self.history     = rag_history
+        self.compressor  = contextual_compressor
+        self.reranker    = reranker
+        self.llm         = llm
+        self.top_k       = top_k
+        self.history_k   = history_k
         self.expansion_n = expansion_n
+        self._ctx_builder  = ContextBuilder(max_tokens=max_ctx_tokens)
+        self._decomposer   = SubQueryDecomposer(llm=self.llm, n=expansion_n)
 
-    def run(
-        self,
-        query: str,
-        top_k: Optional[int] = None,
-        score_threshold: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        effective_top_k = top_k if top_k is not None else self.top_k
-        effective_threshold = score_threshold if score_threshold is not None else self.score_threshold
+    # ─────────────────────────────────────────────────────────────────────
+    #  Main entry point
+    # ─────────────────────────────────────────────────────────────────────
 
-        # 1. History
-        history_context = self.history.format_for_prompt(query, k=self.history_k)
+    def run(self, query: str) -> Dict[str, Any]:
+        """
+        Execute a full deep-research turn.
 
-        # 2. Query expansion
-        sub_queries: List[str] = self._expand_query(query)
+        Returns
+        -------
+        dict with: answer, citations, follow_ups, sources_used,
+                   chunks_used, retrieved_chunks, sub_queries, tokens_estimate
+        """
+        # 1. Decompose
+        sub_queries = self._decomposer.decompose(query)
+        logger.info(
+            "DeepResearchPipeline: %d sub-queries for '%s'",
+            len(sub_queries), query,
+        )
 
-        # 3. Hybrid retrieve + deduplicate
-        all_results: List[Dict] = []
-        seen_ids = set()
+        # 2. Retrieve per sub-query, union results
+        all_chunks: List[Dict] = []
+        seen_ids: set = set()
         for sq in sub_queries:
-            for chunk in self.retriever.retrieve(sq, top_k=effective_top_k):
-                if chunk["id"] not in seen_ids:
-                    seen_ids.add(chunk["id"])
-                    all_results.append(chunk)
+            try:
+                hits = self.retriever.retrieve(sq, top_k=self.top_k)
+            except Exception as exc:
+                logger.warning("retrieve failed for sub-query '%s': %s", sq, exc)
+                hits = []
+            for c in hits:
+                cid = c.get("id", "")
+                if cid not in seen_ids:
+                    seen_ids.add(cid)
+                    all_chunks.append(c)
 
-        # 4. Contextual compression
-        compressed: List[Dict] = self.compressor.compress(all_results, query)
+        # 3. Optional compression per chunk
+        if self.compressor and all_chunks:
+            try:
+                all_chunks = self.compressor.compress(all_chunks, query)
+            except Exception as exc:
+                logger.warning("compressor failed (non-fatal): %s", exc)
 
-        # 5. Cross-encoder rerank + threshold
-        reranked: List[Dict] = self.reranker.rerank(query, compressed, top_k=len(compressed))
-        reranked = [c for c in reranked if c.get("rerank_score", 1.0) >= effective_threshold]
-        reranked = reranked[:effective_top_k]
+        # 4. Optional global rerank
+        if self.reranker and all_chunks:
+            try:
+                all_chunks = self.reranker.rerank(query, all_chunks)
+            except Exception as exc:
+                logger.warning("reranker failed (non-fatal): %s", exc)
 
-        # 6. RAPTOR macro-context nodes (optional)
-        # RAPTOR builds a recursive cluster-summary tree at ingest time.
-        # Each node summarises a group of related chunks; the root is a
-        # full-document abstract.  Retrieving 1-2 nodes adds macro-context
-        # that individual paragraph chunks cannot surface.
-        raptor_used = False
-        if self.raptor:
-            for node in self.raptor.retrieve(query, top_k=2):
-                if node["id"] not in seen_ids:
-                    node["retrieval_method"] = "raptor_summary"
-                    reranked.append(node)
-                    raptor_used = True
+        # 5. Context assembly
+        context_chunks, _sources = self._ctx_builder.build(all_chunks, query=query)
 
-        # 7. Prompt + generate
-        prompt = self._build_prompt(query, reranked, history_context, sub_queries)
-        answer = self.llm(prompt)
+        # 6. Prompt
+        history_str = self.history.format_for_prompt(query, k=self.history_k)
+        prompt = PromptBuilder.build_research_prompt(
+            query,
+            context_chunks,
+            history=history_str,
+            rewrite=False,  # already done implicitly by sub-query decomposition
+        )
 
-        # 8. Update history
+        # 7. LLM synthesis
+        if not self.llm:
+            raise RuntimeError("LLM not configured for DeepResearchPipeline")
+        raw_output = self.llm(prompt)
+
+        # 8. Structure response
+        gen = ResponseGenerator(context_chunks=context_chunks)
+        result = gen.assemble(raw_output, query=query, generate_follow_ups=True)
+        result["retrieved_chunks"] = all_chunks
+        result["sub_queries"]      = sub_queries
+
+        # 9. Persist history
         self.history.add_message("user", query)
-        self.history.add_message("assistant", answer, sources_used=[c["id"] for c in reranked])
+        self.history.add_message("assistant", result["answer"])
 
-        return {
-            "answer": answer,
-            "sources": reranked,
-            "sub_queries": sub_queries,
-            "raptor_used": raptor_used,
-            "history_used": self.history.get_relevant_history(query, k=self.history_k),
-        }
-
-    def _expand_query(self, query: str, n: Optional[int] = None) -> List[str]:
-        n = n or self.expansion_n
-        prompt = (
-            f"Generate {n} distinct search queries covering this question. "
-            f"One per line, no numbering.\n\nQuestion: {query}\n\nQueries:"
-        )
-        try:
-            raw = self.llm(prompt)
-            lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
-            return ([query] + [l for l in lines if l != query])[:n + 1]
-        except Exception:
-            return [query]
-
-    def _build_prompt(
-        self,
-        query: str,
-        chunks: List[Dict],
-        history_context: str,
-        sub_queries: List[str],
-    ) -> str:
-        sources = "\n\n".join(
-            f"[S{i+1}]{' [SUMMARY]' if c.get('retrieval_method') == 'raptor_summary' else ''} "
-            f"(p.{c.get('page_number', '?')})\n{c['content']}"
-            for i, c in enumerate(chunks)
-        )
-        hist = f"HISTORY:\n{history_context}\n\n" if history_context else ""
-        angles = "  • " + "\n  • ".join(sub_queries)
-        return (
-            f"{_SYSTEM}\n\n"
-            f"{hist}"
-            f"SEARCH ANGLES:\n{angles}\n\n"
-            f"SOURCES:\n{sources}\n\n"
-            f"Q: {query}\nA:"
-        )
+        return result

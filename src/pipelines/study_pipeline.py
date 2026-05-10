@@ -1,225 +1,209 @@
-"""Study Mode Pipeline
+"""
+study_pipeline.py  —  Study mode pipeline.
 
-Retrieval strategy
-------------------
-* History  : Graph-based history — tracks CONCEPT NODES visited, not raw
-             messages.  When you ask about "backpropagation" and then ask
-             about "vanishing gradients", the system knows you've already
-             covered prerequisite concepts and skips re-explaining them.
+Produces a rich study package:
+  answer          : conceptual explanation (Sagan teacher persona)
+  quiz_cards      : list of {question, answer, difficulty} dicts
+  summary_bullets : 3-5 key takeaway bullets
+  learning_path   : ordered list of concept → concept graph steps
+  citations       : standard citation objects
+  follow_ups      : suggested deeper-dive questions
 
-* Path A   : Full Deep Research pipeline
-             (query expansion → hybrid ALL-dims → compress → rerank → RAPTOR)
-             = quality, detail, factual grounding.
-
-* Path B   : Graph Retrieval
-             1. Extract entities from query.
-             2. Find node(s) in KnowledgeGraph.
-             3. Traverse prerequisite_of / causes / is_a_type_of edges.
-             4. Return ordered concept path + chunk_ids for each node.
-             = relationships, learning order, conceptual breadth.
-
-* Fusion   : Smart Fusion
-             top-6 from Path A (quality first) +
-             up to 2 from Path B not already in A (relationship context).
-             Deduplicated by chunk_id.
-
-* Output   : chunks (for LLM) + learning_path (for UI to render as graph)
-
-Chat History note
------------------
-Study mode uses GraphHistory (tracks concept nodes visited per session)
-instead of RAGChatHistory.  This prevents re-teaching already-covered
-concepts and builds a personalised learning path across the session.
+Flow
+----
+1. DeepResearchPipeline.run() → rich context + base answer
+2. Quiz generation   (LLM call on context_chunks)
+3. Summary extraction (LLM call or heuristic)
+4. Learning path     (GraphRetriever if available, else stub)
+5. ResponseGenerator : assemble full result dict
 """
 from __future__ import annotations
-from typing import List, Dict, Any, Optional
+
+import logging
+import re
+from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+_QUIZ_PROMPT = """\
+Based ONLY on the following source passages, generate {n} quiz questions.
+For each question provide:
+  Q: <question>
+  A: <concise answer>
+  D: easy | medium | hard
+
+Return ONLY the Q/A/D blocks — no preamble.
+
+SOURCES:
+{sources}
+"""
+
+_SUMMARY_PROMPT = """\
+Based ONLY on the following source passages, write {n} concise bullet-point
+takeaways (one sentence each, no more than 20 words each).
+Return ONLY bullet lines starting with •.
+
+SOURCES:
+{sources}
+"""
 
 
 class StudyPipeline:
     """
-    Entry point for Study Mode.
-
     Parameters
     ----------
-    deep_research_pipeline : DeepResearchPipeline
-        Already-configured deep research pipeline (reused for Path A).
-    graph_retriever        : GraphRetriever
-        Traverses KnowledgeGraph for concept paths.
-    graph_history          : GraphHistory
-        Tracks visited concept nodes per session.
-    llm                    : callable
-    top_k_broad            : chunks from deep research to keep (default 6).
-    top_k_graph            : graph relationship chunks to add (default 2).
+    deep_research_pipeline : DeepResearchPipeline  (handles retrieval + base answer)
+    graph_retriever        : GraphRetriever or None
+    graph_history          : GraphHistory or None
+    llm                    : callable (str) -> str
+    n_quiz_cards           : number of quiz cards to generate (default 5)
+    n_summary_bullets      : number of summary bullets (default 4)
     """
-
-    # Max chunks from each path
-    TOP_K_BROAD = 6
-    TOP_K_GRAPH = 2
 
     def __init__(
         self,
         deep_research_pipeline,
-        graph_retriever,
-        graph_history,
-        llm,
-        top_k_broad: int = TOP_K_BROAD,
-        top_k_graph: int = TOP_K_GRAPH,
+        graph_retriever=None,
+        graph_history=None,
+        llm: Optional[Callable[[str], str]] = None,
+        n_quiz_cards: int = 5,
+        n_summary_bullets: int = 4,
     ):
-        self.deep_pipeline = deep_research_pipeline
+        self.research = deep_research_pipeline
         self.graph_retriever = graph_retriever
-        self.graph_history = graph_history
-        self.llm = llm
-        self.top_k_broad = top_k_broad
-        self.top_k_graph = top_k_graph
+        self.graph_history   = graph_history
+        self.llm             = llm
+        self.n_quiz          = n_quiz_cards
+        self.n_summary       = n_summary_bullets
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Main entry point
+    # ─────────────────────────────────────────────────────────────────────
 
     def run(self, query: str) -> Dict[str, Any]:
         """
-        Full study turn.
+        Run a full study session turn.
 
         Returns
         -------
-        {
-          "answer"        : str,
-          "sources"       : List[Dict],   # final merged chunks
-          "learning_path" : List[Dict],   # concept relationship graph for UI
-          "new_concepts"  : List[str],    # concepts introduced this turn
-          "skipped_concepts": List[str],  # concepts already covered, skipped
-        }
+        dict with: answer, citations, follow_ups, sources_used,
+                   quiz_cards, summary_bullets, learning_path,
+                   retrieved_chunks, sub_queries, tokens_estimate
         """
-        # ── Path A : Deep Research (quality + RAPTOR) ─────────────────
-        # Run the full deep research pipeline — query expansion, hybrid
-        # ALL-dims retrieval, contextual compression, cross-encoder rerank,
-        # + optional RAPTOR summary nodes.
-        dr_result = self.deep_pipeline.run(query)
-        broad_chunks: List[Dict] = dr_result["sources"][: self.top_k_broad]
-        broad_ids = {c["id"] for c in broad_chunks}
+        # 1. Get base research result (retrieval + base explanation + citations)
+        base = self.research.run(query)
 
-        # ── Path B : Graph Retrieval ──────────────────────────────────
-        # find_related_concepts() traverses the KnowledgeGraph:
-        #   1. NER: extract entities from query
-        #   2. Node lookup in KnowledgeGraph
-        #   3. Edge traversal: prerequisite_of, causes, is_a_type_of
-        #   4. Return [{id, content, path, relation}, ...]
-        graph_results: List[Dict] = self.graph_retriever.find_related_concepts(query)
+        # 2. Build source text block for quiz / summary generation
+        ctx_chunks   = base.get("context_chunks", base.get("chunks_used", []))
+        if not ctx_chunks:
+            ctx_chunks = base.get("retrieved_chunks", [])[:8]
+        sources_text = self._chunks_to_text(ctx_chunks)
 
-        # ── Smart Fusion ──────────────────────────────────────────────
-        final_chunks = self._smart_fusion(
-            broad_chunks, graph_results, broad_ids
-        )
+        # 3. Generate quiz cards
+        quiz_cards = self._generate_quiz(sources_text)
 
-        # ── Learning Path Extraction ──────────────────────────────────
-        learning_path = self._extract_learning_path(graph_results)
+        # 4. Generate summary bullets
+        summary_bullets = self._generate_summary(sources_text)
 
-        # ── Concept tracking (graph history) ─────────────────────────
-        new_concepts, skipped = self._update_concept_history(graph_results, query)
+        # 5. Learning path from graph (best-effort)
+        learning_path = self._get_learning_path(query)
 
-        # ── Prompt with learning context ──────────────────────────────
-        prompt = self._build_prompt(
-            query, final_chunks, learning_path, new_concepts, skipped
-        )
-        answer = self.llm(prompt)
+        # 6. Upgrade base answer to study tone if we have an LLM
+        answer = self._study_answer(query, sources_text) or base.get("answer", "")
 
         return {
-            "answer": answer,
-            "sources": final_chunks,
-            "learning_path": learning_path,
-            "new_concepts": new_concepts,
-            "skipped_concepts": skipped,
+            **base,
+            "answer":           answer,
+            "quiz_cards":       quiz_cards,
+            "summary_bullets":  summary_bullets,
+            "learning_path":    learning_path,
         }
 
-    # ------------------------------------------------------------------
-    # Smart Fusion
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────────
+    #  Generation helpers
+    # ─────────────────────────────────────────────────────────────────────
 
-    def _smart_fusion(
-        self,
-        broad: List[Dict],
-        graph: List[Dict],
-        broad_ids: set,
-    ) -> List[Dict]:
-        final = [c | {"source_path": "broad"} for c in broad]
-        count = 0
-        for chunk in graph:
-            if chunk["id"] not in broad_ids and count < self.top_k_graph:
-                final.append(chunk | {"source_path": "graph"})
-                count += 1
-        return final
+    def _study_answer(self, query: str, sources_text: str) -> Optional[str]:
+        """Re-generate the explanation with the Sagan study persona."""
+        if not self.llm or not sources_text:
+            return None
 
-    # ------------------------------------------------------------------
-    # Learning Path
-    # ------------------------------------------------------------------
+        from src.generation.prompt_builder import PromptBuilder
+        # Build a fresh study prompt from the pre-assembled source text
+        # We pass an ad-hoc document list with a single merged block
+        fake_doc = [{"content": sources_text, "source_id": "ctx", "citation_label": "S1"}]
+        prompt = PromptBuilder.build_study_prompt(query, fake_doc, rewrite=False)
+        try:
+            return self.llm(prompt)
+        except Exception as exc:
+            logger.warning("_study_answer LLM call failed: %s", exc)
+            return None
 
-    def _extract_learning_path(self, graph_results: List[Dict]) -> List[Dict]:
-        paths = []
-        for result in graph_results:
-            if "path" in result and len(result["path"]) >= 2:
-                paths.append({
-                    "from": result["path"][0],
-                    "to": result["path"][-1],
-                    "steps": result["path"],
-                    "relationship": result.get("relation", "related"),
+    def _generate_quiz(self, sources_text: str) -> List[Dict[str, Any]]:
+        """Generate quiz cards from source text via LLM."""
+        if not self.llm or not sources_text.strip():
+            return []
+
+        prompt = _QUIZ_PROMPT.format(n=self.n_quiz, sources=sources_text[:4000])
+        try:
+            raw = self.llm(prompt)
+            return self._parse_quiz(raw)
+        except Exception as exc:
+            logger.warning("_generate_quiz failed: %s", exc)
+            return []
+
+    def _generate_summary(self, sources_text: str) -> List[str]:
+        """Generate summary bullets from source text via LLM."""
+        if not self.llm or not sources_text.strip():
+            return []
+
+        prompt = _SUMMARY_PROMPT.format(n=self.n_summary, sources=sources_text[:4000])
+        try:
+            raw = self.llm(prompt)
+            bullets = re.findall(r"^[•\-\*]\s*(.+)$", raw, re.MULTILINE)
+            return [b.strip() for b in bullets if b.strip()][: self.n_summary]
+        except Exception as exc:
+            logger.warning("_generate_summary failed: %s", exc)
+            return []
+
+    def _get_learning_path(self, query: str) -> List[Dict[str, str]]:
+        """Retrieve concept-to-concept path from KG, or return empty list."""
+        if not self.graph_retriever:
+            return []
+        try:
+            return self.graph_retriever.get_learning_path(query) or []
+        except Exception as exc:
+            logger.debug("_get_learning_path failed (non-fatal): %s", exc)
+            return []
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Parsing helpers
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _chunks_to_text(chunks: List[Dict]) -> str:
+        parts = []
+        for c in chunks:
+            text = c.get("content", "")
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _parse_quiz(raw: str) -> List[Dict[str, Any]]:
+        """Parse Q: / A: / D: blocks from raw LLM output."""
+        cards: List[Dict] = []
+        # Split on blank-line-separated blocks
+        blocks = re.split(r"\n{2,}", raw.strip())
+        for block in blocks:
+            q_match = re.search(r"Q\s*:\s*(.+)", block, re.IGNORECASE)
+            a_match = re.search(r"A\s*:\s*(.+)", block, re.IGNORECASE)
+            d_match = re.search(r"D\s*:\s*(easy|medium|hard)", block, re.IGNORECASE)
+            if q_match and a_match:
+                cards.append({
+                    "question":   q_match.group(1).strip(),
+                    "answer":     a_match.group(1).strip(),
+                    "difficulty": d_match.group(1).lower() if d_match else "medium",
                 })
-        return paths
-
-    # ------------------------------------------------------------------
-    # Concept History
-    # ------------------------------------------------------------------
-
-    def _update_concept_history(
-        self,
-        graph_results: List[Dict],
-        query: str,
-    ):
-        """Mark new concepts visited.  Return (new, skipped) lists."""
-        concepts_this_turn = [
-            r.get("concept", "") for r in graph_results if r.get("concept")
-        ]
-        new_concepts, skipped = [], []
-        for concept in concepts_this_turn:
-            if self.graph_history.has_visited(concept):
-                skipped.append(concept)
-            else:
-                self.graph_history.mark_visited(concept, query)
-                new_concepts.append(concept)
-        return new_concepts, skipped
-
-    # ------------------------------------------------------------------
-    # Prompt builder
-    # ------------------------------------------------------------------
-
-    def _build_prompt(
-        self,
-        query: str,
-        chunks: List[Dict],
-        learning_path: List[Dict],
-        new_concepts: List[str],
-        skipped: List[str],
-    ) -> str:
-        context_block = "\n\n".join(
-            f"[{'GRAPH-RELATION' if c.get('source_path') == 'graph' else 'Source'} "
-            f"{i+1} | page {c.get('page_number','?')}]\n{c['content']}"
-            for i, c in enumerate(chunks)
-        )
-        path_block = ""
-        if learning_path:
-            path_block = "\nLEARNING PATH:\n" + "\n".join(
-                f"  {p['from']} → {' → '.join(p['steps'][1:-1]+[p['to']])} ({p['relationship']})"
-                for p in learning_path
-            )
-        already_block = (
-            f"\nCONCEPTS ALREADY COVERED THIS SESSION (do not re-explain): "
-            f"{', '.join(skipped)}"
-            if skipped else ""
-        )
-        new_block = (
-            f"\nNEW CONCEPTS INTRODUCED THIS TURN: {', '.join(new_concepts)}"
-            if new_concepts else ""
-        )
-        return (
-            f"You are a patient study tutor. Teach using ONLY the provided sources. "
-            f"Follow the learning path when it exists.{already_block}{new_block}\n"
-            f"{path_block}\n\n"
-            f"SOURCES:\n{context_block}\n\n"
-            f"STUDENT QUESTION: {query}\n\n"
-            f"TUTOR ANSWER:"
-        )
+        return cards
