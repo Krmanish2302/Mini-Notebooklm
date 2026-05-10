@@ -67,7 +67,9 @@ class QueryRequest(BaseModel):
     query: str
     mode: str = "chat"
     stream: bool = True
-
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_tokens: Optional[int] = None
 
 class ModeRequest(BaseModel):
     mode: str
@@ -374,6 +376,17 @@ async def query_stream(req: QueryRequest):
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
             loop = asyncio.get_event_loop()
+            # Apply per-request generation tuning if the UI sent any sliders
+            if any(v is not None for v in (req.temperature, req.top_p, req.max_tokens)):
+                if pipeline.llm:
+                    pipeline.llm.update_tuning(
+                        **{k: v for k, v in {
+                            "temperature": req.temperature,
+                            "top_p":       req.top_p,
+                            "max_tokens":  req.max_tokens,
+                        }.items() if v is not None}
+                    )
+            
             result = await loop.run_in_executor(
                 None,
                 lambda: pipeline.generate(
@@ -382,7 +395,7 @@ async def query_stream(req: QueryRequest):
                     persona_config=_persona_config if req.mode == "chat" else None,
                 ),
             )
-
+            
             if hasattr(result, "__iter__") and not isinstance(result, dict):
                 for chunk in result:
                     if isinstance(chunk, str):
