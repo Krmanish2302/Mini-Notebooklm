@@ -10,9 +10,13 @@ Retrieval strategy
              sentences from each chunk (reduces token noise before reranking).
 * Step 5   : Cross-encoder rerank (BAAI/bge-reranker-base) — most accurate
              relevance scoring, worth the latency for deep research.
-* Step 6   : RAPTOR retrieval (if RAPTOR tree built at ingestion time) —
-             adds 2-3 high-level summary nodes for macro context.
-* Step 7   : Final merge: reranked leaves + RAPTOR summaries.
+             Score threshold applied: chunks below threshold are dropped.
+* Step 6   : RAPTOR retrieval (if RAPTOR tree was built at ingestion time) —
+             adds 2-3 high-level summary nodes for macro context.  RAPTOR nodes
+             represent clusters of related leaf chunks summarised into a single
+             compact representation; they capture document-level themes that
+             individual paragraph chunks miss.
+* Step 7   : Final merge: reranked leaves + RAPTOR summary nodes.
 
 Token budget awareness
 ----------------------
@@ -36,6 +40,7 @@ class DeepResearchPipeline:
     llm                  : callable  (used for query expansion + final answer)
     raptor               : RaptorRetriever | None
     top_k                : final chunks to send to LLM (default 8)
+    score_threshold      : drop reranked chunks below this score (default 0.0)
     history_k            : history messages (default 5, broader than chat)
     expansion_n          : number of sub-queries to generate (default 3)
     """
@@ -49,6 +54,7 @@ class DeepResearchPipeline:
         llm,
         raptor=None,
         top_k: int = 8,
+        score_threshold: float = 0.0,
         history_k: int = 5,
         expansion_n: int = 3,
     ):
@@ -59,12 +65,18 @@ class DeepResearchPipeline:
         self.llm = llm
         self.raptor = raptor
         self.top_k = top_k
+        self.score_threshold = score_threshold
         self.history_k = history_k
         self.expansion_n = expansion_n
 
-    def run(self, query: str) -> Dict[str, Any]:
+    def run(self, query: str, top_k: Optional[int] = None, score_threshold: Optional[float] = None) -> Dict[str, Any]:
         """
         Full deep research turn.
+
+        Args:
+            query          : user question
+            top_k          : override instance top_k for this turn
+            score_threshold: override instance score_threshold for this turn
 
         Returns
         -------
@@ -76,6 +88,9 @@ class DeepResearchPipeline:
           "history_used"  : List[Dict],
         }
         """
+        effective_top_k = top_k if top_k is not None else self.top_k
+        effective_threshold = score_threshold if score_threshold is not None else self.score_threshold
+
         # ── 1. History ────────────────────────────────────────────────
         history_context = self.history.format_for_prompt(
             query, k=self.history_k
@@ -83,10 +98,6 @@ class DeepResearchPipeline:
 
         # ── 2. LLM Query Expansion ───────────────────────────────────
         sub_queries: List[str] = self._expand_query(query)
-        # e.g. "How does backprop work?" ->
-        #   ["How does backpropagation work?",
-        #    "What is the chain rule in neural networks?",
-        #    "Explain gradient computation in deep learning"]
 
         # ── 3. Hybrid retrieval for EACH sub-query ───────────────────
         # Each call to HybridRetriever:
@@ -97,7 +108,7 @@ class DeepResearchPipeline:
         all_results: List[Dict] = []
         seen_ids = set()
         for sq in sub_queries:
-            hits = self.retriever.retrieve(sq, top_k=self.top_k)
+            hits = self.retriever.retrieve(sq, top_k=effective_top_k)
             for chunk in hits:
                 if chunk["id"] not in seen_ids:
                     seen_ids.add(chunk["id"])
@@ -105,20 +116,27 @@ class DeepResearchPipeline:
 
         # ── 4. Contextual Compression ────────────────────────────────
         # LLM strips each chunk down to only query-relevant sentences.
-        # This trims token noise before the expensive cross-encoder pass.
         compressed: List[Dict] = self.compressor.compress(all_results, query)
 
-        # ── 5. Cross-encoder Rerank ───────────────────────────────────
-        # BAAI/bge-reranker-base scores each (query, chunk) pair jointly
-        # — far more accurate than bi-encoder cosine similarity.
+        # ── 5. Cross-encoder Rerank + Score Threshold ─────────────────
+        # BAAI/bge-reranker-base scores each (query, chunk) pair jointly.
         reranked: List[Dict] = self.reranker.rerank(
-            query, compressed, top_k=self.top_k
+            query, compressed, top_k=len(compressed)
         )
+        # Apply score threshold — drop chunks below the bar
+        reranked = [
+            c for c in reranked
+            if c.get("rerank_score", 1.0) >= effective_threshold
+        ]
+        reranked = reranked[:effective_top_k]
 
         # ── 6. RAPTOR (optional) ─────────────────────────────────────
-        # RAPTOR tree was built at ingestion time.
-        # It returns 1-2 high-level summary nodes providing macro context
-        # that individual chunk retrieval often misses.
+        # RAPTOR builds a tree of recursive summaries at ingest time.
+        # Each internal node is a cluster summary of its children;
+        # the root node is the full-document abstract.
+        # Retrieval returns the 1-2 most relevant summary nodes —
+        # they provide macro-context ("what is this document about")
+        # that individual chunk retrieval cannot surface.
         raptor_used = False
         if self.raptor:
             raptor_nodes = self.raptor.retrieve(query, top_k=2)
@@ -168,7 +186,6 @@ class DeepResearchPipeline:
         try:
             raw = self.llm(expansion_prompt)
             lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
-            # Always prepend the original query
             all_queries = [query] + [l for l in lines if l != query]
             return all_queries[:n + 1]
         except Exception:

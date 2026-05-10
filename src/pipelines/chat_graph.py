@@ -4,12 +4,18 @@ chat_graph.py  —  LangGraph ChatGraph
 The query → retrieve → generate pipeline as a LangGraph StateGraph.
 
 Graph topology:
-    embed_query → retrieve → build_prompt → generate → done
+    embed_query → retrieve → compress → rerank → build_prompt → generate → done
 
 Multi-index retrieval:
     The retrieve node queries ALL active FAISS indexes in parallel (one per
     active embedding model dimension), then applies Reciprocal Rank Fusion
-    to merge results into a single ranked list before passing to the LLM.
+    to merge results into a single ranked list.
+
+Post-retrieval (Chat mode):
+    NODE 2.5 — ContextualCompressor: strips irrelevant sentences from each chunk.
+    NODE 2.6 — Reranker (BAAI/bge-reranker-base): cross-encoder rescoring.
+    Score threshold: chunks below `score_threshold` are dropped before the LLM.
+    Top-K: user-controlled, stored in ChatState as `top_k` (default 8).
 
 Mid-chat ingest:
     The ChatGraph exposes add_source_background() which delegates to
@@ -18,8 +24,7 @@ Mid-chat ingest:
 from __future__ import annotations
 
 import logging
-import time
-from typing import Any, Callable, Dict, List, Optional, TypedDict, Iterator
+from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -40,20 +45,16 @@ RRF_K = 60  # RRF smoothing constant
 # ── State ─────────────────────────────────────────────────────────────────────
 
 class ChatState(TypedDict, total=False):
-    # LangGraph managed message history
     messages:       List[BaseMessage]
-    # Current query
     query:          str
-    # Retrieved context
     retrieved:      List[Dict[str, Any]]
-    # Built prompt string
     prompt:         str
-    # LLM response
     response:       str
-    # Mode: chat | deep_research | study
     mode:           str
-    # LLM callable  (set once, persists in state)
     llm:            Any
+    # Retrieval controls (user-configurable)
+    top_k:          int    # how many final chunks to send to LLM (default 8)
+    score_threshold: float  # drop chunks with rerank_score below this (default 0.0)
     error:          Optional[str]
 
 
@@ -92,8 +93,6 @@ def _make_node_embed_query(faiss_store: MultiFAISSStore):
             active_dims = faiss_store.active_dims()
             if not active_dims:
                 return {**state, "retrieved": [], "error": None}
-            # Build query vectors for each active dim
-            # EmbeddingRegistry.get_by_dim returns the model registered for that dim
             query_vectors: Dict[int, Any] = {}
             for dim in active_dims:
                 model = EmbeddingRegistry.get_by_dim(dim)
@@ -111,7 +110,8 @@ def _make_node_retrieve(faiss_store: MultiFAISSStore, sqlite: SQLiteManager):
     def node_retrieve(state: ChatState) -> ChatState:
         """
         Search all active FAISS indexes, apply RRF fusion, hydrate chunk content
-        from SQLite.
+        from SQLite.  Fetches top_k * 3 candidates so compression+rerank have
+        enough headroom to filter down to the user's desired top_k.
         """
         if state.get("error"):
             return state
@@ -120,15 +120,15 @@ def _make_node_retrieve(faiss_store: MultiFAISSStore, sqlite: SQLiteManager):
             if not qvecs:
                 return {**state, "retrieved": []}
 
-            # Search all dims
-            raw_results = faiss_store.search(qvecs, k=10)
+            top_k = state.get("top_k", 8)
+            # Fetch 3x candidates so compression/rerank have room to filter
+            candidate_k = top_k * 3
 
-            # RRF fusion
+            raw_results = faiss_store.search(qvecs, k=candidate_k)
             fused_ids = _rrf_fuse(raw_results, k=RRF_K)
 
-            # Hydrate from SQLite (content, metadata)
             chunks = []
-            for cid in fused_ids[:8]:  # top 8 after fusion
+            for cid in fused_ids[:candidate_k]:
                 content = sqlite.get_chunk_content(cid)
                 if content:
                     chunks.append({"id": cid, "content": content})
@@ -138,6 +138,77 @@ def _make_node_retrieve(faiss_store: MultiFAISSStore, sqlite: SQLiteManager):
             logger.error("ChatGraph[retrieve]: %s", exc)
             return {**state, "error": str(exc)}
     return node_retrieve
+
+
+def _make_node_compress(compressor):
+    """
+    NODE 2.5 — Contextual Compression.
+
+    Uses ContextualCompressor to strip each chunk down to only the sentences
+    relevant to the query.  Irrelevant chunks are dropped entirely.
+    If no compressor is injected, this node is a transparent pass-through.
+    """
+    def node_compress(state: ChatState) -> ChatState:
+        if state.get("error"):
+            return state
+        chunks = state.get("retrieved", [])
+        if not chunks or compressor is None:
+            return state
+        try:
+            compressed = compressor.compress(chunks, state["query"])
+            logger.debug(
+                "ChatGraph[compress]: %d → %d chunks after compression",
+                len(chunks), len(compressed),
+            )
+            return {**state, "retrieved": compressed}
+        except Exception as exc:
+            logger.warning("ChatGraph[compress] failed, using raw chunks: %s", exc)
+            return state  # graceful fallback — use uncompressed chunks
+    return node_compress
+
+
+def _make_node_rerank(reranker):
+    """
+    NODE 2.6 — Cross-Encoder Reranking + Score Threshold + Top-K trim.
+
+    1. Reranks retrieved chunks with BAAI/bge-reranker-base.
+    2. Drops any chunk whose rerank_score < state['score_threshold'].
+    3. Returns the best state['top_k'] chunks to the prompt builder.
+
+    If no reranker is injected, falls back to simple top-k slice.
+    """
+    def node_rerank(state: ChatState) -> ChatState:
+        if state.get("error"):
+            return state
+        chunks = state.get("retrieved", [])
+        if not chunks:
+            return state
+
+        top_k = state.get("top_k", 8)
+        threshold = state.get("score_threshold", 0.0)
+
+        try:
+            if reranker is not None:
+                reranked = reranker.rerank(state["query"], chunks, top_k=len(chunks))
+                # Apply score threshold
+                filtered = [
+                    c for c in reranked
+                    if c.get("rerank_score", 1.0) >= threshold
+                ]
+                logger.debug(
+                    "ChatGraph[rerank]: %d → %d chunks after threshold=%.2f",
+                    len(reranked), len(filtered), threshold,
+                )
+                final = filtered[:top_k]
+            else:
+                # No reranker: just apply top_k slice
+                final = chunks[:top_k]
+
+            return {**state, "retrieved": final}
+        except Exception as exc:
+            logger.warning("ChatGraph[rerank] failed, using top_k slice: %s", exc)
+            return {**state, "retrieved": chunks[:top_k]}
+    return node_rerank
 
 
 def _make_node_build_prompt():
@@ -165,8 +236,7 @@ def _make_node_build_prompt():
                 MessagesPlaceholder(variable_name="history"),
                 ("human", "{query}"),
             ])
-            # Format into a string for the LLM invoke call
-            history = state.get("messages", [])[:-1]  # exclude latest human msg
+            history = state.get("messages", [])[:-1]
             formatted = prompt_template.format_messages(
                 context=context,
                 history=history,
@@ -206,22 +276,36 @@ def _make_node_generate():
 def build_chat_graph(
     faiss_store: MultiFAISSStore,
     sqlite: SQLiteManager,
+    compressor=None,
+    reranker=None,
 ) -> StateGraph:
-    """Build and compile the LangGraph ChatGraph."""
+    """
+    Build and compile the LangGraph ChatGraph.
+
+    Args:
+        faiss_store : MultiFAISSStore instance
+        sqlite      : SQLiteManager instance
+        compressor  : ContextualCompressor instance (optional — pass-through if None)
+        reranker    : Reranker instance (optional — top_k slice if None)
+    """
     builder = StateGraph(ChatState)
 
     builder.add_node("embed_query",  _make_node_embed_query(faiss_store))
     builder.add_node("retrieve",     _make_node_retrieve(faiss_store, sqlite))
+    builder.add_node("compress",     _make_node_compress(compressor))
+    builder.add_node("rerank",       _make_node_rerank(reranker))
     builder.add_node("build_prompt", _make_node_build_prompt())
     builder.add_node("generate",     _make_node_generate())
 
     builder.set_entry_point("embed_query")
     builder.add_edge("embed_query",  "retrieve")
-    builder.add_edge("retrieve",     "build_prompt")
+    builder.add_edge("retrieve",     "compress")
+    builder.add_edge("compress",     "rerank")
+    builder.add_edge("rerank",       "build_prompt")
     builder.add_edge("build_prompt", "generate")
     builder.add_edge("generate",     END)
 
-    checkpointer = MemorySaver()  # in-memory per-session history
+    checkpointer = MemorySaver()
     return builder.compile(checkpointer=checkpointer)
 
 
@@ -232,20 +316,25 @@ class ChatGraph:
     High-level façade over the compiled LangGraph ChatGraph.
 
     Usage:
-        cg = ChatGraph(faiss_store, sqlite, source_manager)
+        cg = ChatGraph(
+            faiss_store, sqlite, source_manager,
+            compressor=ContextualCompressor(llm),
+            reranker=Reranker(),
+        )
         cg.set_llm(llm_instance)
 
-        # Normal chat
-        response = cg.chat("What is attention mechanism?", session_id="abc")
+        # Standard chat — default top_k=8, threshold=0.0
+        response = cg.chat("What is attention?", session_id="abc")
 
-        # Mid-chat: user drops a new PDF while chatting
+        # User bumps top_k to 12, drops weak chunks
+        response = cg.chat("Explain RLHF", session_id="abc",
+                           top_k=12, score_threshold=0.3)
+
+        # Mid-chat background ingest
         cg.add_source_background(
-            source_config={"file_path": "new.pdf", "source_type": "pdf",
-                           "chunking_strategy": "recursive",
-                           "embedding_model": "all-MiniLM-L6-v2"},
-            on_complete=lambda sid: st.toast(f"✅ New source ready: {sid}"),
+            source_config={...},
+            on_complete=lambda sid: st.toast(f"✅ Ready: {sid}"),
         )
-        # Chat continues immediately — ingest runs in background thread
     """
 
     def __init__(
@@ -254,13 +343,15 @@ class ChatGraph:
         sqlite: SQLiteManager,
         source_manager: SourceManager,
         mode: str = "chat",
+        compressor=None,
+        reranker=None,
     ):
         self.faiss_store = faiss_store
         self.sqlite = sqlite
         self.source_manager = source_manager
         self.mode = mode
         self._llm: Optional[Any] = None
-        self.graph = build_chat_graph(faiss_store, sqlite)
+        self.graph = build_chat_graph(faiss_store, sqlite, compressor, reranker)
         self._ingest_graph = IngestGraph(source_manager)
 
     def set_llm(self, llm: Any) -> None:
@@ -275,27 +366,36 @@ class ChatGraph:
         self,
         query: str,
         session_id: str = "default",
+        top_k: int = 8,
+        score_threshold: float = 0.0,
         stream: bool = False,
     ) -> str:
         """
         Send a message and get a response.
-        LangGraph MemorySaver persists message history per session_id.
+
+        Args:
+            query           : user query
+            session_id      : LangGraph thread id (per-user session)
+            top_k           : number of chunks to pass to LLM (user-configurable)
+            score_threshold : drop chunks with rerank_score below this value.
+                              Range 0.0–1.0; 0.0 = keep all, 0.5 = strict.
         """
         if not self._llm:
             raise ValueError("LLM not set. Call set_llm() first.")
 
         config = {"configurable": {"thread_id": session_id}}
 
-        # Get existing state to append to message history
         existing = self.graph.get_state(config)
         history = existing.values.get("messages", []) if existing.values else []
         history = list(history) + [HumanMessage(content=query)]
 
         initial_state: ChatState = {
-            "messages": history,
-            "query":    query,
-            "mode":     self.mode,
-            "llm":      self._llm,
+            "messages":       history,
+            "query":          query,
+            "mode":           self.mode,
+            "llm":            self._llm,
+            "top_k":          top_k,
+            "score_threshold": score_threshold,
         }
 
         result = self.graph.invoke(initial_state, config=config)
@@ -332,4 +432,7 @@ class ChatGraph:
             on_complete=on_complete,
             on_error=on_error,
         )
-        logger.info("ChatGraph: background ingest dispatched for %s", source_config.get("source_type"))
+        logger.info(
+            "ChatGraph: background ingest dispatched for %s",
+            source_config.get("source_type"),
+        )
