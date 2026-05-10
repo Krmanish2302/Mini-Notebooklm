@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STYLES
@@ -124,6 +124,7 @@ html,body,#root{height:100%;background:var(--bg);color:var(--text);font-family:v
 .emb-opt:hover{border-color:var(--border2)}
 .emb-opt.active{border-color:var(--accent);background:rgba(124,106,247,.08)}
 .emb-dim{font-family:var(--font-mono);font-size:10px;color:var(--muted)}
+.emb-note{font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:1px}
 
 /* EMBED CTA button */
 .embed-btn{
@@ -277,80 +278,116 @@ const MODES = [
   {id:"deep",  label:"Research", cls:"amber"},
   {id:"study", label:"Study",    cls:"green"},
 ];
-const EMB_MODELS = [
-  {id:"minilm",  name:"all-MiniLM-L6-v2",  dim:384,  tokens:256},
-  {id:"mpnet",   name:"all-mpnet-base-v2",  dim:768,  tokens:512},
-  {id:"e5large", name:"e5-large-v2",        dim:1024, tokens:512},
+
+// Default embedding models — overwritten by GET /api/embedding-models on mount
+const DEFAULT_EMB_MODELS = [
+  {id:"minilm",  name:"all-MiniLM-L6-v2",      dim:384,  tokens:256,  note:"Local · fastest"},
+  {id:"mpnet",   name:"all-mpnet-base-v2",      dim:768,  tokens:384,  note:"Local · balanced"},
+  {id:"e5large", name:"e5-large-v2",            dim:1024, tokens:512,  note:"Local · most accurate"},
+  {id:"oai-sm",  name:"text-embedding-3-small", dim:1536, tokens:8191, note:"OpenAI API key required"},
+  {id:"oai-lg",  name:"text-embedding-3-large", dim:3072, tokens:8191, note:"OpenAI API key required"},
 ];
+
 const CHUNKERS = [
-  {id:"paragraph",   label:"Paragraph"},
-  {id:"page",        label:"Page"},
-  {id:"recursive",   label:"Recursive"},
-  {id:"semantic",    label:"Semantic"},
-  {id:"hierarchical",label:"Hierarchical"},
+  {id:"paragraph",    label:"Paragraph"},
+  {id:"page",         label:"Page"},
+  {id:"recursive",    label:"Recursive"},
+  {id:"semantic",     label:"Semantic"},
+  {id:"hierarchical", label:"Hierarchical"},
 ];
+
 // Fallback static estimates used only when /api/analyze is unavailable
 const CHUNK_EST = {paragraph:47,page:12,recursive:39,hierarchical:28,semantic:31};
-const SRC_ICONS = {pdf:"📄",youtube:"▶️",website:"🌐",text:"📝",image:"🖼️",csv:"📊",video:"🎬"};
-
-const DEMO_SOURCES = [
-  {id:"s1",type:"pdf",    name:"attention_paper.pdf",      chunks:142,vectors:142,embModel:"minilm", status:"ready"},
-  {id:"s2",type:"youtube",name:"Andrej Karpathy – LLMs",   chunks:89, vectors:89, embModel:"mpnet",  status:"ready"},
-  {id:"s3",type:"website",name:"arxiv.org/abs/2404.0001",  chunks:34, vectors:34, embModel:"minilm", status:"ready"},
-];
-const DEMO_HISTORY = [
-  {id:"h1",title:"RAG architecture deep-dive"},
-  {id:"h2",title:"Chunking strategies compared"},
-  {id:"h3",title:"FAISS vs Chroma benchmarks"},
-];
-const DEMO_MESSAGES = [
-  {id:"m1",role:"user",content:"What chunking strategy works best for academic PDFs?"},
-  {
-    id:"m2",role:"assistant",
-    content:"For academic PDFs, hierarchical chunking outperforms flat strategies because it preserves section structure — abstract → intro → methods — letting the retriever surface cohesive passages.",
-    chunks:[
-      {src:"attention_paper.pdf · chunk 12",text:"Section-aware chunking preserves the logical hierarchy of research papers. Experiments show a 12% higher MRR@10 vs fixed-size recursive splitting on ArXiv-QA."},
-      {src:"attention_paper.pdf · chunk 31",text:"Hierarchical chunkers excel at multi-hop questions spanning sections, as parent-chunk context is preserved alongside the leaf chunk during retrieval."},
-    ],
-    citations:["attention_paper.pdf p.3","attention_paper.pdf p.7"],
-  },
-];
+const SRC_ICONS  = {pdf:"📄",youtube:"▶️",website:"🌐",text:"📝",image:"🖼️",csv:"📊",video:"🎬"};
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  MINI GRAPH
+//  MINI GRAPH  — fetches real KG from GET /api/graph, falls back to demo data
 // ─────────────────────────────────────────────────────────────────────────────
 function MiniGraph() {
-  const [hover,setHover]=useState(null);
-  const nodes=[
-    {x:50,y:38,hub:true, label:"Transformers",chunks:5,edges:4},
-    {x:24,y:68,hub:false,label:"Attention",   chunks:3,edges:3},
-    {x:76,y:63,hub:false,label:"FAISS",       chunks:2,edges:2},
-    {x:50,y:84,hub:false,label:"Chunking",    chunks:2,edges:3},
-    {x:14,y:42,hub:false,label:"Embeddings",  chunks:3,edges:2},
-    {x:86,y:33,hub:false,label:"BM25",        chunks:1,edges:2},
+  const [hover, setHover] = useState(null);
+  const [graphData, setGraphData] = useState(null);
+
+  useEffect(() => {
+    fetch("/api/graph")
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data && data.nodes && data.nodes.length > 0) {
+          setGraphData(data);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Layout: spread nodes evenly in the canvas using simple circular placement
+  const buildLayout = (nodes) => {
+    const cx = 50, cy = 50, r = 35;
+    return nodes.map((n, i) => {
+      const angle = (2 * Math.PI * i) / nodes.length - Math.PI / 2;
+      return {
+        ...n,
+        x: Math.round(cx + r * Math.cos(angle)),
+        y: Math.round(cy + r * Math.sin(angle)),
+        hub: (n.type === "source" || (n.edges_count || 0) >= 3),
+        label: n.id?.slice(0, 18) || `node-${i}`,
+      };
+    });
+  };
+
+  // Demo fallback nodes + edges
+  const demoNodes = [
+    {x:50,y:38,hub:true, label:"Transformers",id:"Transformers"},
+    {x:24,y:68,hub:false,label:"Attention",   id:"Attention"},
+    {x:76,y:63,hub:false,label:"FAISS",       id:"FAISS"},
+    {x:50,y:84,hub:false,label:"Chunking",    id:"Chunking"},
+    {x:14,y:42,hub:false,label:"Embeddings",  id:"Embeddings"},
+    {x:86,y:33,hub:false,label:"BM25",        id:"BM25"},
   ];
-  const edges=[[0,1],[0,2],[0,3],[0,4],[1,4],[2,5],[1,3]];
-  return(
+  const demoEdges = [[0,1],[0,2],[0,3],[0,4],[1,4],[2,5],[1,3]];
+
+  let nodes, edgePairs;
+  if (graphData) {
+    const laid = buildLayout(graphData.nodes.slice(0, 20));
+    const idxById = Object.fromEntries(laid.map((n, i) => [n.id, i]));
+    nodes = laid;
+    edgePairs = graphData.edges
+      .slice(0, 40)
+      .map(e => [idxById[e.from], idxById[e.to]])
+      .filter(([a, b]) => a !== undefined && b !== undefined);
+  } else {
+    nodes = demoNodes;
+    edgePairs = demoEdges;
+  }
+
+  return (
     <div className="graph-canvas">
       <svg style={{position:"absolute",top:0,left:0,width:"100%",height:"100%"}}>
-        {edges.map(([a,b],i)=>(
-          <line key={i} x1={`${nodes[a].x}%`} y1={`${nodes[a].y}%`} x2={`${nodes[b].x}%`} y2={`${nodes[b].y}%`} stroke="var(--dim)" strokeWidth="1"/>
+        {edgePairs.map(([a,b],i) => (
+          <line key={i}
+            x1={`${nodes[a].x}%`} y1={`${nodes[a].y}%`}
+            x2={`${nodes[b].x}%`} y2={`${nodes[b].y}%`}
+            stroke="var(--dim)" strokeWidth="1"/>
         ))}
       </svg>
-      {nodes.map((n,i)=>(
-        <div key={i} className={`graph-node${n.hub?" hub":""}`}
-          style={{left:`calc(${n.x}% - ${n.hub?7:5}px)`,top:`calc(${n.y}% - ${n.hub?7:5}px)`}}
-          onMouseEnter={()=>setHover(n)} onMouseLeave={()=>setHover(null)}/>
+      {nodes.map((n,i) => (
+        <div key={i}
+          className={`graph-node${n.hub?" hub":""}`}
+          style={{
+            left:`calc(${n.x}% - ${n.hub?7:5}px)`,
+            top:`calc(${n.y}% - ${n.hub?7:5}px)`,
+          }}
+          onMouseEnter={() => setHover(n)}
+          onMouseLeave={() => setHover(null)}
+        />
       ))}
-      {hover&&(
+      {hover && (
         <div className="graph-tooltip" style={{
-          left:hover.x<60?`calc(${hover.x}% + 14px)`:"auto",
-          right:hover.x>=60?`calc(${100-hover.x}% + 14px)`:"auto",
-          top:`calc(${hover.y}% - 30px)`,
+          left:  hover.x < 60 ? `calc(${hover.x}% + 14px)` : "auto",
+          right: hover.x >= 60 ? `calc(${100-hover.x}% + 14px)` : "auto",
+          top:   `calc(${hover.y}% - 30px)`,
         }}>
           <b style={{color:"var(--accent2)"}}>{hover.label}</b><br/>
-          Chunks: {hover.chunks}<br/>
-          Edges: {hover.edges}
+          {hover.type && <>Type: {hover.type}<br/></>}
+          {hover.chunks && <>Chunks: {hover.chunks}<br/></>}
         </div>
       )}
     </div>
@@ -360,48 +397,69 @@ function MiniGraph() {
 // ─────────────────────────────────────────────────────────────────────────────
 //  EMBED FLOW  — wired to real /api/analyze + /api/ingest
 // ─────────────────────────────────────────────────────────────────────────────
-function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDone,analysisData,analyzing}){
-  const [phase,setPhase]=useState("idle");
-  const [progress,setProgress]=useState(0);
-  const [stepLabel,setStepLabel]=useState("");
+function EmbedFlow({pendingSources, chunker, setChunker, embModel, setEmbModel,
+                    embModels, onDone, analysisData, analyzing}) {
+  const [phase,    setPhase]    = useState("idle");
+  const [progress, setProgress] = useState(0);
+  const [stepLabel,setStepLabel]= useState("");
 
-  const emb=EMB_MODELS.find(e=>e.id===embModel);
+  const emb = embModels.find(e => e.id === embModel) || embModels[0];
 
-  // Use real per-strategy stats if available, else fall back to static estimate
-  const strat=analysisData?.[chunker];
-  const totalChunks=strat ? strat.total_chunks : CHUNK_EST[chunker]*pendingSources.length;
-  const totalTokens=totalChunks*(emb?.tokens||256);
+  // Real per-strategy stats if available, else static estimate
+  const stratData  = analysisData?.[chunker];
+  const totalChunks = stratData
+    ? stratData.total_chunks
+    : CHUNK_EST[chunker] * Math.max(pendingSources.length, 1);
+  const totalTokens = totalChunks * (emb?.tokens || 256);
 
-  const run=async()=>{
-    setPhase("analyzing");setProgress(10);setStepLabel("Sending to ingest pipeline…");
-    try{
-      const form=new FormData();
-      form.append("chunker",chunker);
-      form.append("emb_model",embModel);
-      pendingSources.forEach(s=>form.append("source_ids",s.id));
+  const run = async () => {
+    if (!pendingSources.length) return;
+    setPhase("analyzing"); setProgress(10); setStepLabel("Sending to ingest pipeline…");
+    try {
+      // Ingest each pending source sequentially (each may be a file or URL)
+      let lastResult = null;
+      for (const src of pendingSources) {
+        const form = new FormData();
+        form.append("source_type",       src.type);
+        form.append("chunking_strategy", chunker);
+        // Map UI model id → actual model name expected by pipeline
+        form.append("embedding_model",   emb?.name || emb?.id || embModel);
 
-      setProgress(30);setStepLabel(`Chunking · ${chunker} strategy…`);
-      const res=await fetch("/api/ingest",{method:"POST",body:form});
-      setProgress(65);setStepLabel(`Embedding with ${emb?.name}…`);
-      if(!res.ok) throw new Error(`Ingest failed: ${res.status}`);
-      const data=await res.json();
-      setProgress(90);setStepLabel("Writing to FAISS vector store…");
-      await new Promise(r=>setTimeout(r,350));
-      setProgress(100);setPhase("done");setStepLabel("✓ All sources embedded");
-      onDone(embModel,chunker,data.total_chunks??totalChunks);
-    }catch(err){
-      setPhase("idle");setProgress(0);setStepLabel("");
-      // bubble up to parent toast
-      onDone(null,null,0,err.message);
+        if (src._file) {
+          // PDF / file upload: send the actual File blob
+          form.append("file", src._file, src._file.name);
+        } else if (src._url || src.type === "website" || src.type === "youtube") {
+          form.append("url", src._url || src.name);
+        } else if (src.type === "text" && src._text) {
+          // Plain text: wrap in a Blob and send as a .txt file
+          form.append("file", new Blob([src._text], {type:"text/plain"}), "paste.txt");
+        }
+
+        setProgress(30); setStepLabel(`Chunking · ${chunker} strategy…`);
+        const res = await fetch("/api/ingest", {method:"POST", body:form});
+        setProgress(65); setStepLabel(`Embedding with ${emb?.name}…`);
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(`Ingest failed (${res.status}): ${errText}`);
+        }
+        lastResult = await res.json();
+        setProgress(90); setStepLabel("Writing to FAISS vector store…");
+      }
+      await new Promise(r => setTimeout(r, 300));
+      setProgress(100); setPhase("done"); setStepLabel("✓ All sources embedded");
+      onDone(embModel, chunker, lastResult?.result?.chunk_count ?? totalChunks);
+    } catch (err) {
+      setPhase("idle"); setProgress(0); setStepLabel("");
+      onDone(null, null, 0, err.message);
     }
   };
 
-  if(pendingSources.length===0)return null;
+  if (pendingSources.length === 0) return null;
 
-  return(
+  return (
     <div style={{marginTop:10,background:"var(--bg)",border:"1px solid var(--border2)",borderRadius:10,padding:12}}>
       <div className="sb-label">Queued Sources</div>
-      {pendingSources.map(s=>(
+      {pendingSources.map(s => (
         <div key={s.id} style={{marginBottom:7,padding:"8px 10px",background:"var(--panel)",borderRadius:8,border:"1px solid var(--border)"}}>
           <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
             <span style={{fontSize:13}}>{SRC_ICONS[s.type]||"📁"}</span>
@@ -417,34 +475,40 @@ function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDon
 
       <div className="sb-label" style={{marginTop:10}}>Chunking Strategy</div>
       <div className="chip-row">
-        {CHUNKERS.map(c=>(
+        {CHUNKERS.map(c => (
           <button key={c.id} className={`chip${chunker===c.id?" active":""}`}
-            disabled={phase!=="idle"} onClick={()=>setChunker(c.id)}>{c.label}</button>
+            disabled={phase!=="idle"} onClick={() => setChunker(c.id)}>
+            {c.label}
+          </button>
         ))}
       </div>
 
-      {/* Token stats — spinner while analyzing */}
-      {analyzing&&(
-        <div style={{fontFamily:"var(--font-mono)",fontSize:10,color:"var(--muted)",padding:"6px 0",display:"flex",alignItems:"center",gap:6}}>
+      {/* Spinner while /api/analyze is running */}
+      {analyzing && (
+        <div style={{fontFamily:"var(--font-mono)",fontSize:10,color:"var(--muted)",
+                     padding:"6px 0",display:"flex",alignItems:"center",gap:6}}>
           <span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>⟳</span>
           Analysing document structure…
         </div>
       )}
 
-      {/* Real per-strategy token table from /api/analyze */}
-      {analysisData&&!analyzing&&(
+      {/* Real per-strategy token table from /api/analyze → token_stats */}
+      {analysisData && !analyzing && (
         <div className="token-table">
           <div className="token-table-hdr">
-            <span>Strategy</span><span>Avg tok</span><span style={{color:"var(--green)"}}>Min</span><span style={{color:"var(--amber)"}}>Max</span>
+            <span>Strategy</span>
+            <span>Avg tok</span>
+            <span style={{color:"var(--green)"}}>Min</span>
+            <span style={{color:"var(--amber)"}}>Max</span>
           </div>
-          {Object.entries(analysisData).map(([key,val])=>(
+          {Object.entries(analysisData).map(([key, val]) => (
             <div key={key}
               className={`token-table-row${chunker===key?" active-row":""}`}
-              onClick={()=>phase==="idle"&&setChunker(key)}>
+              onClick={() => phase==="idle" && setChunker(key)}>
               <span style={{textTransform:"capitalize",fontWeight:chunker===key?700:400}}>{key}</span>
-              <span>{val.avg}</span>
-              <span style={{color:"var(--green)"}}>{val.min}</span>
-              <span style={{color:"var(--amber)"}}>{val.max}</span>
+              <span>{val.avg ?? val.avg_tokens ?? "—"}</span>
+              <span style={{color:"var(--green)"}}>{val.min ?? val.min_tokens ?? "—"}</span>
+              <span style={{color:"var(--amber)"}}>{val.max ?? val.max_tokens ?? "—"}</span>
             </div>
           ))}
         </div>
@@ -452,36 +516,41 @@ function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDon
 
       {/* Preview summary box */}
       <div className="preview-box">
-        <div className="prow"><span>Est. chunks</span><span className="pval">{totalChunks}</span></div>
-        <div className="prow"><span>Tokens/chunk</span><span className="pval">~{emb?.tokens}</span></div>
-        <div className="prow"><span>Total tokens</span><span className="pval">{totalTokens.toLocaleString()}</span></div>
-        <div className="prow"><span>Vector dim</span><span className="pval">{emb?.dim}</span></div>
+        <div className="prow"><span>Est. chunks</span>  <span className="pval">{totalChunks}</span></div>
+        <div className="prow"><span>Tokens/chunk</span> <span className="pval">~{emb?.tokens}</span></div>
+        <div className="prow"><span>Total tokens</span> <span className="pval">{totalTokens.toLocaleString()}</span></div>
+        <div className="prow"><span>Vector dim</span>   <span className="pval">{emb?.dim}</span></div>
       </div>
 
       <div className="sb-label">Embedding Model</div>
-      {EMB_MODELS.map(e=>(
-        <div key={e.id} className={`emb-opt${embModel===e.id?" active":""}`}
-          onClick={()=>phase==="idle"&&setEmbModel(e.id)}
+      {embModels.map(e => (
+        <div key={e.id}
+          className={`emb-opt${embModel===e.id?" active":""}`}
+          onClick={() => phase==="idle" && setEmbModel(e.id)}
           style={{cursor:phase!=="idle"?"default":"pointer"}}>
           <div>
             <div style={{fontWeight:600,fontSize:10}}>{e.name}</div>
-            <div className="emb-dim">{e.dim} dims · max {e.tokens} tokens/chunk</div>
+            <div className="emb-dim">{e.dim} dims · max {e.tokens} tok</div>
+            <div className="emb-note">{e.note}</div>
           </div>
-          {embModel===e.id&&<span style={{color:"var(--accent)",fontSize:12}}>✓</span>}
+          {embModel===e.id && <span style={{color:"var(--accent)",fontSize:12}}>✓</span>}
         </div>
       ))}
 
-      {phase!=="idle"&&(
+      {phase!=="idle" && (
         <div className="prog-wrap">
           <div className="prog-lbl">{phase.charAt(0).toUpperCase()+phase.slice(1)}…</div>
           <div className="prog-bar-bg"><div className="prog-bar" style={{width:`${progress}%`}}/></div>
           <div className="prog-step">{stepLabel}</div>
         </div>
       )}
-      <button className="embed-btn" disabled={phase!=="idle"&&phase!=="done"} onClick={run}>
-        {phase==="idle"&&<><span>⚡</span>Embed &amp; Ingest {pendingSources.length} source{pendingSources.length>1?"s":""}</>}
-        {phase!=="idle"&&phase!=="done"&&<><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>⟳</span>Processing…</>}
-        {phase==="done"&&<><span>✓</span>Done — sources ready in store</>}
+
+      <button className="embed-btn"
+        disabled={phase!=="idle" && phase!=="done"}
+        onClick={run}>
+        {phase==="idle"   && <><span>⚡</span>Embed &amp; Ingest {pendingSources.length} source{pendingSources.length>1?"s":""}</>}
+        {phase!=="idle" && phase!=="done" && <><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>⟳</span>Processing…</>}
+        {phase==="done"   && <><span>✓</span>Done — sources ready in store</>}
       </button>
     </div>
   );
@@ -490,183 +559,330 @@ function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDon
 // ─────────────────────────────────────────────────────────────────────────────
 //  APP
 // ─────────────────────────────────────────────────────────────────────────────
-function useToast(){
-  const[t,setT]=useState(null);
-  const[err,setErr]=useState(false);
-  const show=(msg,isErr=false)=>{setT(msg);setErr(isErr);setTimeout(()=>{setT(null);setErr(false);},2800);};
-  return[t,err,show];
+function useToast() {
+  const [t,   setT]   = useState(null);
+  const [err, setErr] = useState(false);
+  const show = (msg, isErr=false) => {
+    setT(msg); setErr(isErr);
+    setTimeout(() => { setT(null); setErr(false); }, 2800);
+  };
+  return [t, err, show];
 }
 
-export default function App(){
-  const[sbOpen,setSbOpen]=useState(true);
-  const[rpOpen,setRpOpen]=useState(true);
-  const[mode,setMode]=useState("chat");
-  const[provider,setProvider]=useState("groq");
-  const[apiKey,setApiKey]=useState("");
-  const[model,setModel]=useState("llama-3.1-70b-versatile");
-  const[ollamaUrl,setOllamaUrl]=useState("http://localhost:11434");
-  const[searchQ,setSearchQ]=useState("");
-  const[searchResults,setSearchResults]=useState([]);
-  const[selectedSR,setSelectedSR]=useState({});
-  const[sources,setSources]=useState(DEMO_SOURCES);
-  const[pendingSources,setPendingSources]=useState([]);
-  const[ingestTab,setIngestTab]=useState("pdf");
-  const[ytUrl,setYtUrl]=useState("");
-  const[webUrl,setWebUrl]=useState("");
-  const[pasteText,setPasteText]=useState("");
-  const fileRef=useRef(null);
-  const[chunker,setChunker]=useState("hierarchical");
-  const[embModel,setEmbModel]=useState("minilm");
-  // Real per-strategy token analysis data from /api/analyze
-  const[analysisData,setAnalysisData]=useState(null);
-  const[analyzing,setAnalyzing]=useState(false);
-  const[history,setHistory]=useState(DEMO_HISTORY);
-  const[activeSession,setActiveSession]=useState("h1");
-  const[messages,setMessages]=useState(DEMO_MESSAGES);
-  const[input,setInput]=useState("");
-  const[loading,setLoading]=useState(false);
-  const[temp,setTemp]=useState(0.7);
-  const[topP,setTopP]=useState(0.9);
-  const[topK,setTopK]=useState(40);
-  const[maxTokens,setMaxTokens]=useState(1024);
-  const[toast,toastErr,showToast]=useToast();
-  const bottomRef=useRef(null);
+export default function App() {
+  const [sbOpen,   setSbOpen]   = useState(true);
+  const [rpOpen,   setRpOpen]   = useState(true);
+  const [mode,     setMode]     = useState("chat");
+  const [provider, setProvider] = useState("groq");
+  const [apiKey,   setApiKey]   = useState("");
+  const [model,    setModel]    = useState("llama-3.3-70b-versatile");
+  const [ollamaUrl,setOllamaUrl]= useState("http://localhost:11434");
+  const [searchQ,  setSearchQ]  = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [selectedSR,    setSelectedSR]    = useState({});
 
-  useEffect(()=>{bottomRef.current?.scrollIntoView({behavior:"smooth"});},[messages,loading]);
+  // Sources: starts empty, populated from GET /api/sources on mount
+  const [sources,        setSources]        = useState([]);
+  const [pendingSources, setPendingSources] = useState([]);
+  const [ingestTab,      setIngestTab]      = useState("pdf");
+  const [ytUrl,          setYtUrl]          = useState("");
+  const [webUrl,         setWebUrl]         = useState("");
+  const [pasteText,      setPasteText]      = useState("");
+  const fileRef = useRef(null);
 
-  const totalChunks=sources.reduce((a,s)=>a+s.chunks,0);
-  const totalVectors=sources.reduce((a,s)=>a+s.vectors,0);
-  const dimBreakdown=EMB_MODELS.map(e=>({...e,count:sources.filter(s=>s.embModel===e.id).reduce((a,s)=>a+s.vectors,0)})).filter(e=>e.count>0);
-  const selEmb=EMB_MODELS.find(e=>e.id===embModel);
-  const modeBadge={chat:"mb-chat",deep:"mb-deep",study:"mb-study"}[mode];
-  const modeLabel={chat:"Chat",deep:"Deep Research",study:"Study"}[mode];
+  const [chunker,  setChunker]  = useState("hierarchical");
+  const [embModel, setEmbModel] = useState("minilm");
+  // Embedding model catalogue — overwritten by GET /api/embedding-models
+  const [embModels, setEmbModels] = useState(DEFAULT_EMB_MODELS);
 
-  const doSearch=()=>{
-    if(!searchQ.trim())return;
+  // Real per-strategy token analysis data from /api/analyze → token_stats key
+  const [analysisData, setAnalysisData] = useState(null);
+  const [analyzing,    setAnalyzing]    = useState(false);
+
+  // Stats from GET /api/stats (refreshed after ingest/delete)
+  const [stats, setStats] = useState({total_chunks:0, total_sources:0, graph:{nodes:0,edges:0}, chunks:{dimensions:{}}});
+
+  const [history,       setHistory]       = useState([]);
+  const [activeSession, setActiveSession] = useState(null);
+  const [messages,      setMessages]      = useState([]);
+  const [input,         setInput]         = useState("");
+  const [loading,       setLoading]       = useState(false);
+  const [temp,          setTemp]          = useState(0.7);
+  const [topP,          setTopP]          = useState(0.9);
+  const [topK,          setTopK]          = useState(40);
+  const [maxTokens,     setMaxTokens]     = useState(1024);
+  const [toast, toastErr, showToast]      = useToast();
+  const bottomRef = useRef(null);
+
+  // ── on mount: load sources + embedding models ──────────────────────────────
+  useEffect(() => {
+    // Fetch persisted sources
+    fetch("/api/sources")
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.sources?.length) {
+          setSources(data.sources.map(s => ({
+            id:       s.source_id || s.id,
+            type:     s.source_type || s.type || "text",
+            name:     s.name || s.source_name || s.id,
+            chunks:   s.chunk_count ?? s.chunks ?? 0,
+            vectors:  s.chunk_count ?? s.vectors ?? 0,
+            embModel: s.embedding_model || "minilm",
+            status:   "ready",
+          })));
+        }
+      })
+      .catch(() => {});
+
+    // Fetch live embedding model catalogue
+    fetch("/api/embedding-models")
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.models?.length) {
+          // Map api model objects → UI shape (add a stable id)
+          setEmbModels(data.models.map(m => ({
+            id:     m.name.replace(/[^a-z0-9]/gi, "-").toLowerCase(),
+            name:   m.name,
+            dim:    m.dim,
+            tokens: m.max_tokens,
+            label:  m.label,
+            note:   m.note,
+          })));
+        }
+      })
+      .catch(() => {});
+
+    // Fetch initial stats
+    refreshStats();
+  }, []);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({behavior:"smooth"});
+  }, [messages, loading]);
+
+  // ── refresh stats from GET /api/stats ─────────────────────────────────────
+  const refreshStats = useCallback(() => {
+    fetch("/api/stats")
+      .then(r => r.ok ? r.json() : null)
+      .then(data => { if (data) setStats(data); })
+      .catch(() => {});
+  }, []);
+
+  // Derived display values (fall back to React state when stats not yet loaded)
+  const totalChunks  = stats.total_chunks  || sources.reduce((a,s) => a+s.chunks,  0);
+  const totalVectors = stats.total_chunks  || sources.reduce((a,s) => a+s.vectors, 0);
+  const totalSources = stats.total_sources || sources.length;
+
+  // Dimension breakdown from live stats
+  const dimBreakdown = Object.entries(stats.chunks?.dimensions || {}).map(([dim, count]) => ({
+    dim: Number(dim), count,
+  }));
+
+  const selEmb      = embModels.find(e => e.id === embModel) || embModels[0];
+  const modeBadge   = {chat:"mb-chat", deep:"mb-deep", study:"mb-study"}[mode];
+  const modeLabel   = {chat:"Chat",    deep:"Deep Research", study:"Study"}[mode];
+
+  // ── web search (mock) ──────────────────────────────────────────────────────
+  const doSearch = () => {
+    if (!searchQ.trim()) return;
     setSearchResults([
-      {id:"r1",title:"Retrieval Augmented Generation – DuckDuckGo",snippet:"RAG combines retrieval with language model generation for grounded answers…"},
-      {id:"r2",title:"Hugging Face – FAISS documentation",snippet:"FAISS is a library for efficient similarity search and clustering of dense vectors…"},
-      {id:"r3",title:"LangChain – RAG conceptual guide",snippet:"Learn to build production RAG pipelines with hybrid retrieval and reranking…"},
+      {id:"r1",title:"Retrieval Augmented Generation – DuckDuckGo",    snippet:"RAG combines retrieval with language model generation for grounded answers…"},
+      {id:"r2",title:"Hugging Face – FAISS documentation",             snippet:"FAISS is a library for efficient similarity search and clustering of dense vectors…"},
+      {id:"r3",title:"LangChain – RAG conceptual guide",               snippet:"Learn to build production RAG pipelines with hybrid retrieval and reranking…"},
     ]);
   };
 
-  const ingestSelected=()=>{
-    const sel=Object.entries(selectedSR).filter(([,v])=>v).map(([k])=>k);
-    if(!sel.length)return showToast("Select at least one result first",true);
-    const news=sel.map(id=>{
-      const r=searchResults.find(x=>x.id===id);
-      return{id:`src_${id}`,type:"website",name:r.title.slice(0,42),chunks:0,vectors:0,embModel,status:"pending"};
+  const ingestSelected = () => {
+    const sel = Object.entries(selectedSR).filter(([,v]) => v).map(([k]) => k);
+    if (!sel.length) return showToast("Select at least one result first", true);
+    const news = sel.map(id => {
+      const r = searchResults.find(x => x.id === id);
+      return {id:`src_${id}`, type:"website", name:r.title.slice(0,42),
+              chunks:0, vectors:0, embModel, status:"pending", _url:r.url||r.title};
     });
-    setPendingSources(p=>[...p,...news]);
-    setSelectedSR({});setSearchResults([]);setSearchQ("");
+    setPendingSources(p => [...p, ...news]);
+    setSelectedSR({}); setSearchResults([]); setSearchQ("");
     showToast(`${news.length} source(s) queued`);
   };
 
-  // Call /api/analyze after a file is queued to get real per-strategy token stats
-  const analyzeFile=async(file)=>{
+  // ── /api/analyze — called after file is queued ─────────────────────────────
+  // FIX #1: read data.token_stats (not data.strategies)
+  const analyzeFile = async (file) => {
     setAnalyzing(true);
     setAnalysisData(null);
-    const form=new FormData();
-    form.append("file",file);
-    try{
-      const res=await fetch("/api/analyze",{method:"POST",body:form});
-      if(!res.ok) throw new Error(`analyze ${res.status}`);
-      const data=await res.json();
-      // Expected: { strategies: { paragraph:{avg,min,max,total_chunks}, ... } }
-      setAnalysisData(data.strategies??null);
-    }catch(err){
-      // Non-fatal: fall back to static estimates silently
-      console.warn("analyze fallback:",err.message);
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      const res  = await fetch("/api/analyze", {method:"POST", body:form});
+      if (!res.ok) throw new Error(`analyze ${res.status}`);
+      const data = await res.json();
+      // api.py returns: { token_stats: { paragraph:{avg,min,max,total_chunks}, ... } }
+      setAnalysisData(data.token_stats ?? null);
+    } catch (err) {
+      console.warn("analyze fallback:", err.message);
       setAnalysisData(null);
-    }finally{
+    } finally {
       setAnalyzing(false);
     }
   };
 
-  const onFile=(e)=>{
-    const f=e.target.files?.[0];if(!f)return;
-    const ext=f.name.split(".").pop().toLowerCase();
-    const type={pdf:"pdf",csv:"csv",png:"image",jpg:"image",mp4:"video"}[ext]||"text";
-    setPendingSources(p=>[...p,{id:`src_${Date.now()}`,type,name:f.name,chunks:0,vectors:0,embModel,status:"pending",_file:f}]);
-    e.target.value="";
+  const onFile = (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    const ext  = f.name.split(".").pop().toLowerCase();
+    const type = {pdf:"pdf",csv:"csv",png:"image",jpg:"image",mp4:"video"}[ext] || "text";
+    setPendingSources(p => [...p, {
+      id:`src_${Date.now()}`, type, name:f.name,
+      chunks:0, vectors:0, embModel, status:"pending", _file:f,
+    }]);
+    e.target.value = "";
     showToast(`${f.name} queued — analysing…`);
     analyzeFile(f);
   };
 
-  const addUrl=()=>{
-    const url=ingestTab==="yt"?ytUrl:webUrl;
-    if(!url.trim())return;
-    const type=ingestTab==="yt"?"youtube":"website";
-    setPendingSources(p=>[...p,{id:`src_${Date.now()}`,type,name:url.slice(0,44),chunks:0,vectors:0,embModel,status:"pending"}]);
-    ingestTab==="yt"?setYtUrl(""):setWebUrl("");
+  const addUrl = () => {
+    const url = ingestTab==="yt" ? ytUrl : webUrl;
+    if (!url.trim()) return;
+    const type = ingestTab==="yt" ? "youtube" : "website";
+    setPendingSources(p => [...p, {
+      id:`src_${Date.now()}`, type, name:url.slice(0,44),
+      chunks:0, vectors:0, embModel, status:"pending", _url:url,
+    }]);
+    ingestTab==="yt" ? setYtUrl("") : setWebUrl("");
     showToast("Source queued");
   };
 
-  const addPaste=()=>{
-    if(!pasteText.trim())return;
-    setPendingSources(p=>[...p,{id:`src_${Date.now()}`,type:"text",name:"Pasted text",chunks:0,vectors:0,embModel,status:"pending"}]);
-    setPasteText("");showToast("Text queued");
+  const addPaste = () => {
+    if (!pasteText.trim()) return;
+    setPendingSources(p => [...p, {
+      id:`src_${Date.now()}`, type:"text", name:"Pasted text",
+      chunks:0, vectors:0, embModel, status:"pending", _text:pasteText,
+    }]);
+    setPasteText(""); showToast("Text queued");
   };
 
-  // Called by EmbedFlow when /api/ingest completes (or fails)
-  const handleEmbedDone=(emb,chk,count,errMsg)=>{
-    if(errMsg){
-      showToast(`⚠ Ingest failed: ${errMsg}`,true);
-      return;
-    }
-    const chunkCount=count||CHUNK_EST[chk]||0;
-    const done=pendingSources.map(s=>({...s,status:"ready",embModel:emb,chunks:chunkCount,vectors:chunkCount}));
-    setSources(s=>[...s,...done]);
+  // ── EmbedFlow callback ─────────────────────────────────────────────────────
+  const handleEmbedDone = (emb, chk, count, errMsg) => {
+    if (errMsg) { showToast(`⚠ Ingest failed: ${errMsg}`, true); return; }
+    const chunkCount = count || CHUNK_EST[chk] || 0;
+    const done = pendingSources.map(s => ({
+      ...s, status:"ready", embModel:emb, chunks:chunkCount, vectors:chunkCount,
+    }));
+    setSources(s => [...s, ...done]);
     setPendingSources([]);
     setAnalysisData(null);
+    refreshStats();           // ← pull real numbers from backend
     showToast(`✓ ${done.length} source(s) embedded`);
   };
 
-  // Wired to DELETE /api/sources/:id — removes from FAISS + SQLite + state
-  const deleteSource=async(id)=>{
-    try{
-      const res=await fetch(`/api/sources/${id}`,{method:"DELETE"});
-      if(!res.ok) throw new Error(`${res.status}`);
-      setSources(s=>s.filter(x=>x.id!==id));
+  // ── delete source: DELETE /api/sources/:id → FAISS + SQLite + state ────────
+  const deleteSource = async (id) => {
+    try {
+      const res = await fetch(`/api/sources/${id}`, {method:"DELETE"});
+      if (!res.ok) throw new Error(`${res.status}`);
+      setSources(s => s.filter(x => x.id !== id));
+      refreshStats();
       showToast("Removed from DB + vector store");
-    }catch(err){
-      showToast(`⚠ Delete failed (${err.message})`,true);
+    } catch (err) {
+      showToast(`⚠ Delete failed (${err.message})`, true);
     }
   };
 
-  const sendMessage=()=>{
-    if(!input.trim())return;
-    setMessages(m=>[...m,{id:`m${Date.now()}`,role:"user",content:input}]);
-    setInput("");setLoading(true);
-    setTimeout(()=>{
-      setMessages(m=>[...m,{
-        id:`m${Date.now()+1}`,role:"assistant",
-        content:"Based on the retrieved context from your knowledge base, here is a grounded answer with citations.",
-        chunks:[
-          {src:`${sources[0]?.name||"source"} · chunk 7`,text:"Retrieved passage via hybrid BM25+FAISS search. The reranker scored this chunk highest for semantic similarity to your query."},
-          {src:`${sources[1]?.name||"source 2"} · §3`,text:"Second retrieved passage for grounding. Each chunk below corresponds to an actual vector store hit from your embedded sources."},
-        ],
-        citations:[sources[0]?.name||"src1"],
-      }]);
+  // ── sendMessage: real SSE streaming from POST /api/query/stream ────────────
+  // FIX #3: replaces the old mock setTimeout with actual SSE
+  const sendMessage = async () => {
+    if (!input.trim() || loading) return;
+    const userText = input.trim();
+    const userMsg  = {id:`m${Date.now()}`, role:"user", content:userText};
+    setMessages(m => [...m, userMsg]);
+    setInput("");
+    setLoading(true);
+
+    const botId = `m${Date.now()+1}`;
+    // Insert an empty bot message immediately so the bubble appears
+    setMessages(m => [...m, {id:botId, role:"assistant", content:"", chunks:[], citations:[]}]);
+
+    try {
+      const res = await fetch("/api/query/stream", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({query:userText, mode, stream:true}),
+      });
+      if (!res.ok) throw new Error(`Query failed: ${res.status}`);
+
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer    = "";
+
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {stream:true});
+        const lines = buffer.split("\n");
+        buffer = lines.pop(); // keep incomplete line
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const evt = JSON.parse(line.slice(6));
+            if (evt.type === "token") {
+              setMessages(m => m.map(msg =>
+                msg.id === botId
+                  ? {...msg, content: msg.content + evt.content}
+                  : msg
+              ));
+            } else if (evt.type === "metadata") {
+              const chunks   = evt.chunks || evt.retrieved_chunks || [];
+              const citations= evt.citations || evt.sources_used || [];
+              setMessages(m => m.map(msg =>
+                msg.id === botId ? {...msg, chunks, citations} : msg
+              ));
+            } else if (evt.type === "error") {
+              throw new Error(evt.detail);
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (err) {
+      setMessages(m => m.map(msg =>
+        msg.id === botId
+          ? {...msg, content:`⚠ Error: ${err.message}`}
+          : msg
+      ));
+    } finally {
       setLoading(false);
-    },1900);
+    }
   };
 
-  const newChat=()=>{
-    const id=`h${Date.now()}`;
-    setHistory(h=>[{id,title:"New conversation"},...h]);
-    setActiveSession(id);setMessages([]);showToast("New chat started");
-  };
-  const loadSession=(id)=>{
+  const newChat = () => {
+    fetch("/api/new-chat", {method:"POST"}).catch(() => {});
+    const id = `h${Date.now()}`;
+    setHistory(h => [{id, title:"New conversation"}, ...h]);
     setActiveSession(id);
-    setMessages(id==="h1"?DEMO_MESSAGES:[]);
+    setMessages([]);
+    showToast("New chat started");
   };
 
-  return(
+  const loadSession = (id) => {
+    setActiveSession(id);
+    setMessages([]);
+  };
+
+  // ── mode switch: POST /api/mode ────────────────────────────────────────────
+  const handleModeChange = (m) => {
+    setMode(m);
+    fetch("/api/mode", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({mode:m}),
+    }).catch(() => {});
+  };
+
+  return (
     <>
       <style>{STYLE}</style>
       <div className="shell">
-        {/* LEFT SIDEBAR */}
+
+        {/* ── LEFT SIDEBAR ── */}
         <div className={`sidebar${sbOpen?"":" collapsed"}`}>
           <div style={{padding:"14px 16px 10px",borderBottom:"1px solid var(--border)",flexShrink:0}}>
             <div style={{fontWeight:800,fontSize:16,letterSpacing:"-.02em"}}>
@@ -674,156 +890,306 @@ export default function App(){
             </div>
             <div style={{fontSize:10,color:"var(--muted)",fontFamily:"var(--font-mono)"}}>local · private · fast</div>
           </div>
+
+          {/* Chat mode */}
           <div className="sb-section">
             <div className="sb-label">Chat Mode</div>
             <div className="pill-group">
-              {MODES.map(m=>(
-                <button key={m.id} className={`pill-opt${mode===m.id?` active${m.cls?" "+m.cls:""}`:""}`} onClick={()=>setMode(m.id)}>{m.label}</button>
+              {MODES.map(m => (
+                <button key={m.id}
+                  className={`pill-opt${mode===m.id?` active${m.cls?" "+m.cls:""}`:""}`}
+                  onClick={() => handleModeChange(m.id)}>
+                  {m.label}
+                </button>
               ))}
             </div>
           </div>
+
+          {/* LLM provider */}
           <div className="sb-section">
             <div className="sb-label">LLM Provider</div>
             <div className="pill-group" style={{marginBottom:10}}>
-              <button className={`pill-opt${provider==="groq"?" active":""}`} onClick={()=>setProvider("groq")}>Groq</button>
-              <button className={`pill-opt${provider==="ollama"?" active":""}`} onClick={()=>setProvider("ollama")}>Ollama</button>
+              <button className={`pill-opt${provider==="groq"?" active":""}`}   onClick={() => setProvider("groq")}>Groq</button>
+              <button className={`pill-opt${provider==="ollama"?" active":""}`} onClick={() => setProvider("ollama")}>Ollama</button>
             </div>
-            {provider==="groq"&&(<><input className="sb-input" type="password" placeholder="API Key…" value={apiKey} onChange={e=>setApiKey(e.target.value)}/><input className="sb-input" placeholder="Model name" value={model} onChange={e=>setModel(e.target.value)} style={{marginTop:6}}/></>)}
-            {provider==="ollama"&&(<input className="sb-input" placeholder="http://localhost:11434" value={ollamaUrl} onChange={e=>setOllamaUrl(e.target.value)}/>)}
+            {provider==="groq" && (
+              <>
+                <input className="sb-input" type="password" placeholder="API Key…"    value={apiKey}   onChange={e => setApiKey(e.target.value)}/>
+                <input className="sb-input" placeholder="Model name"                  value={model}    onChange={e => setModel(e.target.value)} style={{marginTop:6}}/>
+              </>
+            )}
+            {provider==="ollama" && (
+              <input className="sb-input" placeholder="http://localhost:11434" value={ollamaUrl} onChange={e => setOllamaUrl(e.target.value)}/>
+            )}
           </div>
+
+          {/* Web search */}
           <div className="sb-section">
             <div className="sb-label">Web Search</div>
             <div style={{display:"flex",gap:6,marginBottom:8}}>
-              <input className="sb-input" placeholder="Search query…" value={searchQ} onChange={e=>setSearchQ(e.target.value)} onKeyDown={e=>e.key==="Enter"&&doSearch()} style={{flex:1}}/>
+              <input className="sb-input" placeholder="Search query…" value={searchQ}
+                onChange={e => setSearchQ(e.target.value)}
+                onKeyDown={e => e.key==="Enter" && doSearch()} style={{flex:1}}/>
               <button className="send-btn" style={{width:32,height:32,borderRadius:8,fontSize:12}} onClick={doSearch}>↵</button>
             </div>
-            {searchResults.map(r=>(
-              <div key={r.id} className={`search-result${selectedSR[r.id]?" sel":""}`} onClick={()=>setSelectedSR(s=>({...s,[r.id]:!s[r.id]}))}>
-                <input type="checkbox" readOnly checked={!!selectedSR[r.id]} style={{marginTop:2,accentColor:"var(--accent)",flexShrink:0}}/>
-                <div><div className="sr-title">{r.title}</div><div className="sr-snip">{r.snippet}</div></div>
+            {searchResults.map(r => (
+              <div key={r.id} className={`search-result${selectedSR[r.id]?" sel":""}`}
+                onClick={() => setSelectedSR(s => ({...s,[r.id]:!s[r.id]}))}>
+                <input type="checkbox" readOnly checked={!!selectedSR[r.id]}
+                  style={{marginTop:2,accentColor:"var(--accent)",flexShrink:0}}/>
+                <div>
+                  <div className="sr-title">{r.title}</div>
+                  <div className="sr-snip">{r.snippet}</div>
+                </div>
               </div>
             ))}
-            {searchResults.length>0&&(<button className="action-btn" style={{marginTop:4}} onClick={ingestSelected}>⬇ Queue selected for embedding</button>)}
+            {searchResults.length>0 && (
+              <button className="action-btn" style={{marginTop:4}} onClick={ingestSelected}>
+                ⬇ Queue selected for embedding
+              </button>
+            )}
           </div>
+
+          {/* Add source */}
           <div className="sb-section">
             <div className="sb-label">Add Source</div>
             <div style={{border:"1px solid var(--border)",borderRadius:8,overflow:"hidden"}}>
               <div className="tab-row" style={{background:"var(--panel)"}}>
-                {[["pdf","📄 PDF"],["yt","▶ YouTube"],["web","🌐 Web"],["text","✏ Text"]].map(([id,lbl])=>(
-                  <div key={id} className={`tab${ingestTab===id?" active":""}`} onClick={()=>setIngestTab(id)}>{lbl}</div>
+                {[["pdf","📄 PDF"],["yt","▶ YouTube"],["web","🌐 Web"],["text","✏ Text"]].map(([id,lbl]) => (
+                  <div key={id} className={`tab${ingestTab===id?" active":""}`} onClick={() => setIngestTab(id)}>{lbl}</div>
                 ))}
               </div>
               <div className="tab-body">
-                {ingestTab==="pdf"&&(<><input ref={fileRef} type="file" accept=".pdf,.txt,.csv,.png,.jpg,.mp4" style={{display:"none"}} onChange={onFile}/><button className="action-btn" style={{marginBottom:0,width:"100%"}} onClick={()=>fileRef.current?.click()}>⬆ Choose file</button></>)}
-                {ingestTab==="yt"&&(<div style={{display:"flex",gap:6}}><input className="sb-input" placeholder="YouTube URL…" value={ytUrl} onChange={e=>setYtUrl(e.target.value)} style={{flex:1}}/><button className="send-btn" style={{width:32,height:32,borderRadius:8,fontSize:12}} onClick={addUrl}>+</button></div>)}
-                {ingestTab==="web"&&(<div style={{display:"flex",gap:6}}><input className="sb-input" placeholder="https://…" value={webUrl} onChange={e=>setWebUrl(e.target.value)} style={{flex:1}}/><button className="send-btn" style={{width:32,height:32,borderRadius:8,fontSize:12}} onClick={addUrl}>+</button></div>)}
-                {ingestTab==="text"&&(<><textarea className="sb-input" rows={3} placeholder="Paste text here…" value={pasteText} onChange={e=>setPasteText(e.target.value)} style={{resize:"none"}}/><button className="action-btn" style={{marginTop:6,marginBottom:0,width:"100%"}} onClick={addPaste}>+ Add text</button></>)}
+                {ingestTab==="pdf" && (
+                  <>
+                    <input ref={fileRef} type="file" accept=".pdf,.txt,.csv,.png,.jpg,.mp4" style={{display:"none"}} onChange={onFile}/>
+                    <button className="action-btn" style={{marginBottom:0,width:"100%"}} onClick={() => fileRef.current?.click()}>⬆ Choose file</button>
+                  </>
+                )}
+                {ingestTab==="yt" && (
+                  <div style={{display:"flex",gap:6}}>
+                    <input className="sb-input" placeholder="YouTube URL…" value={ytUrl} onChange={e => setYtUrl(e.target.value)} style={{flex:1}}/>
+                    <button className="send-btn" style={{width:32,height:32,borderRadius:8,fontSize:12}} onClick={addUrl}>+</button>
+                  </div>
+                )}
+                {ingestTab==="web" && (
+                  <div style={{display:"flex",gap:6}}>
+                    <input className="sb-input" placeholder="https://…" value={webUrl} onChange={e => setWebUrl(e.target.value)} style={{flex:1}}/>
+                    <button className="send-btn" style={{width:32,height:32,borderRadius:8,fontSize:12}} onClick={addUrl}>+</button>
+                  </div>
+                )}
+                {ingestTab==="text" && (
+                  <>
+                    <textarea className="sb-input" rows={3} placeholder="Paste text here…"
+                      value={pasteText} onChange={e => setPasteText(e.target.value)} style={{resize:"none"}}/>
+                    <button className="action-btn" style={{marginTop:6,marginBottom:0,width:"100%"}} onClick={addPaste}>+ Add text</button>
+                  </>
+                )}
               </div>
             </div>
+
             <EmbedFlow
               pendingSources={pendingSources}
-              chunker={chunker} setChunker={setChunker}
-              embModel={embModel} setEmbModel={setEmbModel}
+              chunker={chunker}    setChunker={setChunker}
+              embModel={embModel}  setEmbModel={setEmbModel}
+              embModels={embModels}
               onDone={handleEmbedDone}
               analysisData={analysisData}
               analyzing={analyzing}
             />
           </div>
+
+          {/* Source list */}
           <div className="sb-section" style={{flex:1}}>
-            <div className="sb-label" style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>Source List<span style={{color:"var(--muted)",fontFamily:"var(--font-mono)",fontSize:9,fontWeight:400}}>{sources.length} sources</span></div>
-            {sources.map(s=>(
+            <div className="sb-label" style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              Source List
+              <span style={{color:"var(--muted)",fontFamily:"var(--font-mono)",fontSize:9,fontWeight:400}}>{sources.length} sources</span>
+            </div>
+            {sources.map(s => (
               <div key={s.id} className="source-row">
                 <span className="src-icon">{SRC_ICONS[s.type]||"📁"}</span>
                 <div className="src-meta">
-                  <div style={{display:"flex",alignItems:"center",gap:4,marginBottom:2}}><span className="src-name" style={{flex:1}}>{s.name}</span><span className={`src-badge badge-${s.status}`}>{s.status}</span></div>
-                  <div className="src-stats">{s.chunks} chunks · {s.vectors} vecs · {EMB_MODELS.find(e=>e.id===s.embModel)?.dim||"?"}d</div>
+                  <div style={{display:"flex",alignItems:"center",gap:4,marginBottom:2}}>
+                    <span className="src-name" style={{flex:1}}>{s.name}</span>
+                    <span className={`src-badge badge-${s.status}`}>{s.status}</span>
+                  </div>
+                  <div className="src-stats">
+                    {s.chunks} chunks · {s.vectors} vecs · {embModels.find(e=>e.id===s.embModel)?.dim||"?"}d
+                  </div>
                 </div>
-                <button className="src-del" onClick={()=>deleteSource(s.id)} title="Remove">✕</button>
+                <button className="src-del" onClick={() => deleteSource(s.id)} title="Remove">✕</button>
               </div>
             ))}
             <div className="totals-strip">
-              <div className="total-cell"><span className="total-num">{sources.length}</span><span className="total-lbl">sources</span></div>
-              <div className="total-cell"><span className="total-num">{totalChunks}</span><span className="total-lbl">chunks</span></div>
+              <div className="total-cell"><span className="total-num">{totalSources}</span><span className="total-lbl">sources</span></div>
+              <div className="total-cell"><span className="total-num">{totalChunks}</span> <span className="total-lbl">chunks</span></div>
               <div className="total-cell"><span className="total-num">{totalVectors}</span><span className="total-lbl">vectors</span></div>
             </div>
           </div>
-          <div className="sb-section"><button className="new-chat-btn" onClick={newChat}>＋ New Chat</button></div>
+
+          <div className="sb-section">
+            <button className="new-chat-btn" onClick={newChat}>＋ New Chat</button>
+          </div>
           <div className="sb-section" style={{flexShrink:0}}>
             <div className="sb-label">Chat History</div>
-            {history.map(h=>(
-              <div key={h.id} className={`hist-item${activeSession===h.id?" active":""}`} onClick={()=>loadSession(h.id)}>
-                <div className={`hist-dot${activeSession===h.id?"":""} ${activeSession===h.id?"":"old"}`}/>
+            {history.map(h => (
+              <div key={h.id} className={`hist-item${activeSession===h.id?" active":""}`}
+                onClick={() => loadSession(h.id)}>
+                <div className={`hist-dot${activeSession===h.id?"":" old"}`}/>
                 <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.title}</span>
               </div>
             ))}
           </div>
         </div>
 
-        <div className="sb-toggle" style={{left:sbOpen?"calc(var(--sb-w) - 1px)":"0px"}} onClick={()=>setSbOpen(o=>!o)} title={sbOpen?"Hide sidebar":"Show sidebar"}>{sbOpen?"‹":"›"}</div>
+        <div className="sb-toggle"
+          style={{left:sbOpen?"calc(var(--sb-w) - 1px)":"0px"}}
+          onClick={() => setSbOpen(o => !o)}
+          title={sbOpen?"Hide sidebar":"Show sidebar"}>
+          {sbOpen?"‹":"›"}
+        </div>
 
-        {/* MAIN CHAT */}
+        {/* ── MAIN CHAT ── */}
         <div className="main">
           <div className="chat-header">
             <div className="header-title"><span>Mini</span>NotebookLM</div>
             <span className={`mode-badge ${modeBadge}`}>{modeLabel}</span>
             <div style={{flex:1}}/>
-            <span style={{fontSize:10,color:"var(--muted)",fontFamily:"var(--font-mono)"}}>{sources.length} src · {totalChunks} chunks · {totalVectors} vecs</span>
+            <span style={{fontSize:10,color:"var(--muted)",fontFamily:"var(--font-mono)"}}>
+              {totalSources} src · {totalChunks} chunks · {totalVectors} vecs
+            </span>
           </div>
+
           <div className="messages">
-            {messages.length===0&&(<div style={{margin:"auto",textAlign:"center",color:"var(--muted)",fontSize:13}}><div style={{fontSize:36,marginBottom:10}}>✦</div><div style={{fontWeight:700,color:"var(--text)",marginBottom:4}}>Ready to answer</div><div>Add &amp; embed sources, then ask anything.</div></div>)}
-            {messages.map(msg=>(
+            {messages.length===0 && (
+              <div style={{margin:"auto",textAlign:"center",color:"var(--muted)",fontSize:13}}>
+                <div style={{fontSize:36,marginBottom:10}}>✦</div>
+                <div style={{fontWeight:700,color:"var(--text)",marginBottom:4}}>Ready to answer</div>
+                <div>Add &amp; embed sources, then ask anything.</div>
+              </div>
+            )}
+            {messages.map(msg => (
               <div key={msg.id} className={`msg${msg.role==="user"?" user":""}`}>
-                <div className={`avatar ${msg.role==="user"?"av-user":"av-bot"}`}>{msg.role==="user"?"U":"✦"}</div>
+                <div className={`avatar ${msg.role==="user"?"av-user":"av-bot"}`}>
+                  {msg.role==="user"?"U":"✦"}
+                </div>
                 <div className={`bubble ${msg.role==="user"?"bubble-user":"bubble-bot"}`}>
-                  <div style={{whiteSpace:"pre-wrap"}}>{msg.content}{msg.citations?.map((c,i)=>(<span key={i} className="cite-tag" title={c}>[{i+1}]</span>))}</div>
-                  {msg.chunks&&(<div className="chunks-section"><div className="chunks-hdr"><span style={{color:"var(--accent)"}}>▪</span>Retrieved Chunks</div>{msg.chunks.map((c,i)=>(<div key={i} className="chunk-item"><div className="chunk-src">[{i+1}] {c.src}</div><div className="chunk-text">{c.text}</div></div>))}</div>)}
+                  <div style={{whiteSpace:"pre-wrap"}}>
+                    {msg.content}
+                    {msg.citations?.map((c,i) => (
+                      <span key={i} className="cite-tag" title={typeof c==="string"?c:(c.source||"")}>[{i+1}]</span>
+                    ))}
+                  </div>
+                  {msg.chunks?.length>0 && (
+                    <div className="chunks-section">
+                      <div className="chunks-hdr"><span style={{color:"var(--accent)"}}>▪</span>Retrieved Chunks</div>
+                      {msg.chunks.map((c,i) => (
+                        <div key={i} className="chunk-item">
+                          <div className="chunk-src">[{i+1}] {c.src || c.source || c.source_name || "source"}</div>
+                          <div className="chunk-text">{c.text || c.content || ""}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
-            {loading&&(<div className="msg"><div className="avatar av-bot">✦</div><div className="bubble bubble-bot"><div className="loading-dots"><span/><span/><span/></div></div></div>)}
+            {loading && (
+              <div className="msg">
+                <div className="avatar av-bot">✦</div>
+                <div className="bubble bubble-bot">
+                  <div className="loading-dots"><span/><span/><span/></div>
+                </div>
+              </div>
+            )}
             <div ref={bottomRef}/>
           </div>
+
           <div className="input-bar">
-            <textarea className="chat-input" placeholder={`Ask in ${modeLabel} mode… (Shift+Enter for newline)`} value={input} rows={1} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage();}}}/>
+            <textarea className="chat-input"
+              placeholder={`Ask in ${modeLabel} mode… (Shift+Enter for newline)`}
+              value={input} rows={1}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}/>
             <button className="send-btn" disabled={!input.trim()||loading} onClick={sendMessage}>↑</button>
           </div>
-          <div className="statusbar"><span className="status-dot"/><span>{provider==="groq"?`Groq · ${model.slice(0,20)}`:`Ollama · ${ollamaUrl}`}</span><span>·</span><span>{selEmb?.name}</span><span>·</span><span>{selEmb?.dim}d</span><span>·</span><span>{chunker}</span></div>
+
+          <div className="statusbar">
+            <span className="status-dot"/>
+            <span>{provider==="groq" ? `Groq · ${model.slice(0,20)}` : `Ollama · ${ollamaUrl}`}</span>
+            <span>·</span><span>{selEmb?.name}</span>
+            <span>·</span><span>{selEmb?.dim}d</span>
+            <span>·</span><span>{chunker}</span>
+            <span>·</span><span>{stats.graph?.nodes||0} KG nodes</span>
+          </div>
         </div>
 
-        <div className="sb-toggle right" style={{right:rpOpen?"calc(var(--rp-w) - 1px)":"0px"}} onClick={()=>setRpOpen(o=>!o)} title={rpOpen?"Hide panel":"Show panel"}>{rpOpen?"›":"‹"}</div>
+        <div className="sb-toggle right"
+          style={{right:rpOpen?"calc(var(--rp-w) - 1px)":"0px"}}
+          onClick={() => setRpOpen(o => !o)}
+          title={rpOpen?"Hide panel":"Show panel"}>
+          {rpOpen?"›":"‹"}
+        </div>
 
-        {/* RIGHT PANEL */}
+        {/* ── RIGHT PANEL ── */}
         <div className={`right-panel${rpOpen?"":" collapsed"}`}>
           <div className="rp-section">
             <div className="rp-label">Knowledge Graph</div>
             <MiniGraph/>
-            <div style={{fontSize:9,color:"var(--muted)",marginTop:6,fontFamily:"var(--font-mono)",textAlign:"center"}}>hover nodes · inspect chunks &amp; edges</div>
+            <div style={{fontSize:9,color:"var(--muted)",marginTop:6,fontFamily:"var(--font-mono)",textAlign:"center"}}>
+              {stats.graph?.nodes||0} nodes · {stats.graph?.edges||0} edges
+            </div>
           </div>
+
           <div className="rp-section">
             <div className="rp-label">Vector Store (multi-dim)</div>
-            <div className="db-row"><span>Sources</span><span className="db-num">{sources.length}</span></div>
-            <div className="db-row"><span>Total chunks</span><span className="db-num">{totalChunks}</span></div>
+            <div className="db-row"><span>Sources</span>      <span className="db-num">{totalSources}</span></div>
+            <div className="db-row"><span>Total chunks</span> <span className="db-num">{totalChunks}</span></div>
             <div className="db-row"><span>Total vectors</span><span className="db-num">{totalVectors}</span></div>
-            {dimBreakdown.length>0&&(<><div style={{fontSize:9,color:"var(--muted)",margin:"8px 0 5px",letterSpacing:".1em",textTransform:"uppercase",fontWeight:700}}>By dimension</div>{dimBreakdown.map(e=>(<div key={e.id} className="dim-row"><span className="dim-label">{e.dim}d</span><div className="dim-bar" style={{width:`${Math.round(e.count/Math.max(totalVectors,1)*100)}%`}}/><span className="dim-count">{e.count}</span></div>))}</>)}
+            {dimBreakdown.length>0 && (
+              <>
+                <div style={{fontSize:9,color:"var(--muted)",margin:"8px 0 5px",letterSpacing:".1em",textTransform:"uppercase",fontWeight:700}}>By dimension</div>
+                {dimBreakdown.map(e => (
+                  <div key={e.dim} className="dim-row">
+                    <span className="dim-label">{e.dim}d</span>
+                    <div className="dim-bar" style={{width:`${Math.round(e.count/Math.max(totalVectors,1)*100)}%`}}/>
+                    <span className="dim-count">{e.count}</span>
+                  </div>
+                ))}
+              </>
+            )}
           </div>
+
           <div className="rp-section">
             <div className="rp-label">Model Tuning</div>
             {[
-              {label:"Temperature",key:"t",val:temp,  set:setTemp,  min:0,max:2,  step:.05},
-              {label:"Top-P",      key:"p",val:topP,  set:setTopP,  min:0,max:1,  step:.05},
-              {label:"Top-K",      key:"k",val:topK,  set:setTopK,  min:1,max:100,step:1},
-              {label:"Max Tokens", key:"m",val:maxTokens,set:setMaxTokens,min:128,max:4096,step:64},
-            ].map(p=>(<div key={p.key} className="param-row"><div className="param-label">{p.label}<span>{p.val}</span></div><input type="range" min={p.min} max={p.max} step={p.step} value={p.val} onChange={e=>p.set(parseFloat(e.target.value))}/></div>))}
+              {label:"Temperature", key:"t", val:temp,      set:setTemp,      min:0,   max:2,    step:.05},
+              {label:"Top-P",       key:"p", val:topP,      set:setTopP,      min:0,   max:1,    step:.05},
+              {label:"Top-K",       key:"k", val:topK,      set:setTopK,      min:1,   max:100,  step:1},
+              {label:"Max Tokens",  key:"m", val:maxTokens, set:setMaxTokens, min:128, max:4096, step:64},
+            ].map(p => (
+              <div key={p.key} className="param-row">
+                <div className="param-label">{p.label}<span>{p.val}</span></div>
+                <input type="range" min={p.min} max={p.max} step={p.step} value={p.val}
+                  onChange={e => p.set(parseFloat(e.target.value))}/>
+              </div>
+            ))}
           </div>
+
           <div className="rp-section">
             <div className="rp-label">Actions</div>
-            <button className="action-btn" onClick={()=>showToast("Cache cleared")}>🗑 Clear response cache</button>
-            <button className="action-btn" onClick={()=>showToast("Graph rebuilt")}>↻ Rebuild knowledge graph</button>
-            <button className="action-btn danger" onClick={()=>{setSources([]);showToast("Vector store wiped");}}>⚠ Wipe vector store</button>
+            <button className="action-btn" onClick={() => { refreshStats(); showToast("Stats refreshed"); }}>↻ Refresh stats</button>
+            <button className="action-btn" onClick={() => showToast("Cache cleared")}>🗑 Clear response cache</button>
+            <button className="action-btn" onClick={() => showToast("Graph rebuilt")}>↻ Rebuild knowledge graph</button>
+            <button className="action-btn danger"
+              onClick={() => { setSources([]); setStats(s=>({...s,total_chunks:0,total_sources:0})); showToast("Vector store wiped"); }}>
+              ⚠ Wipe vector store
+            </button>
           </div>
         </div>
+
       </div>
-      {toast&&<div className={`toast${toastErr?" err":""}`}>{toast}</div>}
+      {toast && <div className={`toast${toastErr?" err":""}`}>{toast}</div>}
     </>
   );
 }
