@@ -96,6 +96,7 @@ html,body,#root{height:100%;background:var(--bg);color:var(--text);font-family:v
 }
 .chip:hover,.chip.active{border-color:var(--accent2);color:var(--accent2);background:rgba(192,132,252,.08)}
 .chip:disabled{opacity:.4;cursor:default}
+.chip.warn{border-color:rgba(251,191,36,.4);color:var(--amber)}
 
 /* preview box */
 .preview-box{
@@ -107,6 +108,18 @@ html,body,#root{height:100%;background:var(--bg);color:var(--text);font-family:v
 .prow:last-child{border-bottom:none}
 .pval{color:var(--text);font-weight:500}
 
+/* token estimation table */
+.tok-table{width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:10px;margin-bottom:8px}
+.tok-table th{color:var(--muted);font-weight:500;text-align:left;padding:4px 6px;border-bottom:1px solid var(--border)}
+.tok-table td{padding:4px 6px;border-bottom:1px solid var(--border);color:var(--text)}
+.tok-table tr:last-child td{border-bottom:none}
+.tok-table tr.selected-row td{color:var(--accent2)}
+.tok-val{color:var(--green)}
+.tok-hi{color:var(--amber)}
+.tok-lo{color:var(--muted)}
+.tok-bar-wrap{height:3px;background:var(--border);border-radius:3px;width:48px;display:inline-block;vertical-align:middle;margin-left:4px}
+.tok-bar{height:100%;border-radius:3px;background:var(--accent);display:block}
+
 /* embedding model options */
 .emb-opt{
   display:flex;align-items:center;justify-content:space-between;
@@ -115,6 +128,7 @@ html,body,#root{height:100%;background:var(--bg);color:var(--text);font-family:v
 }
 .emb-opt:hover{border-color:var(--border2)}
 .emb-opt.active{border-color:var(--accent);background:rgba(124,106,247,.08)}
+.emb-opt.over-budget{border-color:rgba(251,191,36,.35);background:rgba(251,191,36,.04)}
 .emb-dim{font-family:var(--font-mono);font-size:10px;color:var(--muted)}
 
 /* EMBED CTA button */
@@ -127,6 +141,16 @@ html,body,#root{height:100%;background:var(--bg);color:var(--text);font-family:v
 }
 .embed-btn:hover{opacity:.88}
 .embed-btn:disabled{opacity:.4;cursor:default}
+
+/* analyse CTA */
+.analyse-btn{
+  width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--accent);
+  background:rgba(124,106,247,.12);color:var(--accent);font-family:var(--font-ui);
+  font-size:12px;font-weight:700;cursor:pointer;display:flex;align-items:center;
+  justify-content:center;gap:7px;letter-spacing:.04em;transition:all .14s;margin-top:10px;
+}
+.analyse-btn:hover{background:rgba(124,106,247,.22)}
+.analyse-btn:disabled{opacity:.4;cursor:default}
 
 /* progress */
 .prog-wrap{margin-top:8px;background:var(--bg);border:1px solid var(--border2);border-radius:8px;padding:10px}
@@ -254,10 +278,17 @@ input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer;height:3p
 
 .toast{position:fixed;bottom:18px;right:18px;background:var(--panel);border:1px solid var(--green);border-radius:10px;padding:9px 15px;font-size:12px;color:var(--green);z-index:999;animation:slideUp .22s;box-shadow:0 4px 16px rgba(0,0,0,.5)}
 
+/* section divider inside embed flow */
+.flow-divider{border:none;border-top:1px solid var(--border);margin:12px 0}
+
+/* inline warning pill */
+.warn-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:20px;background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.3);color:var(--amber);font-family:var(--font-mono);font-size:9px;font-weight:600;margin-left:6px}
+
 @keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
 @keyframes slideUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 @keyframes bounce{0%,80%,100%{transform:scale(.6);opacity:.4}40%{transform:scale(1);opacity:1}}
 @keyframes spin{to{transform:rotate(360deg)}}
+@keyframes analyseIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -269,16 +300,27 @@ const MODES = [
   {id:"study", label:"Study",    cls:"green"},
 ];
 const EMB_MODELS = [
-  {id:"minilm",  name:"all-MiniLM-L6-v2",  dim:384,  tokens:256},
-  {id:"mpnet",   name:"all-mpnet-base-v2",  dim:768,  tokens:512},
-  {id:"e5large", name:"e5-large-v2",        dim:1024, tokens:512},
+  {id:"minilm",  name:"all-MiniLM-L6-v2",  dim:384,  maxTokens:256},
+  {id:"mpnet",   name:"all-mpnet-base-v2",  dim:768,  maxTokens:512},
+  {id:"e5large", name:"e5-large-v2",        dim:1024, maxTokens:512},
 ];
+
+// Per-strategy: avg tokens per chunk for different source types
+// Shape: { strategy: { pdf|website|text|youtube|csv: {avg,lo,hi,chunks_per_page} } }
+const STRATEGY_TOKEN_PROFILES = {
+  paragraph:   { pdf:{avg:180,lo:60,hi:420,cpp:3},   website:{avg:140,lo:40,hi:320,cpp:2.5}, text:{avg:160,lo:50,hi:380,cpp:3},   youtube:{avg:120,lo:40,hi:260,cpp:2},   csv:{avg:80,lo:30,hi:180,cpp:5}  },
+  page:        { pdf:{avg:680,lo:300,hi:1100,cpp:1},  website:{avg:520,lo:200,hi:900,cpp:1},  text:{avg:600,lo:250,hi:980,cpp:1},  youtube:{avg:440,lo:180,hi:760,cpp:1},  csv:{avg:320,lo:100,hi:600,cpp:1} },
+  recursive:   { pdf:{avg:220,lo:80,hi:500,cpp:3.5},  website:{avg:200,lo:70,hi:460,cpp:3},   text:{avg:210,lo:75,hi:480,cpp:3.2}, youtube:{avg:190,lo:65,hi:420,cpp:3},   csv:{avg:150,lo:50,hi:320,cpp:4}  },
+  semantic:    { pdf:{avg:260,lo:100,hi:560,cpp:2.8}, website:{avg:240,lo:90,hi:520,cpp:2.5}, text:{avg:250,lo:95,hi:540,cpp:2.7}, youtube:{avg:220,lo:80,hi:480,cpp:2.4}, csv:{avg:190,lo:70,hi:400,cpp:3}  },
+  hierarchical:{ pdf:{avg:310,lo:120,hi:680,cpp:2.2}, website:{avg:280,lo:100,hi:620,cpp:2},  text:{avg:295,lo:110,hi:650,cpp:2.1},youtube:{avg:265,lo:90,hi:580,cpp:1.9},  csv:{avg:210,lo:80,hi:440,cpp:2.6}},
+};
+
 const CHUNKERS = [
-  {id:"paragraph",   label:"Paragraph"},
-  {id:"page",        label:"Page"},
-  {id:"recursive",   label:"Recursive"},
-  {id:"semantic",    label:"Semantic"},
-  {id:"hierarchical",label:"Hierarchical"},
+  {id:"paragraph",    label:"Paragraph"},
+  {id:"page",         label:"Page"},
+  {id:"recursive",    label:"Recursive"},
+  {id:"semantic",     label:"Semantic"},
+  {id:"hierarchical", label:"Hierarchical"},
 ];
 const CHUNK_EST = {paragraph:47,page:12,recursive:39,hierarchical:28,semantic:31};
 const SRC_ICONS = {pdf:"📄",youtube:"▶️",website:"🌐",text:"📝",image:"🖼️",csv:"📊",video:"🎬"};
@@ -305,6 +347,37 @@ const DEMO_MESSAGES = [
     citations:["attention_paper.pdf p.3","attention_paper.pdf p.7"],
   },
 ];
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Compute per-strategy token stats across all pending sources
+function computeTokenStats(pendingSources) {
+  // Returns array: [{strategy, avgTokens, loTokens, hiTokens, totalChunks}]
+  return CHUNKERS.map(c => {
+    let sumAvg=0, sumLo=0, sumHi=0, totalChunks=0;
+    pendingSources.forEach(src => {
+      const srcType = src.type in STRATEGY_TOKEN_PROFILES[c.id] ? src.type : "text";
+      const prof = STRATEGY_TOKEN_PROFILES[c.id][srcType];
+      const estChunks = CHUNK_EST[c.id];
+      sumAvg += prof.avg * estChunks;
+      sumLo  += prof.lo  * estChunks;
+      sumHi  += prof.hi  * estChunks;
+      totalChunks += estChunks;
+    });
+    const n = pendingSources.length || 1;
+    return {
+      id: c.id,
+      label: c.label,
+      avgPerChunk: Math.round(sumAvg / Math.max(totalChunks,1)),
+      loPerChunk:  Math.round(sumLo  / Math.max(totalChunks,1)),
+      hiPerChunk:  Math.round(sumHi  / Math.max(totalChunks,1)),
+      totalChunks,
+      totalAvgTokens: Math.round(sumAvg),
+    };
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MINI GRAPH
@@ -348,43 +421,131 @@ function MiniGraph() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  TOKEN ESTIMATION TABLE
+// ─────────────────────────────────────────────────────────────────────────────
+function TokenEstTable({stats, selectedChunker, onSelectChunker, disabled}) {
+  const maxAvg = Math.max(...stats.map(s=>s.avgPerChunk));
+  return (
+    <div style={{animation:"analyseIn .25s"}}>
+      <div className="sb-label" style={{marginBottom:6}}>Token Budget by Strategy</div>
+      <table className="tok-table">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Avg/chunk</th>
+            <th>Low</th>
+            <th>High</th>
+            <th>Chunks</th>
+          </tr>
+        </thead>
+        <tbody>
+          {stats.map(s=>(
+            <tr key={s.id}
+              className={selectedChunker===s.id?"selected-row":""}
+              style={{cursor:disabled?"default":"pointer",transition:"background .1s",
+                background:selectedChunker===s.id?"rgba(192,132,252,.06)":"transparent"}}
+              onClick={()=>!disabled&&onSelectChunker(s.id)}>
+              <td style={{fontWeight:selectedChunker===s.id?700:400}}>
+                {s.label}
+                {selectedChunker===s.id&&<span style={{color:"var(--accent2)",marginLeft:5}}>✓</span>}
+              </td>
+              <td>
+                <span className="tok-val">{s.avgPerChunk}</span>
+                <span className="tok-bar-wrap">
+                  <span className="tok-bar" style={{width:`${Math.round(s.avgPerChunk/maxAvg*100)}%`}}/>
+                </span>
+              </td>
+              <td><span className="tok-lo">{s.loPerChunk}</span></td>
+              <td><span className="tok-hi">{s.hiPerChunk}</span></td>
+              <td style={{color:"var(--muted)"}}>{s.totalChunks}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div style={{fontSize:9,color:"var(--muted)",fontFamily:"var(--font-mono)",marginBottom:8}}>
+        ↑ click a row to select chunking strategy · avg is per-chunk estimate
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  EMBED FLOW — shown whenever pendingSources.length > 0
 // ─────────────────────────────────────────────────────────────────────────────
 function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDone}){
-  const [phase,setPhase]=useState("idle");
+  // flowPhase: "idle" | "analysing" | "configured" | "embedding" | "done"
+  const [flowPhase,setFlowPhase]=useState("idle");
   const [progress,setProgress]=useState(0);
   const [stepLabel,setStepLabel]=useState("");
+  const [tokenStats,setTokenStats]=useState([]);
+  const [analyseProgress,setAnalyseProgress]=useState(0);
 
-  const emb=EMB_MODELS.find(e=>e.id===embModel);
-  const totalChunks=CHUNK_EST[chunker]*pendingSources.length;
-  const totalTokens=totalChunks*(emb?.tokens||256);
+  // Reset when new sources arrive
+  useEffect(()=>{
+    if(pendingSources.length>0 && flowPhase==="done"){
+      setFlowPhase("idle");
+    }
+  },[pendingSources.length]);
 
-  const run=()=>{
-    setPhase("analyzing");setProgress(5);setStepLabel("Detecting content types…");
+  const selectedStats = tokenStats.find(s=>s.id===chunker);
+  const emb = EMB_MODELS.find(e=>e.id===embModel);
+
+  const isOverBudget = selectedStats && emb && selectedStats.avgPerChunk > emb.maxTokens;
+  const hiOverBudget = selectedStats && emb && selectedStats.hiPerChunk  > emb.maxTokens;
+
+  const totalChunks  = selectedStats?.totalChunks  || (CHUNK_EST[chunker]*(pendingSources.length||1));
+  const totalTokens  = selectedStats ? selectedStats.avgPerChunk * totalChunks : totalChunks*(emb?.maxTokens||256);
+
+  // ── STEP 1: Analyse ──
+  const runAnalyse = () => {
+    setFlowPhase("analysing");
+    setAnalyseProgress(0);
+    const steps = [10,25,45,65,80,100];
+    let i=0;
+    const tick=()=>{
+      if(i>=steps.length){
+        const stats = computeTokenStats(pendingSources);
+        setTokenStats(stats);
+        setFlowPhase("configured");
+        return;
+      }
+      setAnalyseProgress(steps[i++]);
+      setTimeout(tick,220+Math.random()*120);
+    };
+    setTimeout(tick,200);
+  };
+
+  // ── STEP 2: Embed ──
+  const runEmbed = () => {
+    setFlowPhase("embedding");setProgress(5);setStepLabel("Preprocessing pages…");
     const steps=[
-      [18,"analyzing","Analysing document structure…"],
-      [36,"chunking", `Chunking · ${chunker} strategy…`],
-      [58,"chunking", `Generated ~${totalChunks} chunks`],
-      [78,"embedding",`Embedding with ${emb?.name}…`],
-      [94,"embedding","Writing to FAISS store…"],
-      [100,"done",    "✓ All sources embedded"],
+      [18,"Splitting into paragraphs…"],
+      [36,`Chunking · ${chunker} strategy…`],
+      [58,`Generated ~${totalChunks} chunks`],
+      [78,`Embedding with ${emb?.name}…`],
+      [94,"Writing to FAISS store…"],
+      [100,"✓ All sources embedded"],
     ];
     let i=0;
     const tick=()=>{
-      if(i>=steps.length){onDone(embModel,chunker,totalChunks);return;}
-      const[p,ph,lbl]=steps[i++];
-      setProgress(p);setPhase(ph);setStepLabel(lbl);
+      if(i>=steps.length){
+        setFlowPhase("done");
+        onDone(embModel,chunker,totalChunks);
+        return;
+      }
+      const[p,lbl]=steps[i++];
+      setProgress(p);setStepLabel(lbl);
       setTimeout(tick,400+Math.random()*200);
     };
     setTimeout(tick,300);
   };
 
-  if(pendingSources.length===0)return null;
+  if(pendingSources.length===0) return null;
 
   return(
     <div style={{marginTop:10,background:"var(--bg)",border:"1px solid var(--border2)",borderRadius:10,padding:12}}>
 
-      {/* per-source cards */}
+      {/* ── Queued Sources ── */}
       <div className="sb-label">Queued Sources</div>
       {pendingSources.map(s=>(
         <div key={s.id} style={{marginBottom:7,padding:"8px 10px",background:"var(--panel)",borderRadius:8,border:"1px solid var(--border)"}}>
@@ -395,58 +556,125 @@ function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDon
           </div>
           <div style={{fontFamily:"var(--font-mono)",fontSize:10,color:"var(--muted)"}}>
             type: <span style={{color:"var(--text)"}}>{s.type}</span>
-            {" · "}est. chunks: <span style={{color:"var(--text)"}}>{CHUNK_EST[chunker]}</span>
-            {" · "}dim: <span style={{color:"var(--text)"}}>{emb?.dim}</span>
           </div>
         </div>
       ))}
 
-      {/* chunker pick */}
-      <div className="sb-label" style={{marginTop:10}}>Chunking Strategy</div>
-      <div className="chip-row">
-        {CHUNKERS.map(c=>(
-          <button key={c.id} className={`chip${chunker===c.id?" active":""}`}
-            disabled={phase!=="idle"} onClick={()=>setChunker(c.id)}>{c.label}</button>
-        ))}
-      </div>
+      {/* ── Phase: idle → show Analyse button ── */}
+      {flowPhase==="idle"&&(
+        <button className="analyse-btn" onClick={runAnalyse}>
+          <span>🔍</span> Analyse &amp; Estimate Token Budget
+        </button>
+      )}
 
-      {/* stats preview */}
-      <div className="preview-box">
-        <div className="prow"><span>Est. chunks</span><span className="pval">{totalChunks}</span></div>
-        <div className="prow"><span>Tokens/chunk</span><span className="pval">~{emb?.tokens}</span></div>
-        <div className="prow"><span>Total tokens</span><span className="pval">{totalTokens.toLocaleString()}</span></div>
-        <div className="prow"><span>Vector dim</span><span className="pval">{emb?.dim}</span></div>
-      </div>
-
-      {/* embedding model */}
-      <div className="sb-label">Embedding Model</div>
-      {EMB_MODELS.map(e=>(
-        <div key={e.id} className={`emb-opt${embModel===e.id?" active":""}`}
-          onClick={()=>phase==="idle"&&setEmbModel(e.id)}
-          style={{cursor:phase!=="idle"?"default":"pointer"}}>
-          <div>
-            <div style={{fontWeight:600,fontSize:10}}>{e.name}</div>
-            <div className="emb-dim">{e.dim} dims · max {e.tokens} tokens/chunk</div>
-          </div>
-          {embModel===e.id&&<span style={{color:"var(--accent)",fontSize:12}}>✓</span>}
-        </div>
-      ))}
-
-      {/* progress bar */}
-      {phase!=="idle"&&(
-        <div className="prog-wrap">
-          <div className="prog-lbl">{phase.charAt(0).toUpperCase()+phase.slice(1)}…</div>
-          <div className="prog-bar-bg"><div className="prog-bar" style={{width:`${progress}%`}}/></div>
-          <div className="prog-step">{stepLabel}</div>
+      {/* ── Phase: analysing → progress ── */}
+      {flowPhase==="analysing"&&(
+        <div className="prog-wrap" style={{marginTop:8}}>
+          <div className="prog-lbl">Analysing document structure…</div>
+          <div className="prog-bar-bg"><div className="prog-bar" style={{width:`${analyseProgress}%`}}/></div>
+          <div className="prog-step">Preprocessing pages · paragraphs · sentences</div>
         </div>
       )}
 
-      {/* CTA */}
-      <button className="embed-btn" disabled={phase!=="idle"&&phase!=="done"} onClick={run}>
-        {phase==="idle"&&<><span>⚡</span>Embed &amp; Ingest {pendingSources.length} source{pendingSources.length>1?"s":""}</>}
-        {phase!=="idle"&&phase!=="done"&&<><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>⟳</span>Processing…</>}
-        {phase==="done"&&<><span>✓</span>Done — sources ready in store</>}
-      </button>
+      {/* ── Phase: configured → show token table + chunker select + model select ── */}
+      {(flowPhase==="configured"||flowPhase==="embedding"||flowPhase==="done")&&(
+        <>
+          <hr className="flow-divider"/>
+
+          {/* Token Estimation Table — click row to pick chunker */}
+          <TokenEstTable
+            stats={tokenStats}
+            selectedChunker={chunker}
+            onSelectChunker={setChunker}
+            disabled={flowPhase!=="configured"}
+          />
+
+          {/* Chunker quick-chips (mirror of table selection) */}
+          <div className="chip-row">
+            {CHUNKERS.map(c=>{
+              const st=tokenStats.find(x=>x.id===c.id);
+              return(
+                <button key={c.id}
+                  className={`chip${chunker===c.id?" active":""}`}
+                  disabled={flowPhase!=="configured"}
+                  onClick={()=>setChunker(c.id)}>
+                  {c.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <hr className="flow-divider"/>
+
+          {/* Selected strategy stats */}
+          {selectedStats&&(
+            <div className="preview-box" style={{marginBottom:10}}>
+              <div className="prow"><span>Strategy</span><span className="pval">{selectedStats.label}</span></div>
+              <div className="prow"><span>Est. chunks</span><span className="pval">{selectedStats.totalChunks}</span></div>
+              <div className="prow"><span>Avg tokens/chunk</span><span className="pval">{selectedStats.avgPerChunk}</span></div>
+              <div className="prow"><span>Low tokens/chunk</span><span className="pval" style={{color:"var(--muted)"}}>{selectedStats.loPerChunk}</span></div>
+              <div className="prow"><span>High tokens/chunk</span><span className="pval" style={{color:"var(--amber)"}}>{selectedStats.hiPerChunk}</span></div>
+              <div className="prow"><span>Total avg tokens</span><span className="pval">{selectedStats.totalAvgTokens.toLocaleString()}</span></div>
+              <div className="prow"><span>Vector dim</span><span className="pval">{emb?.dim}</span></div>
+            </div>
+          )}
+
+          {/* Embedding model — shown after chunker selected */}
+          <div className="sb-label" style={{marginTop:4}}>
+            Embedding Model
+            {isOverBudget&&<span className="warn-pill">⚠ avg over budget</span>}
+          </div>
+          <div style={{fontSize:9,color:"var(--muted)",fontFamily:"var(--font-mono)",marginBottom:8}}>
+            avg chunk: <span style={{color:selectedStats?.avgPerChunk>256?"var(--amber)":"var(--green)"}}>~{selectedStats?.avgPerChunk||"—"} tokens</span>
+            {" · "}choose a model whose max ≥ avg
+          </div>
+          {EMB_MODELS.map(e=>{
+            const over = selectedStats && selectedStats.avgPerChunk > e.maxTokens;
+            const hiOver = selectedStats && selectedStats.hiPerChunk > e.maxTokens;
+            return(
+              <div key={e.id}
+                className={`emb-opt${embModel===e.id?" active":""}${over?" over-budget":""}`}
+                onClick={()=>flowPhase==="configured"&&setEmbModel(e.id)}
+                style={{cursor:flowPhase!=="configured"?"default":"pointer"}}>
+                <div>
+                  <div style={{fontWeight:600,fontSize:10,display:"flex",alignItems:"center",gap:5}}>
+                    {e.name}
+                    {over&&<span style={{fontSize:9,color:"var(--amber)"}}>avg exceeds</span>}
+                    {!over&&hiOver&&<span style={{fontSize:9,color:"var(--muted)"}}>hi may truncate</span>}
+                    {!over&&!hiOver&&embModel===e.id&&<span style={{fontSize:9,color:"var(--green)"}}>✓ fits</span>}
+                  </div>
+                  <div className="emb-dim">{e.dim} dims · max {e.maxTokens} tok/chunk</div>
+                </div>
+                {embModel===e.id&&<span style={{color:"var(--accent)",fontSize:12}}>✓</span>}
+              </div>
+            );
+          })}
+
+          {/* Embed progress */}
+          {flowPhase==="embedding"&&(
+            <div className="prog-wrap">
+              <div className="prog-lbl">Embedding…</div>
+              <div className="prog-bar-bg"><div className="prog-bar" style={{width:`${progress}%`}}/></div>
+              <div className="prog-step">{stepLabel}</div>
+            </div>
+          )}
+
+          {/* CTA */}
+          {flowPhase!=="done"&&(
+            <button className="embed-btn"
+              disabled={flowPhase==="embedding"}
+              onClick={flowPhase==="configured"?runEmbed:undefined}>
+              {flowPhase==="configured"&&<><span>⚡</span>Embed &amp; Ingest {pendingSources.length} source{pendingSources.length>1?"s":""}</>}
+              {flowPhase==="embedding"&&<><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>⟳</span>Processing…</>}
+            </button>
+          )}
+          {flowPhase==="done"&&(
+            <div style={{textAlign:"center",padding:"10px 0",color:"var(--green)",fontFamily:"var(--font-mono)",fontSize:11}}>
+              ✓ Done — {totalChunks} chunks in {emb?.dim}d FAISS store
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -737,7 +965,7 @@ export default function App(){
             <div className="sb-label">Chat History</div>
             {history.map(h=>(
               <div key={h.id} className={`hist-item${activeSession===h.id?" active":""}`} onClick={()=>loadSession(h.id)}>
-                <div className={`hist-dot${activeSession===h.id?"":" old"}`}/>
+                <div className={`hist-dot${activeSession===h.id?"":""} old`}/>
                 <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.title}</span>
               </div>
             ))}
