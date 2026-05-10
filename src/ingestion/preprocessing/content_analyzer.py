@@ -26,7 +26,7 @@ class ContentAnalyzer:
     def analyze(
         self,
         content: str,
-        source_type: Optional[str] = "text",   # FIX: was required, now optional
+        source_type: Optional[str] = "text",
     ) -> Dict[str, Any]:
         """
         Analyze *content* and return strategy recommendation.
@@ -39,7 +39,8 @@ class ContentAnalyzer:
         Returns:
             {
                 sampled_length, estimated_tokens, avg_tokens_per_paragraph,
-                paragraph_count, word_count,
+                paragraph_count, word_count, sentence_count,
+                token_stats: {sentence, paragraph, page},
                 structure: {has_chapters, has_page_markers, has_headings},
                 recommendation: {strategy, reason, chunk_size}
             }
@@ -72,17 +73,44 @@ class ContentAnalyzer:
             word_count=len(words),
         )
 
+        # ── Per-strategy token estimation (on full content) ───────────────────
+        full_words  = content.split()
+        full_tokens = int(len(full_words) / 0.75)
+
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", content) if s.strip()]
+        all_paras = [p.strip() for p in content.split("\n\n") if p.strip()]
+        pages     = [p.strip() for p in content.split("[Page") if p.strip()]
+
+        def _token_stats(units: list) -> dict:
+            if not units:
+                return {"count": 0, "avg": 0, "min": 0, "max": 0}
+            toks = [int(len(u.split()) / 0.75) for u in units]
+            return {
+                "count": len(toks),
+                "avg":   int(sum(toks) / len(toks)),
+                "min":   min(toks),
+                "max":   max(toks),
+            }
+
+        token_stats = {
+            "sentence":  _token_stats(sentences),
+            "paragraph": _token_stats(all_paras),
+            "page":      _token_stats(pages) if len(pages) > 1 else _token_stats(all_paras),
+        }
+
         return {
-            "sampled_length": len(sample),
-            "estimated_tokens": estimated_tokens,
+            "sampled_length":           len(sample),
+            "estimated_tokens":         full_tokens,
             "avg_tokens_per_paragraph": avg_tokens_per_paragraph,
-            "paragraph_count": len(paragraphs),
-            "word_count": len(content.split()),
+            "paragraph_count":          len(paragraphs),
+            "word_count":               len(full_words),
+            "sentence_count":           len(sentences),
+            "token_stats":              token_stats,
             "structure": {
-                "has_chapters": has_chapters,
+                "has_chapters":     has_chapters,
                 "has_page_markers": has_page_markers,
-                "has_headings": has_headings,
-                "has_timestamps": has_timestamps,
+                "has_headings":     has_headings,
+                "has_timestamps":   has_timestamps,
             },
             "recommendation": recommendation,
         }
