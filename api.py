@@ -71,6 +71,7 @@ class QueryRequest(BaseModel):
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
 
+
 class ModeRequest(BaseModel):
     mode: str
 
@@ -85,6 +86,22 @@ class PersonaRequest(BaseModel):
     length:         Optional[str] = None
     custom_persona: Optional[str] = None
     reset:          bool = False   # set True to restore sagan/neutral/medium
+
+
+# ── helper ────────────────────────────────────────────────────────────────────
+
+def _apply_tuning(req: QueryRequest) -> None:
+    """Apply per-request generation params to the LLM client if any were sent."""
+    if pipeline.llm and any(
+        v is not None for v in (req.temperature, req.top_p, req.max_tokens)
+    ):
+        pipeline.llm.update_tuning(
+            **{k: v for k, v in {
+                "temperature": req.temperature,
+                "top_p":       req.top_p,
+                "max_tokens":  req.max_tokens,
+            }.items() if v is not None}
+        )
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -350,17 +367,9 @@ async def query(req: QueryRequest):
     Passes the current persona config to the pipeline for Chat mode.
     """
     try:
+        _apply_tuning(req)
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            if any(v is not None for v in (req.temperature, req.top_p, req.max_tokens)):
-                if pipeline.llm:
-                    pipeline.llm.update_tuning(
-                        **{k: v for k, v in {
-                            "temperature": req.temperature,
-                            "top_p":       req.top_p,
-                            "max_tokens":  req.max_tokens,
-                        }.items() if v is not None}
-                    )
             lambda: pipeline.generate(
                 req.query,
                 stream=False,
@@ -385,17 +394,8 @@ async def query_stream(req: QueryRequest):
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
             loop = asyncio.get_event_loop()
-            # Apply per-request generation tuning if the UI sent any sliders
-            if any(v is not None for v in (req.temperature, req.top_p, req.max_tokens)):
-                if pipeline.llm:
-                    pipeline.llm.update_tuning(
-                        **{k: v for k, v in {
-                            "temperature": req.temperature,
-                            "top_p":       req.top_p,
-                            "max_tokens":  req.max_tokens,
-                        }.items() if v is not None}
-                    )
-            
+            _apply_tuning(req)
+
             result = await loop.run_in_executor(
                 None,
                 lambda: pipeline.generate(
@@ -404,7 +404,7 @@ async def query_stream(req: QueryRequest):
                     persona_config=_persona_config if req.mode == "chat" else None,
                 ),
             )
-            
+
             if hasattr(result, "__iter__") and not isinstance(result, dict):
                 for chunk in result:
                     if isinstance(chunk, str):
