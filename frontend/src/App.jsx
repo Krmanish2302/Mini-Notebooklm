@@ -795,7 +795,15 @@ export default function App() {
       const res = await fetch(`${API}/api/query/stream`, {
         method: "POST",
         headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({query: userMsg.content, mode, stream: true}),
+        body: JSON.stringify({
+          query: userMsg.content,
+          mode,
+          stream: true,
+          temperature: temp,
+          top_p: topP,
+          top_k: topK,
+          max_tokens: maxTokens,
+        }),
         signal: abortRef.current.signal,
       });
       if (!res.ok) throw new Error(`Query failed: ${res.status}`);
