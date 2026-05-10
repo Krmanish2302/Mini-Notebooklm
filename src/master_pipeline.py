@@ -48,7 +48,7 @@ from src.ingestion.chunking.chunker_registry import ChunkerRegistry
 from src.ingestion.embedding.embedding_pipeline import EmbeddingPipeline
 from src.ingestion.merging.cross_modal_merger import CrossModalMerger
 from src.ingestion.ingestion_graph import IngestionGraph
-
+from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
 # ── Storage (corrected class names + orchestrator) ────────────────────────────
 from src.storage import (
     MultiFAISSStore,
@@ -374,11 +374,33 @@ class MasterPipeline:
         query_embedding = self.embedder.embed_query(query)
 
         # ── Retrieve ──────────────────────────────────────────────────────────
+        active_dims = self.storage_manager.faiss.active_dims()
+        query_vectors = {}
+        for dim in active_dims:
+            ep = EmbeddingRegistry.get_by_dim(dim)
+            if ep is not None:
+                query_vectors[dim] = ep.embed_query(query)
+            elif dim == self._embed_dim:
+                query_vectors[dim] = query_embedding  # fallback to default
+        
+        if not query_vectors:
+            query_vectors = {self._embed_dim: query_embedding}
+        
         raw_results = self.storage_manager.faiss.search(
-            query_vectors={self._embed_dim: query_embedding},
+            query_vectors=query_vectors,
             k=self.config.get("retrieval.top_k", 10),
         )
-        chunk_ids = [cid for cid, _score in raw_results.get(self._embed_dim, [])]
+        
+        # RRF fusion across all dims
+        from collections import defaultdict
+        rrf_scores: dict = defaultdict(float)
+        K = 60
+        for dim_results in raw_results.values():
+            for rank, (cid, _score) in enumerate(dim_results):
+                rrf_scores[cid] += 1.0 / (K + rank + 1)
+        
+        top_k = self.config.get("retrieval.top_k", 10)
+        chunk_ids = [cid for cid, _ in sorted(rrf_scores.items(), key=lambda x: -x[1])[:top_k]]
 
         # Hydrate chunk IDs → LangChain Documents
         documents = self.storage_manager.get_chunks_as_documents(chunk_ids)
