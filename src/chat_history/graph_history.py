@@ -1,83 +1,151 @@
-from typing import List, Dict, Any, Optional
-from src.graph.graph_storage import GraphStorage
+"""
+GraphHistory  —  Study Mode session history.
 
-class GraphChatHistory:
+Tracks concept nodes visited during a study session.
+
+Core API
+--------
+  has_visited(concept)          -> bool
+  mark_visited(concept, query)  -> stores in-memory + KnowledgeGraph
+  add_message(role, content, concepts, sources_used)
+  get_visited_concepts()        -> List[str]
+  get_learning_path(concept)    -> List[Dict]  (KG BFS)
+  concept_graph_for_ui()        -> {nodes, edges} JSON for frontend
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+
+class GraphHistory:
     """
-    Graph-based chat history for Study Mode.
-    Tracks concept relationships and learning sequences.
+    Study Mode session history: concept-node tracking.
+
+    Parameters
+    ----------
+    session_id      : str
+    knowledge_graph : KnowledgeGraph
     """
-    
-    def __init__(self, session_id: str, graph_storage: GraphStorage):
+
+    def __init__(self, session_id: str, knowledge_graph):
         self.session_id = session_id
-        self.graph = graph_storage
+        self.kg = knowledge_graph
         self.messages: List[Dict[str, Any]] = []
-    
-    def add_message(self, role: str, content: str, concepts: List[str] = None, 
-                   sources_used: List[str] = None):
-        """Add message with concept tracking."""
-        message_id = f"{self.session_id}_{len(self.messages)}"
-        
-        message = {
-            "id": message_id,
-            "session_id": self.session_id,
-            "role": role,
-            "content": content,
-            "concepts": concepts or [],
-            "sources_used": sources_used or [],
-            "index": len(self.messages)
+        # {concept_key: {concept, first_seen, query}}
+        self._visited: Dict[str, Dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # Concept tracking
+    # ------------------------------------------------------------------
+
+    def has_visited(self, concept: str) -> bool:
+        """Return True if this concept was already covered in the session."""
+        return self._concept_key(concept) in self._visited
+
+    def mark_visited(self, concept: str, triggering_query: str = "") -> None:
+        """
+        Mark concept as visited and add a node in the KnowledgeGraph.
+        Links to the previous concept node with a 'led_to' edge.
+        """
+        key = self._concept_key(concept)
+        if key in self._visited:
+            return
+        record = {
+            "concept": concept,
+            "first_seen": datetime.now(timezone.utc).isoformat(),
+            "query": triggering_query,
         }
-        self.messages.append(message)
-        
-        # Add to graph as node
-        self.graph.add_chunk({
-            "id": message_id,
-            "content": content,
-            "modality": "chat_message",
-            "source_id": self.session_id,
-            "metadata": {"role": role, "concepts": concepts}
+        self._visited[key] = record
+
+        concept_node_id = f"concept__{self.session_id}__{key}"
+        self.kg.add_chunk({
+            "id": concept_node_id, "content": concept,
+            "modality": "study_concept", "source_id": self.session_id,
+            "metadata": record,
         })
-        
-        # Link to previous message
+        prev = self._last_concept_node_id()
+        if prev and prev != concept_node_id:
+            self.kg.add_edge(prev, concept_node_id, weight=0.9, relation="led_to")
+
+    def get_visited_concepts(self) -> List[str]:
+        return [v["concept"] for v in self._visited.values()]
+
+    # ------------------------------------------------------------------
+    # Message tracking
+    # ------------------------------------------------------------------
+
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        concepts: Optional[List[str]] = None,
+        sources_used: Optional[List[str]] = None,
+    ) -> None:
+        message_id = f"{self.session_id}_msg_{len(self.messages)}"
+        msg: Dict[str, Any] = {
+            "id": message_id, "role": role, "content": content,
+            "concepts": concepts or [], "sources_used": sources_used or [],
+            "index": len(self.messages),
+        }
+        self.messages.append(msg)
+
+        self.kg.add_chunk({
+            "id": message_id, "content": content,
+            "modality": "chat_message", "source_id": self.session_id,
+            "metadata": {"role": role, "concepts": concepts or []},
+        })
         if len(self.messages) > 1:
-            prev_id = self.messages[-2]["id"]
-            self.graph.add_relationship(
-                prev_id, message_id, "followed_by", weight=1.0
-            )
-        
-        # Link concepts
-        if concepts:
-            for concept in concepts:
-                # Create concept node if not exists
-                concept_id = f"concept_{concept}_{self.session_id}"
-                if concept_id not in self.graph.graph:
-                    self.graph.add_chunk({
-                        "id": concept_id,
-                        "content": concept,
-                        "modality": "concept",
-                        "source_id": self.session_id
-                    })
-                self.graph.add_relationship(
-                    message_id, concept_id, "mentions", weight=0.8
-                )
-    
+            prev_msg_id = self.messages[-2]["id"]
+            self.kg.add_edge(prev_msg_id, message_id, weight=1.0, relation="followed_by")
+
+        for concept in (concepts or []):
+            self.mark_visited(concept, triggering_query=content)
+            cnode_id = f"concept__{self.session_id}__{self._concept_key(concept)}"
+            if cnode_id in self.kg.graph:
+                self.kg.add_edge(message_id, cnode_id, weight=0.8, relation="mentions")
+
+    # ------------------------------------------------------------------
+    # Learning path
+    # ------------------------------------------------------------------
+
     def get_learning_path(self, concept: str) -> List[Dict[str, Any]]:
-        """Get learning sequence for a concept."""
-        concept_id = f"concept_{concept}_{self.session_id}"
-        if concept_id not in self.graph.graph:
+        key = self._concept_key(concept)
+        concept_node_id = f"concept__{self.session_id}__{key}"
+        if concept_node_id not in self.kg.graph:
             return []
-        
-        # Find all messages mentioning this concept
-        related = self.graph.get_related(concept_id, depth=2)
-        return related
-    
-    def get_concept_connections(self) -> List[Dict[str, Any]]:
-        """Get all concept relationships in this session."""
-        connections = []
-        for node_id, data in self.graph.graph.nodes(data=True):
-            if data.get("modality") == "concept":
-                related = self.graph.get_related(node_id, depth=1)
-                connections.append({
-                    "concept": data.get("content", ""),
-                    "related": related
+        return self.kg.get_neighbors(concept_node_id, depth=2)
+
+    def concept_graph_for_ui(self) -> Dict[str, Any]:
+        """
+        {nodes: [{id, label, type, first_seen}], edges: [{from, to, relation}]}
+        """
+        nodes: List[Dict] = []
+        edges: List[Dict] = []
+        prefix = f"concept__{self.session_id}__"
+        for node_id, data in self.kg.graph.nodes(data=True):
+            if data.get("modality") == "study_concept" and node_id.startswith(prefix):
+                nodes.append({
+                    "id": node_id, "label": data.get("content", node_id),
+                    "type": "concept",
+                    "first_seen": data.get("metadata", {}).get("first_seen"),
                 })
-        return connections
+        for u, v, edata in self.kg.graph.edges(data=True):
+            rel = edata.get("relation", "related")
+            if rel in ("led_to", "prerequisite_of", "causes", "is_a_type_of"):
+                edges.append({"from": u, "to": v, "relation": rel})
+        return {"nodes": nodes, "edges": edges}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _concept_key(concept: str) -> str:
+        return concept.strip().lower().replace(" ", "_")
+
+    def _last_concept_node_id(self) -> Optional[str]:
+        if not self._visited:
+            return None
+        last_key = list(self._visited.keys())[-1]
+        return f"concept__{self.session_id}__{last_key}"
