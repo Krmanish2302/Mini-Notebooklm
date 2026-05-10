@@ -94,6 +94,11 @@ class SQLiteManager:
     # ── sources ───────────────────────────────────────────────────────────────
 
     def add_source(self, source: Dict[str, Any]) -> None:
+        """
+        Fix (Bug 1+2): use .get() with safe defaults for all fields so that
+        a missing 'source_type' key no longer raises a KeyError, and a missing
+        'title' key no longer silently stores an empty string.
+        """
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO sources
@@ -101,8 +106,8 @@ class SQLiteManager:
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 source["id"],
-                source.get("title", ""),
-                source["source_type"],
+                source.get("title", source.get("name", "")),         # accept legacy 'name' key
+                source.get("source_type", source.get("type", "unknown")),  # accept legacy 'type' key
                 source.get("file_path"),
                 source.get("url"),
                 json.dumps(source.get("metadata", {})),

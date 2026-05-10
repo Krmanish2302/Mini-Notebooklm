@@ -2,10 +2,10 @@
 embedding_pipeline.py  —  EmbeddingPipeline
 
 Fixes vs original:
-    - embed_batch() single-item edge case: result is always shape (N, dim)
-      even when N=1 (was returning (dim,) causing downstream index errors).
-    - expose embed_query() as alias for embed_single() so both ChatGraph
-      and CrossModalMerger callers work without AttributeError.
+    - embed_batch() always returns shape (N, dim), even for empty input
+      (was returning (0,) for empty lists causing downstream shape errors).
+    - expose embed_query() as the canonical single-query entry point;
+      embed_single aliased to same so both callers work.
     - MD5 cache uses full text as key to avoid collision on short texts.
 """
 from __future__ import annotations
@@ -42,11 +42,16 @@ class EmbeddingPipeline:
 
     def embed_batch(self, texts: List[str]) -> np.ndarray:
         """
-        Embed a batch of texts.  Always returns shape (N, dim) — never (dim,).
-        Uses in-memory MD5 cache.
+        Embed a batch of texts.  Always returns shape (N, dim) — never (dim,)
+        or (0,) for empty input.
+
+        Fix (Bug 7): empty list now returns (0, dim) not (0,).
         """
+        dim = self.embedder.dimension
+
         if not texts:
-            return np.empty((0,), dtype="float32")
+            # Fix Bug 7 — return correct 2-D empty array
+            return np.empty((0, dim), dtype="float32")
 
         if not self.use_cache:
             result = self.embedder.embed(texts)
@@ -75,7 +80,10 @@ class EmbeddingPipeline:
         return np.stack([r[1] for r in cached_results])  # always (N, dim)
 
     def embed_query(self, query: str) -> np.ndarray:
-        """Embed a single query string.  Returns 1-D array of shape (dim,)."""
+        """
+        Embed a single query string.  Returns 1-D array of shape (dim,).
+        This is the canonical method called by HybridRetriever.
+        """
         return self.embedder.embed_single(query)
 
     # alias kept for backwards compatibility

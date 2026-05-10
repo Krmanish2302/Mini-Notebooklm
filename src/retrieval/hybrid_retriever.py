@@ -12,9 +12,7 @@ class HybridRetriever:
     1. Dense  : Search EVERY active FAISS index (one per embedding dim).
                 Each index was built with a different embedding model, so
                 we embed the query with ALL registered models and fire one
-                search per (dim, query_vector) pair — in parallel via a
-                simple loop (FAISS releases the GIL; add ThreadPoolExecutor
-                if you want true parallelism later).
+                search per (dim, query_vector) pair.
 
     2. Sparse : BM25Okapi over the tokenised corpus of all stored chunks
                 (built once after ingestion, rebuilt on source add/delete).
@@ -23,21 +21,26 @@ class HybridRetriever:
                  results.  RRF score = sum( weight / (k + rank) ) per chunk.
                  dense_weight=0.7, sparse_weight=0.3 (tunable).
 
-    4. Hydrate : chunk_ids → full chunk dicts via StorageManager.
+    4. Hydrate : chunk_ids -> full chunk dicts via StorageManager.
+
+    Fix (Bug 5+6): embedder.encode() -> embedder.embed_query()
+        The embedders dict holds EmbeddingPipeline objects which expose
+        embed_query(), NOT encode(). Using encode() raised AttributeError
+        on every single retrieval call.
     """
 
     def __init__(
         self,
-        faiss_store,          # MultiFAISSStore — holds all dim-keyed indexes
-        storage_manager,      # StorageManager  — SQLite hydration
-        embedders: Dict[int, Any],  # {dim: SentenceTransformer | OpenAIEmbedder}
+        faiss_store,
+        storage_manager,
+        embedders: Dict[int, Any],  # {dim: EmbeddingPipeline}
         top_k: int = 5,
         dense_weight: float = 0.7,
         sparse_weight: float = 0.3,
     ):
         self.faiss_store = faiss_store
         self.storage_manager = storage_manager
-        self.embedders = embedders          # ALL active embedding models keyed by dim
+        self.embedders = embedders
         self.top_k = top_k
         self.dense_weight = dense_weight
         self.sparse_weight = sparse_weight
@@ -69,22 +72,23 @@ class HybridRetriever:
 
         Steps
         -----
-        1. Embed query with EVERY active model  → query_vectors {dim: vec}
-        2. Dense search on EVERY FAISS index    → dense_hits {dim: [(id,score)]}
-        3. BM25 search                          → sparse_hits [(id,score)]
+        1. Embed query with EVERY active model  -> query_vectors {dim: vec}
+        2. Dense search on EVERY FAISS index    -> dense_hits {dim: [(id,score)]}
+        3. BM25 search                          -> sparse_hits [(id,score)]
         4. RRF fusion over all hits
         5. Hydrate top_k chunk_ids from SQLite
         """
         k = top_k or self.top_k
         fetch_k = k * 3   # over-fetch before fusion
 
-        # ── Step 1 & 2 : Dense (all dims in parallel) ─────────────────────
+        # ── Step 1 & 2 : Dense (all dims) ─────────────────────────────────
         query_vectors: Dict[int, np.ndarray] = {}
         for dim, embedder in self.embedders.items():
-            query_vectors[dim] = embedder.encode(query)
+            # Fix Bug 5: use embed_query() not encode()
+            query_vectors[dim] = embedder.embed_query(query)
 
         raw_dense = self.faiss_store.search(query_vectors, k=fetch_k)
-        # raw_dense → {dim: [(chunk_id, score), ...]}
+        # raw_dense -> {dim: [(chunk_id, score), ...]}
 
         # Flatten: collect all (chunk_id, rank, weight) tuples for RRF
         dense_ranked: List[Dict] = []
@@ -152,7 +156,7 @@ class HybridRetriever:
     # ------------------------------------------------------------------
 
     def _hydrate(self, fused: List[Dict]) -> List[Dict]:
-        """Resolve chunk_ids → full content dicts via StorageManager."""
+        """Resolve chunk_ids -> full content dicts via StorageManager."""
         results = []
         for item in fused:
             cid = item["chunk_id"]

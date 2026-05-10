@@ -9,28 +9,33 @@ from .chapter_chunker import ChapterChunker
 from .paragraph_chunker import ParagraphChunker
 from .sentence_chunker import SentenceChunker
 
+
 class ChunkerRegistry:
     """Registry for pluggable chunking strategies."""
-    
+
     _chunkers: Dict[str, Type[BaseChunker]] = {
-        "recursive": RecursiveChunker,
-        "semantic": SemanticChunker,
-        "late": LateChunker,
+        "recursive":    RecursiveChunker,
+        "semantic":     SemanticChunker,
+        "late":         LateChunker,
         "hierarchical": HierarchicalChunker,
-        "page": PageChunker,
-        "chapter": ChapterChunker,
-        "paragraph": ParagraphChunker,
-        "sentence":  SentenceChunker,
+        "page":         PageChunker,
+        "chapter":      ChapterChunker,
+        "paragraph":    ParagraphChunker,
+        "sentence":     SentenceChunker,
     }
-    
+
+    # Fix (Bug 10): added 'video' and 'audio' source-type defaults so that
+    # ChunkerRegistry.get_chunker('video') no longer raises ValueError.
     _defaults: Dict[str, str] = {
         "pdf":     "paragraph",
         "website": "recursive",
         "youtube": "paragraph",
         "csv":     "recursive",
         "image":   "paragraph",
+        "video":   "paragraph",   # Fix Bug 10
+        "audio":   "paragraph",   # Fix Bug 10
     }
-    
+
     @classmethod
     def get_chunker(cls, strategy: str, **kwargs) -> BaseChunker:
         # Resolve source-type aliases to strategy name
@@ -41,7 +46,7 @@ class ChunkerRegistry:
                 f"Available: {list(cls._chunkers.keys())}"
             )
         return cls._chunkers[resolved](**kwargs)
-    
+
     @classmethod
     def list_strategies(cls) -> list:
         return list(cls._chunkers.keys())

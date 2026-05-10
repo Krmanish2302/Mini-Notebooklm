@@ -6,21 +6,21 @@ Design:
     IndexIDMap2 + DirectMap.Hashtable enables O(1) deletion by FAISS internal
     ID without scanning the full index.
 
-    dim_registry maps:  dim (int) → FAISSIndex dataclass
+    dim_registry maps:  dim (int) -> FAISSIndex dataclass
     Each index is persisted at:  <base_dir>/faiss_<dim>.index
 
 Deletion flow:
-    delete_by_source(source_id)
-      → SQLite lookup: all (chunk_id, faiss_internal_id, dim) for source
-      → group by dim
-      → per dim: index.remove_ids(faiss_internal_ids)
-      → SQLite purge
+    delete_chunks(chunk_ids, dim)
+      -> group fids from id_map
+      -> index.remove_ids(IDSelectorArray)
+      -> update id_map / rev_map
+      -> persist
 
 Retrieval flow:
     search(query_vectors_by_dim, k)
-      → for each dim: search that index with correct query vector
-      → return {dim: [(chunk_id, score), ...]}
-      → caller applies RRF fusion
+      -> for each dim: search that index with correct query vector
+      -> return {dim: [(chunk_id, score), ...]}
+      -> caller applies RRF fusion
 """
 from __future__ import annotations
 
@@ -43,9 +43,9 @@ class _DimIndex:
     """One FAISS index for a specific embedding dimension."""
     dim: int
     index: faiss.Index
-    # chunk_id → faiss internal int64 ID
+    # chunk_id -> faiss internal int64 ID
     id_map: Dict[str, int] = field(default_factory=dict)
-    # faiss internal int64 ID → chunk_id  (reverse map)
+    # faiss internal int64 ID -> chunk_id  (reverse map)
     rev_map: Dict[int, str] = field(default_factory=dict)
     _next_id: int = 0
 
@@ -68,7 +68,7 @@ class MultiFAISSStore:
     def __init__(self, base_dir: str = _BASE_DIR):
         self.base_dir = base_dir
         os.makedirs(base_dir, exist_ok=True)
-        # dim → _DimIndex
+        # dim -> _DimIndex
         self._indexes: Dict[int, _DimIndex] = {}
         self._load_all()
 
@@ -110,7 +110,7 @@ class MultiFAISSStore:
         k: int = 10,
     ) -> Dict[int, List[Tuple[str, float]]]:
         """
-        Search all requested dimensions in parallel.
+        Search all requested dimensions.
 
         Args:
             query_vectors: {dim: query_vector (1-D np.ndarray)}
@@ -198,13 +198,28 @@ class MultiFAISSStore:
             )
 
     def _load_all(self) -> None:
-        """Reload all persisted indexes on startup."""
+        """
+        Reload all persisted indexes on startup.
+
+        Fix (Bug 8): after read_index(), call set_direct_map(Hashtable) so
+        that delete_chunks -> remove_ids works correctly after a server
+        restart.  Without this, the DirectMap is not restored and remove_ids
+        raises a FAISS internal error.
+        """
         for fname in os.listdir(self.base_dir):
             if not fname.startswith("faiss_") or not fname.endswith(".index"):
                 continue
             try:
                 dim = int(fname.replace("faiss_", "").replace(".index", ""))
                 index = faiss.read_index(self._index_path(dim))
+                # Fix Bug 8 — restore DirectMap so delete works post-restart
+                try:
+                    index.set_direct_map(faiss.DirectMap.Hashtable)
+                except Exception as dm_err:
+                    logger.warning(
+                        "MultiFAISSStore: could not set DirectMap for dim=%d: %s",
+                        dim, dm_err,
+                    )
                 meta_path = self._meta_path(dim)
                 if os.path.exists(meta_path):
                     with open(meta_path, "rb") as f:
@@ -218,6 +233,8 @@ class MultiFAISSStore:
                 else:
                     di = _DimIndex(dim=dim, index=index)
                 self._indexes[dim] = di
-                logger.info("MultiFAISSStore: loaded dim=%d (%d vectors)", dim, index.ntotal)
+                logger.info(
+                    "MultiFAISSStore: loaded dim=%d (%d vectors)", dim, index.ntotal
+                )
             except Exception as e:
                 logger.warning("MultiFAISSStore: failed to load %s — %s", fname, e)

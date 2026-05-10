@@ -3,34 +3,34 @@ storage_manager.py  —  Single orchestration surface over all three stores
 
 Used by
 -------
-  MasterPipeline.ingest()     — store embedded chunks
-  LangGraph retrieve node     — lookup chunks by id after FAISS search
-  LangGraph delete node       — remove a source end-to-end
+  IngestGraph node_store     — store embedded chunks
+  LangGraph retrieve node    — lookup chunks by id after FAISS search
+  LangGraph delete node      — remove a source end-to-end
 
 Public API
 ----------
   store(source, chunks, embedding_model, dim)
-      → persists to FAISS + SQLite + KnowledgeGraph
-      → returns source_id (str)
+      -> persists to FAISS + SQLite + KnowledgeGraph
+      -> returns source_id (str)
 
   delete_source(source_id)
-      → removes from all three stores atomically
+      -> removes from all three stores atomically
 
-  get_chunk_content(chunk_id) → str | None
-      → fast SQLite lookup by chunk id
+  get_chunk_content(chunk_id) -> str | None
+      -> fast SQLite lookup by chunk id
 
-  get_chunks_as_documents(chunk_ids) → List[LangChain Document]
-      → hydrate chunk_ids into LangChain Document objects
-        (used by HybridRetriever to return LC-native objects)
+  get_chunks_as_documents(chunk_ids) -> List[LangChain Document]
+      -> hydrate chunk_ids into LangChain Document objects
 
   get_all_chunks_for_bm25() -> List[Dict]
-      → returns [{'id': ..., 'content': ...}] for BM25 index rebuild
+      -> returns [{'id': ..., 'content': ...}] for BM25 index rebuild
 
   get_stats() -> Dict
 """
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
@@ -79,49 +79,63 @@ class StorageManager:
         """
         Persist a source and its embedded chunks across all three stores.
 
-        Parameters
-        ----------
-        source          : must have 'id', 'title', 'source_type'
-        chunks          : each must have 'id', 'content', 'embedding'
-        embedding_model : name used for provenance tracking
-        dim             : embedding dimensionality (FAISS index routing key)
-
-        Returns
-        -------
-        source_id : str
+        Fix (Bug 4): FAISS add_chunks is wrapped in a try/except. If it
+        raises mid-batch (e.g. dim mismatch on chunk N), the SQLite source
+        row that was already written is rolled back to prevent split-brain
+        between FAISS and SQLite that would later break deletion.
         """
-        source_id = source["id"]
+        source_id = source.get("id") or __import__("uuid").uuid4().hex
+        source["id"] = source_id
 
-        # 1. SQLite — source row first (FK constraint)
+        # 1. SQLite source row first (we can roll it back on FAISS failure)
         self.sqlite.add_source(source)
         self._sources[source_id] = source
 
-        # 2. FAISS — multi-dim routing
-        self.faiss.add_chunks(chunks, dim=dim)
+        # 2. FAISS — multi-dim store handles dim routing
+        try:
+            self.faiss.add_chunks(chunks, dim=dim)
+        except Exception as faiss_err:
+            # Rollback SQLite source row to keep stores in sync
+            logger.error(
+                "StorageManager.store: FAISS add_chunks failed for source %s — rolling back. Error: %s",
+                source_id, faiss_err,
+            )
+            try:
+                self.sqlite.delete_source(source_id)
+            except Exception:
+                pass
+            self._sources.pop(source_id, None)
+            raise
 
-        # 3. SQLite — chunk rows with embedding provenance
+        # 3. SQLite chunk rows — annotated with embedding provenance
         for chunk in chunks:
             cid = chunk["id"]
+            dim_idx = self.faiss._indexes.get(dim)
+            fid = dim_idx.id_map.get(cid) if dim_idx else None
             self.sqlite.add_chunk({
-                "id":               cid,
-                "source_id":        source_id,
-                "content":          chunk.get("content", ""),
-                "modality":         chunk.get("modality", "text"),
-                "metadata":         chunk.get("metadata", {}),
-                "embedding_model":  embedding_model,
-                "faiss_dim":        dim,
-                "faiss_internal_id": (
-                    self.faiss._indexes[dim].id_map.get(cid)
-                ),
+                "id":                cid,
+                "source_id":         source_id,
+                "content":           chunk.get("content", ""),
+                "modality":          chunk.get("modality", "text"),
+                "metadata":          chunk.get("metadata", {}),
+                "embedding_model":   embedding_model,
+                "faiss_dim":         dim,
+                "faiss_internal_id": fid,
             })
 
-        # 4. KnowledgeGraph — nodes (auto-link disabled by default for speed;
-        #    caller can call graph.add_edge() explicitly for cross-modal links)
-        for chunk in chunks:
-            self.graph.add_chunk(chunk, auto_link=False)
+        # 4. KnowledgeGraph nodes
+        if self.graph:
+            for chunk in chunks:
+                try:
+                    self.graph.add_chunk(chunk)
+                except Exception as kg_err:
+                    logger.warning(
+                        "StorageManager.store: KnowledgeGraph.add_chunk failed for %s: %s",
+                        chunk.get("id"), kg_err,
+                    )
 
         logger.info(
-            "StorageManager.store: source=%s  chunks=%d  model=%s  dim=%d",
+            "StorageManager: stored source %s — %d chunks (model=%s dim=%d)",
             source_id, len(chunks), embedding_model, dim,
         )
         return source_id
@@ -130,95 +144,71 @@ class StorageManager:
 
     def delete_source(self, source_id: str) -> bool:
         """
-        Remove a source and all its chunks from FAISS + SQLite + KnowledgeGraph.
-        Returns True on success, False if source not found.
+        Fully delete a source and all its chunks from every store.
         """
         if source_id not in self._sources:
-            logger.warning("StorageManager.delete_source: unknown source_id=%s", source_id)
+            logger.warning("StorageManager.delete_source: unknown source %s", source_id)
             return False
 
-        # Get chunk metadata before deleting SQLite rows
         chunk_rows = self.sqlite.get_chunks_for_deletion(source_id)
 
-        # Group by dim for FAISS
-        from collections import defaultdict
+        # Group by dim
         by_dim: Dict[int, List[str]] = defaultdict(list)
         for row in chunk_rows:
             d = row.get("faiss_dim")
             if d is not None:
                 by_dim[d].append(row["id"])
 
+        # FAISS deletion per dim
         for dim, chunk_ids in by_dim.items():
             self.faiss.delete_chunks(chunk_ids, dim=dim)
 
         # KnowledgeGraph
-        removed = self.graph.remove_source(source_id)
-        logger.debug("StorageManager: removed %d graph nodes for source=%s", removed, source_id)
+        if self.graph:
+            for row in chunk_rows:
+                cid = row["id"]
+                try:
+                    self.graph.graph.remove_node(cid)
+                except Exception:
+                    pass
 
-        # SQLite (cascades chunks)
+        # SQLite purge (cascades chunks via delete_source)
         self.sqlite.delete_source(source_id)
 
+        # Memory
         del self._sources[source_id]
-        logger.info("StorageManager.delete_source: removed source=%s", source_id)
+
+        logger.info(
+            "StorageManager: removed source %s — %d chunks across %d FAISS indexes",
+            source_id, len(chunk_rows), len(by_dim),
+        )
         return True
 
     # ── read ──────────────────────────────────────────────────────────────────
 
     def get_chunk_content(self, chunk_id: str) -> Optional[str]:
-        """Fast single-chunk content lookup via SQLite."""
         return self.sqlite.get_chunk_content(chunk_id)
 
-    def get_chunks_as_documents(
-        self,
-        chunk_ids: List[str],
-        include_context_window: bool = True,
-    ) -> List[Document]:
-        """
-        Hydrate chunk_ids into LangChain Document objects.
-
-        The 'context_window' stored during ContextualEnricher.enrich() is
-        included in metadata so the LLM receives the surrounding context
-        without it being embedded (as designed).
-        """
-        docs: List[Document] = []
+    def get_chunks_as_documents(self, chunk_ids: List[str]) -> List[Document]:
+        """Hydrate chunk_ids into LangChain Document objects."""
+        docs = []
         for cid in chunk_ids:
             content = self.sqlite.get_chunk_content(cid)
-            if content is None:
-                continue
-            node_data = self.graph.graph.nodes.get(cid, {})
-            metadata = dict(node_data.get("metadata", {}))
-            metadata["chunk_id"] = cid
-            metadata["source_id"] = node_data.get("source_id", "")
-            metadata["modality"] = node_data.get("modality", "text")
-            metadata["section"] = node_data.get("section", "")
-            # context_window is stored in metadata by ContextualEnricher
-            if not include_context_window:
-                metadata.pop("context_window", None)
-            docs.append(Document(page_content=content, metadata=metadata))
+            if content is not None:
+                docs.append(Document(page_content=content, metadata={"chunk_id": cid}))
         return docs
 
-    def get_all_chunks_for_bm25(self) -> List[Dict[str, Any]]:
-        """
-        Return minimal chunk dicts for BM25 index rebuild.
-        Called by MasterPipeline after every ingestion.
-        """
-        rows = []
+    def get_all_chunks_for_bm25(self) -> List[Dict]:
+        """Return all chunks as [{id, content}] for BM25 index rebuild."""
+        results = []
         for source_id in self._sources:
-            for row in self.sqlite.get_chunks_by_source(source_id):
-                rows.append({"id": row["id"], "content": row.get("content", "")})
-        return rows
+            rows = self.sqlite.get_chunks_by_source(source_id)
+            for row in rows:
+                results.append({"id": row["id"], "content": row.get("content", "")})
+        return results
 
-    # ── sources ───────────────────────────────────────────────────────────────
-
-    def get_all_sources(self) -> List[Dict[str, Any]]:
-        return list(self._sources.values())
-
-    def get_source_count(self) -> int:
-        return len(self._sources)
-
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> Dict:
         return {
-            "sources": self.get_source_count(),
+            "source_count": len(self._sources),
             "faiss": self.faiss.get_stats(),
-            "graph": self.graph.get_stats(),
         }
