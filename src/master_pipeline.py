@@ -125,9 +125,8 @@ class MasterPipeline:
         # ── Ingestion ─────────────────────────────────────────────────────────
         self.file_detector  = FileDetector()
         self.preprocessor   = AdaptivePreprocessor()
-        self.embedder       = EmbeddingPipeline(
-            model_name=self.config.get("embedding.default_model", "all-MiniLM-L6-v2")
-        )
+        self._default_embed_model: str = self.config.get("embedding.default_model", "all-MiniLM-L6-v2")
+        self.embedder       = EmbeddingPipeline(model_name=self._default_embed_model)
         self.cross_modal_merger = CrossModalMerger(embedder=self.embedder.embedder)
         self.ingestion_graph    = IngestionGraph()
 
@@ -194,6 +193,8 @@ class MasterPipeline:
         file_path: Optional[str] = None,
         url: Optional[str] = None,
         source_type: Optional[str] = None,
+        chunking_strategy: Optional[str] = None,
+        embedding_model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Ingest a file or URL into the knowledge base.
@@ -272,16 +273,31 @@ class MasterPipeline:
 
         # ── Step 4: chunk ─────────────────────────────────────────────────────
         try:
-            chunker = ChunkerRegistry.get_chunker(resolved_type)
+            # Use user-selected strategy if provided, else default for source type
+            effective_strategy = chunking_strategy or resolved_type
+            chunker = ChunkerRegistry.get_chunker(effective_strategy)
             chunks  = chunker.chunk(preprocessed, source_id=source_id)
         except Exception as exc:
             self.ingestion_graph.mark_error(source_id, stage="chunk", error=str(exc))
             raise RuntimeError(f"Chunking failed: {exc}") from exc
         self.ingestion_graph.mark_stage(source_id, "chunk")
-
+        
         # ── Step 5: embed ─────────────────────────────────────────────────────
         try:
-            embedded_chunks = self.embedder.embed_chunks(chunks)
+            # Use user-selected embedding model if provided, else pipeline default
+            if embedding_model and embedding_model != self._embed_model:
+                from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
+                active_embedder = EmbeddingRegistry.get(embedding_model)
+                _probe = active_embedder.embed_query("probe")
+                active_dim   = int(_probe.shape[0])
+                active_model = embedding_model
+                logger.info("ingest: using user-selected embedder %s (dim=%d)", active_model, active_dim)
+            else:
+                active_embedder = self.embedder
+                active_dim      = self._embed_dim
+                active_model    = self._embed_model
+
+            embedded_chunks = active_embedder.embed_chunks(chunks)
         except Exception as exc:
             self.ingestion_graph.mark_error(source_id, stage="embed", error=str(exc))
             raise RuntimeError(f"Embedding failed: {exc}") from exc
@@ -306,8 +322,8 @@ class MasterPipeline:
             self.storage_manager.store(
                 source_record,
                 merged_chunks,
-                embedding_model=self._embed_model,
-                dim=self._embed_dim,
+                embedding_model=active_model,
+                dim=active_dim,
             )
         except Exception as exc:
             self.ingestion_graph.mark_error(source_id, stage="store", error=str(exc))
@@ -323,9 +339,12 @@ class MasterPipeline:
 
         self.ingestion_graph.mark_stage(source_id, "complete")
         return {
-            "source_id":  source_id,
-            "num_chunks": len(merged_chunks),
-            "profile":    result.get("profile"),
+            "source_id":         source_id,
+            "num_chunks":        len(merged_chunks),
+            "profile":           result.get("profile"),
+            "chunking_strategy": effective_strategy,
+            "embedding_model":   active_model,
+            "embedding_dim":     active_dim,
         }
 
     # ── Generation ────────────────────────────────────────────────────────────
