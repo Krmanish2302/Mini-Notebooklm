@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.master_pipeline import MasterPipeline
+from src.generation.persona_config import PersonaConfig
 
 # ── app ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Mini NotebookLM API", version="1.0.0")
@@ -39,6 +40,9 @@ app.add_middleware(
 # ── global pipeline singleton ─────────────────────────────────────────────────
 pipeline: MasterPipeline = MasterPipeline(mode="chat")
 
+# ── global persona config (Chat mode only — Study/Research use fixed personas) ─
+_persona_config: PersonaConfig = PersonaConfig()   # default: sagan / neutral / medium
+
 UPLOAD_DIR = Path("data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -52,7 +56,7 @@ EMBEDDING_MODELS = [
 ]
 
 
-# ── request models ────────────────────────────────────────────────────────────
+# ── request / response models ─────────────────────────────────────────────────
 class ConfigRequest(BaseModel):
     provider: str = "groq"
     model: str = "llama-3.3-70b-versatile"
@@ -67,6 +71,18 @@ class QueryRequest(BaseModel):
 
 class ModeRequest(BaseModel):
     mode: str
+
+
+class PersonaRequest(BaseModel):
+    """
+    All fields optional — only the provided fields are updated.
+    Send {} to reset to defaults.
+    """
+    persona:        Optional[str] = None
+    tone:           Optional[str] = None
+    length:         Optional[str] = None
+    custom_persona: Optional[str] = None
+    reset:          bool = False   # set True to restore sagan/neutral/medium
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -122,6 +138,58 @@ def set_mode(req: ModeRequest):
     pipeline.mode = internal_mode
     return {"mode": req.mode, "internal": internal_mode}
 
+
+# ── Persona endpoints ─────────────────────────────────────────────────────────
+
+@app.get("/api/persona")
+def get_persona():
+    """
+    Return the current persona config + the full catalogue of available
+    options (for building the UI dropdowns).
+    """
+    return {
+        "current": _persona_config.to_dict(),
+        "catalogue": PersonaConfig.catalogue(),
+    }
+
+
+@app.post("/api/persona")
+def set_persona(req: PersonaRequest):
+    """
+    Update persona settings for Chat mode.
+    Partial updates are supported — only sent fields are changed.
+    Set `reset: true` to restore defaults.
+    """
+    global _persona_config
+    try:
+        if req.reset:
+            _persona_config = PersonaConfig()
+            return {"status": "reset", "current": _persona_config.to_dict()}
+
+        # Merge: start from current values, apply only what was sent
+        new_persona        = req.persona        or _persona_config.persona
+        new_tone           = req.tone           or _persona_config.tone
+        new_length         = req.length         or _persona_config.length
+        new_custom_persona = req.custom_persona or _persona_config.custom_persona
+
+        _persona_config = PersonaConfig(
+            persona=new_persona,
+            tone=new_tone,
+            length=new_length,
+            custom_persona=new_custom_persona,
+        )
+        # Inject updated config into pipeline prompt builder
+        if hasattr(pipeline, "prompt_builder") and pipeline.prompt_builder:
+            pipeline.prompt_builder.persona_config = _persona_config
+
+        return {"status": "updated", "current": _persona_config.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Analyze / Ingest ──────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
 async def analyze_source(
@@ -277,11 +345,16 @@ def delete_source(source_id: str):
 async def query(req: QueryRequest):
     """
     Non-streaming query. Returns full response + citations + retrieved chunks.
+    Passes the current persona config to the pipeline for Chat mode.
     """
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: pipeline.generate(req.query, stream=False),
+            lambda: pipeline.generate(
+                req.query,
+                stream=False,
+                persona_config=_persona_config if req.mode == "chat" else None,
+            ),
         )
         return result
     except Exception as e:
@@ -303,7 +376,11 @@ async def query_stream(req: QueryRequest):
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None,
-                lambda: pipeline.generate(req.query, stream=True),
+                lambda: pipeline.generate(
+                    req.query,
+                    stream=True,
+                    persona_config=_persona_config if req.mode == "chat" else None,
+                ),
             )
 
             if hasattr(result, "__iter__") and not isinstance(result, dict):
