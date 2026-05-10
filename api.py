@@ -5,7 +5,6 @@ Run with:  uvicorn api:app --reload --port 8000
 """
 
 import os
-import uuid
 import asyncio
 import tempfile
 import json
@@ -42,6 +41,15 @@ pipeline: MasterPipeline = MasterPipeline(mode="chat")
 
 UPLOAD_DIR = Path("data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── embedding model catalogue (single source of truth) ────────────────────────
+EMBEDDING_MODELS = [
+    {"name": "all-MiniLM-L6-v2",      "dim": 384,  "max_tokens": 256,  "label": "MiniLM",   "speed": "fast",   "note": "Local · fastest"},
+    {"name": "all-mpnet-base-v2",      "dim": 768,  "max_tokens": 384,  "label": "MPNet",    "speed": "medium", "note": "Local · balanced"},
+    {"name": "e5-large-v2",            "dim": 1024, "max_tokens": 512,  "label": "E5-Large", "speed": "slow",   "note": "Local · most accurate"},
+    {"name": "text-embedding-3-small", "dim": 1536, "max_tokens": 8191, "label": "OAI Small","speed": "fast",   "note": "OpenAI API key required"},
+    {"name": "text-embedding-3-large", "dim": 3072, "max_tokens": 8191, "label": "OAI Large","speed": "medium", "note": "OpenAI API key required"},
+]
 
 
 # ── request models ────────────────────────────────────────────────────────────
@@ -122,7 +130,8 @@ async def analyze_source(
     source_type: str = Form("pdf"),
 ):
     """
-    Pre-ingest analysis: returns chunking recommendation + chunk previews.
+    Pre-ingest analysis: returns chunking recommendation + chunk previews
+    + per-strategy token stats + embedding model catalogue.
     Feeds the EmbedFlow component in the sidebar.
     """
     try:
@@ -157,18 +166,26 @@ async def analyze_source(
         ]
 
         return {
-            "source_name": source_name,
-            "source_type": source_type,
+            "source_name":          source_name,
+            "source_type":          source_type,
             "recommended_strategy": recommended,
             "available_strategies": STRATEGIES,
             "chunk_count_estimate": len(chunks),
-            "analysis": analysis,
-            "previews": previews,
+            "analysis":             analysis,
+            "previews":             previews,
+            "token_stats":          analysis.get("token_stats", {}),
+            "embedding_models":     EMBEDDING_MODELS,
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/embedding-models")
+def list_embedding_models():
+    """Return available embedding models with token limits and dims for the UI model picker."""
+    return {"models": EMBEDDING_MODELS}
 
 
 @app.post("/api/ingest")
@@ -181,6 +198,7 @@ async def ingest_source(
 ):
     """
     Full ingest: file or URL → pipeline → FAISS + KG + SQLite.
+    chunking_strategy and embedding_model are forwarded to the pipeline.
     Returns source metadata when done.
     """
     tmp_path = None
@@ -199,6 +217,8 @@ async def ingest_source(
                     file_path=tmp_path,
                     url=None,
                     source_type=source_type,
+                    chunking_strategy=chunking_strategy,
+                    embedding_model=embedding_model,
                 ),
             )
         elif url:
@@ -208,6 +228,8 @@ async def ingest_source(
                     file_path=None,
                     url=url,
                     source_type=source_type,
+                    chunking_strategy=chunking_strategy,
+                    embedding_model=embedding_model,
                 ),
             )
         else:
