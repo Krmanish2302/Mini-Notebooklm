@@ -268,13 +268,20 @@ const DEFAULT_EMB_MODELS = [
   {id:"text-embedding-3-large",name:"text-embedding-3-large",dim:3072,tokens:8191,note:"OpenAI API key required"},
 ];
 
+// All 5 chunking strategies are selectable by the user.
+// Only sentence / paragraph / page show token stats in the table
+// (recursive, semantic, hierarchical don't expose per-unit stats by design).
 const CHUNKERS = [
-  {id:"paragraph",   label:"Paragraph"},
-  {id:"page",        label:"Page"},
-  {id:"recursive",   label:"Recursive"},
-  {id:"semantic",    label:"Semantic"},
+  {id:"semantic",    label:"Semantic"},    // default — listed first
+  {id:"paragraph",  label:"Paragraph"},
+  {id:"page",       label:"Page"},
+  {id:"recursive",  label:"Recursive"},
   {id:"hierarchical",label:"Hierarchical"},
 ];
+
+// Keys from token_stats that we actually render in the table.
+// recursive / semantic / hierarchical are intentionally excluded.
+const TOKEN_STAT_KEYS = ["sentence", "paragraph", "page"];
 
 // Fallback static estimates used only when /api/analyze is unavailable
 const CHUNK_EST = {paragraph:47,page:12,recursive:39,hierarchical:28,semantic:31};
@@ -351,8 +358,10 @@ function EmbedFlow({pendingSources, chunker, setChunker, embModel, setEmbModel, 
 
   const emb = embModels.find(e => e.id === embModel) || embModels[0];
 
-  // Use real per-strategy stats if available, else fall back to static estimate
-  const strat      = analysisData?.[chunker];
+  // Use real per-strategy stats if available, else fall back to static estimate.
+  // For the chunk count estimate we prefer paragraph stats when available,
+  // then fall back to the CHUNK_EST map.
+  const strat      = analysisData?.[chunker] ?? analysisData?.["paragraph"];
   const totalChunks = strat ? strat.total_chunks ?? strat.count ?? 0
                             : (CHUNK_EST[chunker] || 0) * pendingSources.length;
   const totalTokens = totalChunks * (emb?.tokens || 256);
@@ -400,6 +409,15 @@ function EmbedFlow({pendingSources, chunker, setChunker, embModel, setEmbModel, 
 
   if (pendingSources.length === 0) return null;
 
+  // Build the token table rows: only sentence / paragraph / page.
+  // We filter against TOKEN_STAT_KEYS so any extra keys the backend
+  // returns in future don't accidentally appear here.
+  const tokenTableRows = analysisData
+    ? TOKEN_STAT_KEYS
+        .filter(key => analysisData[key])
+        .map(key => ({ key, ...analysisData[key] }))
+    : [];
+
   return (
     <div style={{marginTop:10,background:"var(--bg)",border:"1px solid var(--border2)",borderRadius:10,padding:12}}>
       <div className="sb-label">Queued Sources</div>
@@ -421,7 +439,10 @@ function EmbedFlow({pendingSources, chunker, setChunker, embModel, setEmbModel, 
       <div className="chip-row">
         {CHUNKERS.map(c => (
           <button key={c.id} className={`chip${chunker===c.id?" active":""}`}
-            disabled={phase !== "idle"} onClick={() => setChunker(c.id)}>{c.label}</button>
+            disabled={phase !== "idle"} onClick={() => setChunker(c.id)}>
+            {c.label}
+            {c.id === "semantic" && <span style={{fontSize:8,marginLeft:3,opacity:.6}}>default</span>}
+          </button>
         ))}
       </div>
 
@@ -433,25 +454,30 @@ function EmbedFlow({pendingSources, chunker, setChunker, embModel, setEmbModel, 
         </div>
       )}
 
-      {/* Real per-strategy token table from /api/analyze → token_stats */}
-      {analysisData && !analyzing && (
-        <div className="token-table">
-          <div className="token-table-hdr">
-            <span>Strategy</span><span>Avg tok</span>
-            <span style={{color:"var(--green)"}}>Min</span>
-            <span style={{color:"var(--amber)"}}>Max</span>
+      {/* Token stats table — only sentence / paragraph / page.
+          recursive / semantic / hierarchical are selectable above but
+          intentionally excluded from this table. */}
+      {tokenTableRows.length > 0 && !analyzing && (
+        <>
+          <div style={{fontFamily:"var(--font-mono)",fontSize:9,color:"var(--muted)",marginBottom:4,letterSpacing:".06em",textTransform:"uppercase"}}>
+            Token estimates per unit
           </div>
-          {Object.entries(analysisData).map(([key, val]) => (
-            <div key={key}
-              className={`token-table-row${chunker===key?" active-row":""}`}
-              onClick={() => phase==="idle" && setChunker(key)}>
-              <span style={{textTransform:"capitalize",fontWeight:chunker===key?700:400}}>{key}</span>
-              <span>{val.avg}</span>
-              <span style={{color:"var(--green)"}}>{val.min}</span>
-              <span style={{color:"var(--amber)"}}>{val.max}</span>
+          <div className="token-table">
+            <div className="token-table-hdr">
+              <span>Granularity</span><span>Avg tok</span>
+              <span style={{color:"var(--green)"}}>Min</span>
+              <span style={{color:"var(--amber)"}}>Max</span>
             </div>
-          ))}
-        </div>
+            {tokenTableRows.map(({key, avg, min, max}) => (
+              <div key={key} className="token-table-row">
+                <span style={{textTransform:"capitalize"}}>{key}</span>
+                <span>{avg}</span>
+                <span style={{color:"var(--green)"}}>{min}</span>
+                <span style={{color:"var(--amber)"}}>{max}</span>
+              </div>
+            ))}
+          </div>
+        </>
       )}
 
       {/* Preview summary */}
@@ -523,11 +549,13 @@ export default function App() {
   const [webUrl, setWebUrl]                 = useState("");
   const [pasteText, setPasteText]           = useState("");
   const fileRef = useRef(null);
-  const [chunker, setChunker]   = useState("hierarchical");
+  // Default chunking strategy is semantic
+  const [chunker, setChunker]   = useState("semantic");
   const [embModel, setEmbModel] = useState("all-MiniLM-L6-v2");
   const [embModels, setEmbModels] = useState(DEFAULT_EMB_MODELS);
 
-  // Real per-strategy token analysis from /api/analyze → token_stats key
+  // Real per-strategy token analysis from /api/analyze → token_stats key.
+  // Only sentence / paragraph / page keys are displayed; others are excluded.
   const [analysisData, setAnalysisData] = useState(null);
   const [analyzing, setAnalyzing]       = useState(false);
 
@@ -675,10 +703,6 @@ export default function App() {
   };
 
   // ── URL source (YouTube / Website): queue + fire /api/analyze (JSON) ─────────
-  // FIX: URL sources previously never triggered /api/analyze, so the token
-  // table was always hidden for YouTube and website sources. Now we POST
-  // {url, source_type} as JSON — the backend fetches/extracts the text and
-  // runs ContentAnalyzer on it, returning the same token_stats shape.
   const analyzeUrl = async (url, sourceType) => {
     setAnalyzing(true);
     setAnalysisData(null);
@@ -691,8 +715,6 @@ export default function App() {
       if (!res.ok) throw new Error(`analyze ${res.status}`);
       applyAnalysis(await res.json());
     } catch (err) {
-      // Non-fatal: backend may not have fetched the URL yet.
-      // The token table simply stays hidden; user can still embed.
       console.warn("analyze url fallback:", err.message);
       setAnalysisData(null);
     } finally {
@@ -730,7 +752,6 @@ export default function App() {
     analyzeFile(f);
   };
 
-  // FIX: call analyzeUrl after queuing so token table appears for URL sources
   const addUrl = () => {
     const url  = ingestTab==="yt" ? ytUrl : webUrl;
     if (!url.trim()) return;
@@ -741,20 +762,19 @@ export default function App() {
     }]);
     ingestTab==="yt" ? setYtUrl("") : setWebUrl("");
     showToast("Source queued — analysing…");
-    analyzeUrl(url, type);           // ← FIX
+    analyzeUrl(url, type);
   };
 
-  // FIX: call analyzeText after queuing so token table appears for pasted text
   const addPaste = () => {
     if (!pasteText.trim()) return;
-    const snapshot = pasteText;      // capture before clearing
+    const snapshot = pasteText;
     setPendingSources(p => [...p, {
       id:`src_${Date.now()}`,type:"text",name:"Pasted text",
       chunks:0,vectors:0,embModel,status:"pending",_text:snapshot,
     }]);
     setPasteText("");
     showToast("Text queued — analysing…");
-    analyzeText(snapshot);           // ← FIX
+    analyzeText(snapshot);
   };
 
   const handleEmbedDone = (emb, chk, count, errMsg) => {
