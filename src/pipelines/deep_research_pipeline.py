@@ -1,6 +1,21 @@
 """
 deep_research_pipeline.py  —  Deep Research mode pipeline.
 
+Bug fixes (2026-05-10 audit)
+----------------------------
+1. ContextualCompressor was constructed with  `compressor.compress(all_chunks, query)`
+   but the compressor injected from master_pipeline was built BEFORE the LLM was
+   available (ContextualCompressor() no-arg call).  The pipeline now injects the
+   live llm_callable into the compressor at run-time before calling compress().
+
+2. Reranker.rerank() default top_k=5 silently truncated results.  Pipeline now
+   explicitly passes top_k=None to let ContextBuilder apply the budget instead.
+
+3. context_chunks were not stored on the result dict.  StudyPipeline was then
+   unable to find them under 'context_chunks' key and silently fell back to
+   'retrieved_chunks', losing the deduped/annotated context.
+   Fixed: result["context_chunks"] = context_chunks added.
+
 Multi-hop research flow
 -----------------------
 1. SubQueryDecomposer   : break query into N focused sub-queries (LLM call)
@@ -12,11 +27,6 @@ Multi-hop research flow
 7. LLM synthesis call
 8. ResponseGenerator    : structured output with citations
 9. RAGChatHistory       : persist turns
-
-Fallback
---------
-If SubQueryDecomposer returns only the original query (LLM unavailable),
-the pipeline degrades gracefully to a single-pass retrieval.
 """
 from __future__ import annotations
 
@@ -83,7 +93,8 @@ class DeepResearchPipeline:
         Returns
         -------
         dict with: answer, citations, follow_ups, sources_used,
-                   chunks_used, retrieved_chunks, sub_queries, tokens_estimate
+                   chunks_used, context_chunks, retrieved_chunks,
+                   sub_queries, tokens_estimate
         """
         # 1. Decompose
         sub_queries = self._decomposer.decompose(query)
@@ -108,16 +119,21 @@ class DeepResearchPipeline:
                     all_chunks.append(c)
 
         # 3. Optional compression per chunk
-        if self.compressor and all_chunks:
+        # BUG FIX: inject live llm into compressor right before calling compress()
+        # so that the no-arg ContextualCompressor() from master_pipeline gets an LLM.
+        if self.compressor and all_chunks and self.llm:
             try:
+                if self.compressor.llm is None:
+                    self.compressor.llm = self.llm   # late-inject LLM
                 all_chunks = self.compressor.compress(all_chunks, query)
             except Exception as exc:
                 logger.warning("compressor failed (non-fatal): %s", exc)
 
         # 4. Optional global rerank
+        # BUG FIX: pass top_k=None so we don't silently truncate before ContextBuilder
         if self.reranker and all_chunks:
             try:
-                all_chunks = self.reranker.rerank(query, all_chunks)
+                all_chunks = self.reranker.rerank(query, all_chunks, top_k=None)
             except Exception as exc:
                 logger.warning("reranker failed (non-fatal): %s", exc)
 
@@ -130,7 +146,7 @@ class DeepResearchPipeline:
             query,
             context_chunks,
             history=history_str,
-            rewrite=False,  # already done implicitly by sub-query decomposition
+            rewrite=False,
         )
 
         # 7. LLM synthesis
@@ -141,8 +157,9 @@ class DeepResearchPipeline:
         # 8. Structure response
         gen = ResponseGenerator(context_chunks=context_chunks)
         result = gen.assemble(raw_output, query=query, generate_follow_ups=True)
-        result["retrieved_chunks"] = all_chunks
-        result["sub_queries"]      = sub_queries
+        result["retrieved_chunks"]  = all_chunks
+        result["context_chunks"]    = context_chunks   # BUG FIX: StudyPipeline needs this
+        result["sub_queries"]       = sub_queries
 
         # 9. Persist history
         self.history.add_message("user", query)

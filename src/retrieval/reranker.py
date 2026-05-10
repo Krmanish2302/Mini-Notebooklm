@@ -1,3 +1,10 @@
+"""
+Reranker  —  cross-encoder reranker for Deep Research Mode.
+
+Bug fix (2026-05-10): rerank(query, chunks, top_k=5) had a fixed top_k default
+that silently truncated results when DeepResearchPipeline passed more chunks
+than 5.  Changed default to None (pass-through) so the caller decides.
+"""
 from typing import List, Dict, Any, Optional
 
 
@@ -23,9 +30,18 @@ class Reranker:
         self,
         query: str,
         chunks: List[Dict[str, Any]],
-        top_k: int = 5,
+        top_k: Optional[int] = None,   # BUG FIX: was hard-coded default=5
     ) -> List[Dict[str, Any]]:
-        """Rerank chunks by query relevance using the cross-encoder."""
+        """
+        Rerank chunks by query relevance using the cross-encoder.
+
+        Parameters
+        ----------
+        top_k : int or None
+                If None, return ALL chunks re-scored and sorted (no truncation).
+                DeepResearchPipeline sets this to None so ContextBuilder
+                receives the full ranked set for its own token-budget pass.
+        """
         if not chunks:
             return []
 
@@ -38,4 +54,4 @@ class Reranker:
             chunk["rerank_score"] = float(score)
 
         chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
-        return chunks[:top_k]
+        return chunks if top_k is None else chunks[:top_k]  # BUG FIX

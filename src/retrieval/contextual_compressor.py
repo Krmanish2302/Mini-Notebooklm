@@ -1,19 +1,15 @@
 """
 ContextualCompressor  —  used in Deep Research Mode (Step 4).
 
+Bug fix (2026-05-10): __init__ accepted `llm` as a REQUIRED positional arg.
+master_pipeline.py calls  `ContextualCompressor()`  with NO arguments
+(the llm is injected later via DeepResearchPipeline).  Changed llm to
+Optional with default None so the class can be constructed at startup
+without a live LLM, matching how master_pipeline uses it.
+
 For each retrieved chunk, asks the LLM to extract ONLY the sentences
 directly relevant to the query.  Chunks the LLM deems irrelevant are
 dropped entirely (return value: None).
-
-Token savings
--------------
-Typically reduces total chunk tokens by 40-60% before the reranker pass,
-which more than offsets the LLM call cost.
-
-Behaviour
----------
-* Chunks shorter than min_tokens pass through unchanged.
-* Falls back to original chunk if the LLM call fails.
 """
 from __future__ import annotations
 
@@ -29,13 +25,18 @@ class ContextualCompressor:
     """
     Parameters
     ----------
-    llm        : callable(prompt: str) -> str
+    llm        : optional callable(prompt: str) -> str
+                 If None the compressor passes every chunk through unchanged
+                 (safe no-op when LLM is not yet configured).
     min_tokens : int   chunks below this word count pass through unchanged (default 30)
     max_tokens : int   soft cap on output length (default 200 words)
     """
 
     def __init__(
-        self, llm: Callable[[str], str], min_tokens: int = 30, max_tokens: int = 200
+        self,
+        llm: Optional[Callable[[str], str]] = None,   # BUG FIX: was required positional
+        min_tokens: int = 30,
+        max_tokens: int = 200,
     ):
         self.llm = llm
         self.min_tokens = min_tokens
@@ -45,6 +46,9 @@ class ContextualCompressor:
         self, chunks: List[Dict[str, Any]], query: str
     ) -> List[Dict[str, Any]]:
         """Compress each chunk; drop irrelevant ones. Order preserved."""
+        if not self.llm:
+            # No LLM configured — pass-through (safe fallback)
+            return chunks
         return [r for r in (self._compress_one(c, query) for c in chunks) if r is not None]
 
     def _compress_one(
@@ -61,7 +65,7 @@ class ContextualCompressor:
             f"QUESTION: {query}\n\nPASSAGE:\n{content}\n\nRELEVANT SENTENCES:"
         )
         try:
-            compressed = self.llm(prompt).strip()
+            compressed = self.llm(prompt).strip()  # type: ignore[misc]
         except Exception as exc:
             logger.warning("ContextualCompressor LLM call failed: %s", exc)
             return chunk

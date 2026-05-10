@@ -1,3 +1,13 @@
+"""
+RAGChatHistory  —  vector-based chat history for all pipeline modes.
+
+Bug fix (2026-05-10 audit)
+--------------------------
+format_for_prompt() referenced  m["_history_source"]  but that key is only
+set by get_relevant_history().  If any code path called format_for_prompt()
+after add_message() without calling get_relevant_history() first, a KeyError
+would be raised.  Fixed by safe-getting the key with a default.
+"""
 from typing import List, Dict, Any, Optional
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -15,15 +25,9 @@ class RAGChatHistory:
         - last-2 messages unconditionally           (recency anchor)
       This keeps context tight (never > K+2 messages) while ensuring
       the model is never blind to the most recent turn.
-
-    Why in-memory (not a separate FAISS index)?
-    --------------------------------------------
-    Sessions are ephemeral.  Cosine-sim over 50-200 messages is < 1 ms.
-    A per-session FAISS index would add disk I/O for no measurable gain.
-    For cross-session long-term memory that's a separate feature (MemoryStore).
     """
 
-    RECENCY_ANCHOR = 2   # always include last N messages regardless of similarity
+    RECENCY_ANCHOR = 2
 
     def __init__(
         self,
@@ -35,13 +39,9 @@ class RAGChatHistory:
         self.embedder = SentenceTransformer(embedding_model)
         self._embeddings: List[np.ndarray] = []
 
-    # ------------------------------------------------------------------
-    # Write
-    # ------------------------------------------------------------------
-
     def add_message(
         self,
-        role: str,           # "user" | "assistant"
+        role: str,
         content: str,
         sources_used: Optional[List[str]] = None,
     ):
@@ -57,10 +57,6 @@ class RAGChatHistory:
         self.messages.append(msg)
         self._embeddings.append(self.embedder.encode(content, normalize_embeddings=True))
 
-    # ------------------------------------------------------------------
-    # Read — used by all three modes before building LLM prompt
-    # ------------------------------------------------------------------
-
     def get_relevant_history(
         self,
         query: str,
@@ -68,21 +64,15 @@ class RAGChatHistory:
     ) -> List[Dict[str, Any]]:
         """
         Returns up to k+RECENCY_ANCHOR messages, deduplicated.
-
-        Order: [RAG-retrieved (most-similar first)] + [recent anchor]
-        The caller formats these into the prompt.
+        Each returned dict gains a '_history_source' key: 'rag' | 'recency_anchor'.
         """
         if not self.messages:
             return []
 
         n = len(self.messages)
         query_emb = self.embedder.encode(query, normalize_embeddings=True)
-
-        # Cosine similarity (vectors are L2-normalised → just dot product)
         sims = np.array([float(np.dot(query_emb, e)) for e in self._embeddings])
 
-        # Exclude the very last RECENCY_ANCHOR messages from RAG pool
-        # (they are added unconditionally below)
         anchor_start = max(0, n - self.RECENCY_ANCHOR)
         rag_pool_mask = np.ones(n, dtype=bool)
         rag_pool_mask[anchor_start:] = False
@@ -91,12 +81,11 @@ class RAGChatHistory:
         if rag_pool_mask.any():
             pool_sims = sims.copy()
             pool_sims[~rag_pool_mask] = -999
-            top_k = min(k, rag_pool_mask.sum())
+            top_k = min(k, int(rag_pool_mask.sum()))
             rag_indices = list(np.argsort(pool_sims)[-top_k:][::-1])
 
         anchor_indices = list(range(anchor_start, n))
 
-        # Merge, deduplicate, preserve order (RAG then recency)
         seen = set()
         final: List[Dict[str, Any]] = []
         for idx in rag_indices + anchor_indices:
@@ -117,13 +106,11 @@ class RAGChatHistory:
             return ""
         lines = []
         for m in relevant:
-            tag = "[context]" if m["_history_source"] == "rag" else "[recent]"
+            # BUG FIX: safe-get _history_source in case it was not set
+            src = m.get("_history_source", "recency_anchor")
+            tag = "[context]" if src == "rag" else "[recent]"
             lines.append(f"{tag} {m['role'].upper()}: {m['content']}")
         return "\n".join(lines)
-
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
 
     def get_recent_messages(self, n: int = 10) -> List[Dict[str, Any]]:
         return self.messages[-n:]
