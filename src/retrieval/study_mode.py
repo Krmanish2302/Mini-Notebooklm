@@ -1,73 +1,87 @@
 from typing import List, Dict, Any
-import numpy as np
+
 
 class StudyModeRetriever:
     """
     Study Mode: Graph-Augmented Retrieval with Smart Fusion.
-    Combines broad retrieval (quality) + graph retrieval (relationships).
+
+    Combines:
+    - AdvancedRetriever  → broad, high-quality chunk retrieval
+    - GraphRetriever     → relationship-aware concept traversal
     """
-    
-    def __init__(self, advanced_retriever, graph_storage, graph_retriever):
+
+    def __init__(self, advanced_retriever, graph_retriever):
         self.advanced = advanced_retriever
-        self.graph_storage = graph_storage
         self.graph_retriever = graph_retriever
-    
-    def retrieve(self, query: str, query_embedding: np.ndarray) -> Dict[str, Any]:
+
+    def retrieve(self, query: str) -> Dict[str, Any]:
         """
-        Returns: {"chunks": List[Dict], "learning_path": List[Dict]}
+        Returns
+        -------
+        {
+            "chunks":        List[Dict]  — merged & de-duplicated chunks,
+            "learning_path": List[Dict]  — concept relationship steps for UI
+        }
         """
-        # Step 1: Broad retrieval (Advanced Pipeline)
-        broad_results = self.advanced.retrieve(query, query_embedding)
-        
-        # Step 2: Graph retrieval (find relationship paths)
-        graph_results = self.graph_retriever.find_related_concepts(query)
-        
-        # Step 3: Smart Fusion
+        # Step 1: Broad retrieval (AdvancedRetriever handles embedding internally)
+        broad_results = self.advanced.retrieve(query)
+
+        # Step 2: Graph retrieval (concept BFS traversal)
+        graph_results = self.graph_retriever.retrieve(query)
+
+        # Step 3: Smart fusion — quality first, relationships second
         final_chunks = self._smart_fusion(broad_results, graph_results)
-        
-        # Step 4: Extract learning path from graph
+
+        # Step 4: Extract learning path from graph results
         learning_path = self._extract_learning_path(graph_results)
-        
+
         return {
             "chunks": final_chunks,
-            "learning_path": learning_path
+            "learning_path": learning_path,
         }
-    
-    def _smart_fusion(self, broad: List[Dict], graph: List[Dict], max_chunks: int = 8) -> List[Dict]:
+
+    # ------------------------------------------------------------------
+    # Fusion helpers
+    # ------------------------------------------------------------------
+
+    def _smart_fusion(
+        self,
+        broad: List[Dict],
+        graph: List[Dict],
+        max_chunks: int = 8,
+    ) -> List[Dict]:
         """
-        Combine broad retrieval (quality) with graph (relationships).
-        Priority: Keep top broad results, add graph relationships.
+        Keep top-6 broad results (quality), then fill remaining slots with
+        unique graph results (relationships) up to max_chunks.
         """
-        seen = set()
-        final = []
-        
-        # Add top 6 from broad retrieval (quality first)
+        seen: set = set()
+        final: List[Dict] = []
+
         for chunk in broad[:6]:
-            cid = chunk["id"]
-            if cid not in seen:
+            cid = chunk.get("id")
+            if cid and cid not in seen:
                 seen.add(cid)
                 chunk["source"] = "broad"
                 final.append(chunk)
-        
-        # Add up to 3 from graph (relationships)
+
         for chunk in graph:
-            cid = chunk["id"]
-            if cid not in seen and len(final) < max_chunks:
+            cid = chunk.get("id")
+            if cid and cid not in seen and len(final) < max_chunks:
                 seen.add(cid)
                 chunk["source"] = "graph"
                 final.append(chunk)
-        
+
         return final
-    
+
     def _extract_learning_path(self, graph_results: List[Dict]) -> List[Dict]:
-        """Extract concept relationships for learning path display."""
+        """Extract concept hop sequences for the learning-path UI panel."""
         paths = []
         for result in graph_results:
-            if "path" in result:
+            if "path" in result and len(result["path"]) >= 2:
                 paths.append({
                     "from": result["path"][0],
                     "to": result["path"][-1],
                     "steps": result["path"],
-                    "relationship": result.get("relation", "related")
+                    "relationship": result.get("relation", "related"),
                 })
         return paths
