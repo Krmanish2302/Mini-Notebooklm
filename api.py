@@ -14,7 +14,7 @@ from typing import AsyncGenerator, Optional
 import nest_asyncio
 nest_asyncio.apply()
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -212,45 +212,89 @@ def set_persona(req: PersonaRequest):
 
 @app.post("/api/analyze")
 async def analyze_source(
+    request: Request,
     file: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None),
-    source_type: str = Form("pdf"),
 ):
     """
     Pre-ingest analysis: returns chunking recommendation + chunk previews
-    + per-strategy token stats + embedding model catalogue.
-    Feeds the EmbedFlow component in the sidebar.
+    + per-strategy token stats (sentence / paragraph / page only) + embedding
+    model catalogue.  Feeds the EmbedFlow component in the sidebar.
+
+    Accepts two content types:
+      1. multipart/form-data  — file upload (PDF, CSV, image …)
+         Fields: file (required), source_type (optional, default "pdf")
+      2. application/json     — URL or raw text
+         Body: { url?: string, text?: string, source_type?: string }
     """
     try:
         from src.ingestion.preprocessing.content_analyzer import ContentAnalyzer
         from src.ingestion.chunking.adaptive_chunker import AdaptiveChunker
 
-        analyzer = ContentAnalyzer()
+        analyzer  = ContentAnalyzer()
         STRATEGIES = ["recursive", "paragraph", "page", "semantic", "hierarchical"]
 
-        if file:
+        content_type = request.headers.get("content-type", "")
+
+        # ── Branch 1: JSON body (URL or pasted text) ──────────────────────────
+        if "application/json" in content_type:
+            body        = await request.json()
+            url         = body.get("url", "").strip()
+            text        = body.get("text", "").strip()
+            source_type = body.get("source_type", "text").lower().strip()
+
+            if url:
+                # Use the URL string itself as a lightweight stand-in.
+                # The full extraction happens at /api/ingest time; here we only
+                # need enough text to produce token estimates.  If a real
+                # fetcher is available on the pipeline we use it, otherwise
+                # fall back to the raw URL string so the endpoint never 422s.
+                try:
+                    fetched = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: pipeline.fetch_url_content(url),
+                    )
+                    source_content = fetched if fetched else url
+                except Exception:
+                    source_content = url
+                source_name = url
+            elif text:
+                source_content = text
+                source_name    = "pasted text"
+            else:
+                raise HTTPException(status_code=400, detail="Provide 'url' or 'text' in JSON body")
+
+        # ── Branch 2: multipart/form-data (file upload) ───────────────────────
+        else:
+            if not file:
+                raise HTTPException(status_code=400, detail="Provide a file (multipart) or JSON body with url/text")
+
+            # Read source_type from the multipart form
+            form_data   = await request.form()
+            source_type = str(form_data.get("source_type", "pdf")).lower().strip()
+
             suffix = Path(file.filename).suffix or ".tmp"
-            tmp = tempfile.NamedTemporaryFile(
+            tmp    = tempfile.NamedTemporaryFile(
                 delete=False, suffix=suffix, dir=str(UPLOAD_DIR)
             )
             tmp.write(await file.read())
             tmp.close()
             source_content = Path(tmp.name).read_text(errors="ignore")
-            source_name = file.filename
-        elif url:
-            source_content = url
-            source_name = url
-        else:
-            raise HTTPException(status_code=400, detail="Provide file or url")
+            source_name    = file.filename
 
-        analysis = analyzer.analyze(source_content, source_type=source_type)
-        chunker = AdaptiveChunker()
+        # ── Shared analysis logic ─────────────────────────────────────────────
+        analysis  = analyzer.analyze(source_content, source_type=source_type)
+        chunker   = AdaptiveChunker()
         recommended = chunker.recommend_strategy(source_content, source_type)
-        chunks = chunker.chunk(source_content, strategy=recommended)
-        previews = [
+        chunks    = chunker.chunk(source_content, strategy=recommended)
+        previews  = [
             {"index": i, "text": c.get("content", "")[:200]}
             for i, c in enumerate(chunks[:3])
         ]
+
+        # token_stats contains only sentence / paragraph / page — intentional.
+        # recursive / semantic / hierarchical are selectable strategies but
+        # do not produce per-unit stats in the UI table.
+        token_stats = analysis.get("token_stats", {})
 
         return {
             "source_name":          source_name,
@@ -260,7 +304,7 @@ async def analyze_source(
             "chunk_count_estimate": len(chunks),
             "analysis":             analysis,
             "previews":             previews,
-            "token_stats":          analysis.get("token_stats", {}),
+            "token_stats":          token_stats,
             "embedding_models":     EMBEDDING_MODELS,
         }
     except HTTPException:
