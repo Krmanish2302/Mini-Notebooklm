@@ -1,44 +1,60 @@
-from typing import List, Dict, Any, Optional
+"""
+prompt_builder.py  —  Mode-specific prompt construction.
+
+Persona (all modes)
+-------------------
+You're Carl Sagan if he were a chill classmate.
+Grounded strictly in the retrieved sources ("our notebook").
+Simple words, real-world analogies, poetic tone.
+Short-to-medium answers.  If it’s not in the notes — say so.
+
+Token philosophy
+----------------
+System prompts are kept intentionally short.  No redundant words.
+Grounding is enforced via a single clean rule block, not a paragraph.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+
+# ── Shared persona + grounding block (reused across all modes) ────────────
+_PERSONA = (
+    "You're Carl Sagan if he were a chill classmate. "
+    "Use simple words, real-world analogies, and a poetic touch. "
+    "Answer only from the SOURCES below. "
+    "If it’s not there, say: \"Not in my notes, bro.\""
+)
+
+# Grounding rules — minimal but airtight
+_GROUND = (
+    "Rules: "
+    "(1) Use ONLY the sources. "
+    "(2) Cite inline as [S1], [S2]… "
+    "(3) Never invent facts."
+)
 
 
 class PromptBuilder:
-    """Builds mode-specific prompts with citations and grounding.
+    """
+    Builds mode-specific prompts.
 
     Method name contract (must match master_pipeline.py dispatch table):
         build_chat_prompt(query, documents, history="")     -> str
         build_study_prompt(query, documents, history="")    -> str
         build_research_prompt(query, documents, history="") -> str
-
-    ``documents`` is a list of LangChain Document objects
-    (each has .page_content and .metadata).  The context_window
-    stored by ContextualEnricher is surfaced as
-    metadata["context_window"] and is appended to the LLM context
-    without being embedded.
     """
-
-    GROUNDING_INSTRUCTION = (
-        "CRITICAL INSTRUCTIONS:\n"
-        "- Answer using ONLY the provided sources below.\n"
-        "- Never make up information not in the sources.\n"
-        "- If the answer is not in the sources, say \"I don't have enough information\".\n"
-        "- Always cite sources using [SOURCE_X] format.\n"
-        "- Be concise but complete.\n"
-    )
 
     # ── Context formatting ────────────────────────────────────────────────────
 
     @staticmethod
     def format_context(documents: List[Any]) -> str:
-        """Format LangChain Documents into a numbered SOURCE block.
-
-        Includes context_window (surrounding sentences stored by
-        ContextualEnricher) as a secondary paragraph so the LLM has
-        richer surrounding context without it being embedded.
+        """
+        Format retrieved chunks into a compact numbered SOURCE block.
+        Appends context_window (from ContextualEnricher) when present.
         """
         parts: List[str] = []
         for i, doc in enumerate(documents, 1):
-            label = f"[SOURCE_{i}]"
-            # Accept both LangChain Documents and plain dicts
             if hasattr(doc, "page_content"):
                 content = doc.page_content
                 meta = doc.metadata or {}
@@ -46,21 +62,19 @@ class PromptBuilder:
                 content = doc.get("content", "")
                 meta = {k: v for k, v in doc.items() if k != "content"}
 
-            source_name = meta.get("source", meta.get("source_id", ""))
-            header = f"{label} (from: {source_name})" if source_name else label
-
+            src = meta.get("source", meta.get("source_id", ""))
+            header = f"[S{i}]{' — ' + src if src else ''}"
             block = f"{header}\n{content}"
 
-            # Append context_window if present — shown to LLM, not embedded
-            ctx_window = meta.get("context_window", "")
-            if ctx_window:
-                block += f"\n[SURROUNDING CONTEXT]\n{ctx_window}"
+            ctx = meta.get("context_window", "")
+            if ctx:
+                block += f"\n[context] {ctx}"
 
             parts.append(block)
 
         return "\n\n".join(parts)
 
-    # ── Prompt builders (names must match master_pipeline dispatch table) ─────
+    # ── Chat Mode ─────────────────────────────────────────────────────────
 
     @staticmethod
     def build_chat_prompt(
@@ -68,16 +82,22 @@ class PromptBuilder:
         documents: List[Any],
         history: str = "",
     ) -> str:
-        """Build prompt for Chat mode."""
-        context = PromptBuilder.format_context(documents)
-        history_block = f"CONVERSATION HISTORY:\n{history}\n\n" if history else ""
+        """
+        Chat mode — conversational, short-to-medium, strictly grounded.
+
+        System: Carl Sagan persona + grounding rules.
+        Keep answers concise — this is a quick back-and-forth, not a lecture.
+        """
+        ctx = PromptBuilder.format_context(documents)
+        hist = f"HISTORY:\n{history}\n\n" if history else ""
         return (
-            f"{PromptBuilder.GROUNDING_INSTRUCTION}\n"
-            f"{history_block}"
-            f"RELEVANT SOURCES:\n{context}\n\n"
-            f"USER QUESTION: {query}\n\n"
-            f"ANSWER (with citations):"
+            f"{_PERSONA}\n{_GROUND}\n\n"
+            f"{hist}"
+            f"SOURCES:\n{ctx}\n\n"
+            f"Q: {query}\nA:"
         )
+
+    # ── Study Mode ─────────────────────────────────────────────────────
 
     @staticmethod
     def build_study_prompt(
@@ -86,27 +106,31 @@ class PromptBuilder:
         history: str = "",
         learning_path: Optional[List[Dict]] = None,
     ) -> str:
-        """Build prompt for Study mode."""
-        context = PromptBuilder.format_context(documents)
-        history_block = f"CONVERSATION HISTORY:\n{history}\n\n" if history else ""
+        """
+        Study mode — teach the concept clearly, show connections,
+        use analogies.  Slightly longer than Chat but still tight.
+        """
+        ctx = PromptBuilder.format_context(documents)
+        hist = f"HISTORY:\n{history}\n\n" if history else ""
 
         path_block = ""
         if learning_path:
-            steps = "\n".join(
-                f"{i+1}. {s.get('from','')} → {s.get('to','')} ({s.get('relationship','related')})"
-                for i, s in enumerate(learning_path[:5])
+            steps = " → ".join(
+                f"{s.get('from', '')} ➔ {s.get('to', '')}"
+                for s in learning_path[:4]
             )
-            path_block = f"LEARNING PATH:\n{steps}\n\n"
+            path_block = f"CONCEPT PATH: {steps}\n\n"
 
         return (
-            f"{PromptBuilder.GROUNDING_INSTRUCTION}\n"
-            f"You are in Study Mode. Explain concepts clearly and show relationships.\n\n"
+            f"{_PERSONA} You’re in teacher mode — build intuition, show how ideas connect.\n"
+            f"{_GROUND}\n\n"
             f"{path_block}"
-            f"{history_block}"
-            f"RELEVANT SOURCES:\n{context}\n\n"
-            f"USER QUESTION: {query}\n\n"
-            f"EDUCATIONAL ANSWER (with citations and concept connections):"
+            f"{hist}"
+            f"SOURCES:\n{ctx}\n\n"
+            f"TOPIC: {query}\nEXPLAIN:"
         )
+
+    # ── Deep Research Mode ─────────────────────────────────────────────
 
     @staticmethod
     def build_research_prompt(
@@ -114,27 +138,26 @@ class PromptBuilder:
         documents: List[Any],
         history: str = "",
     ) -> str:
-        """Build prompt for Deep Research mode."""
-        context = PromptBuilder.format_context(documents)
-        history_block = f"CONVERSATION HISTORY:\n{history}\n\n" if history else ""
+        """
+        Deep Research mode — thorough, structured, cited.
+        Still Carl Sagan — wonder + precision, not dry academia.
+        """
+        ctx = PromptBuilder.format_context(documents)
+        hist = f"HISTORY:\n{history}\n\n" if history else ""
         return (
-            f"{PromptBuilder.GROUNDING_INSTRUCTION}\n"
-            f"You are in Deep Research mode. Provide a comprehensive, well-structured answer.\n\n"
-            f"{history_block}"
-            f"RELEVANT SOURCES (ranked by relevance):\n{context}\n\n"
-            f"USER QUESTION: {query}\n\n"
-            f"DETAILED ANSWER (with citations and analysis):"
+            f"{_PERSONA} Go deep — structured, thorough, cite everything.\n"
+            f"{_GROUND}\n\n"
+            f"{hist}"
+            f"SOURCES:\n{ctx}\n\n"
+            f"RESEARCH Q: {query}\nDETAILED ANSWER:"
         )
 
-    # ── Backward-compat alias kept for any code still calling the old names ───
+    # ── Backward-compat aliases ───────────────────────────────────────
 
     @staticmethod
     def build_deep_research_prompt(
-        query: str,
-        documents: List[Any],
-        history: str = "",
+        query: str, documents: List[Any], history: str = ""
     ) -> str:
-        """Alias → build_research_prompt."""
         return PromptBuilder.build_research_prompt(query, documents, history)
 
     @staticmethod
@@ -144,5 +167,4 @@ class PromptBuilder:
         learning_path: Optional[List[Dict]] = None,
         history: str = "",
     ) -> str:
-        """Alias → build_study_prompt."""
         return PromptBuilder.build_study_prompt(query, documents, history, learning_path)

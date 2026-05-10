@@ -1,26 +1,11 @@
 """
 study_mode_pipeline.py  —  Study Mode Pipeline
 
-Study Mode is designed for learning from ingested documents.  Unlike Chat
-(answer fast) or Deep Research (answer thoroughly), Study Mode structures
-the retrieved knowledge into active learning artifacts:
+Retrieval: Hybrid → compress → rerank → graph-augment.
+Generation: flashcards + MCQ quiz + study summary.
 
-    flashcards, quiz questions, concept maps, and a learning path.
-
-Retrieval strategy
-------------------
-* Step 1 : Hybrid retrieval (Dense ALL-dims + BM25 + RRF) — same as deep
-           research but with a wider top_k to maximise coverage.
-* Step 2 : Contextual compression — trim irrelevant sentences per chunk.
-* Step 3 : Cross-encoder rerank + score threshold — surface the most
-           pedagogically relevant chunks.
-* Step 4 : Graph augmentation (StudyModeRetriever) — add concept-relationship
-           hops from the KnowledgeGraph for a richer learning path.
-* Step 5 : Flashcard generation — LLM generates Q&A pairs from top chunks.
-* Step 6 : Quiz generation — LLM generates MCQ questions from top chunks.
-* Step 7 : Summary generation — concise study summary for the retrieved context.
-
-All generation steps are optional; pass generate_flashcards=False etc. to skip.
+Persona: Carl Sagan as a chill classmate. Build intuition, show connections.
+Strictly grounded in retrieved sources.
 """
 from __future__ import annotations
 
@@ -29,62 +14,60 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── Shared persona string ──────────────────────────────────────────────────
+_PERSONA_STUDY = (
+    "You're Carl Sagan if he were a chill classmate in teacher mode. "
+    "Build intuition, use analogies, show how ideas connect. "
+    "Use ONLY the sources. Cite as [S1], [S2]… "
+    "If it’s not there, say: 'Not in my notes, bro.'"
+)
 
-# ── Flashcard / Quiz helpers ───────────────────────────────────────────────────
-
+# ── Generation prompts (short + precise) ───────────────────────────────
 _FLASHCARD_PROMPT = """\
-You are a study assistant.  From the CONTEXT below, generate {n} concise flashcards.
-Each flashcard must have:
-  FRONT: a short question or term
-  BACK:  a clear, accurate answer (1-3 sentences)
+{persona}
+From the SOURCES, generate {n} flashcards. Only use what's in the sources.
 
-Output ONLY the flashcards in this exact format, one per block:
-FRONT: <question>
-BACK: <answer>
+Format (repeat exactly):
+FRONT: <question or term>
+BACK: <answer, 1-3 sentences>
 
-CONTEXT:
+SOURCES:
 {context}
 """
 
 _QUIZ_PROMPT = """\
-You are a study assistant.  From the CONTEXT below, generate {n} multiple-choice
-questions to test understanding.  Each question must have 4 options (A-D) with
-exactly one correct answer.
+{persona}
+From the SOURCES, generate {n} multiple-choice questions. Only use what's in the sources.
 
-Output ONLY the questions in this exact format:
-Q: <question text>
-A) <option>
-B) <option>
-C) <option>
-D) <option>
-ANSWER: <correct letter>
+Format (repeat exactly):
+Q: <question>
+A) <option>  B) <option>  C) <option>  D) <option>
+ANSWER: <letter>
 
-CONTEXT:
+SOURCES:
 {context}
 """
 
 _SUMMARY_PROMPT = """\
-You are a study assistant.  Summarise the CONTEXT below into a clear, structured
-study note (bullet points preferred).  Focus on key concepts, definitions, and
-relationships.  Keep it under 300 words.
+{persona}
+Summarise the SOURCES into a concise study note (bullet points, max 250 words).
+Focus on key concepts, definitions, and relationships. Only what's in the sources.
 
-CONTEXT:
+SOURCES:
 {context}
 
-STUDY SUMMARY:
+STUDY NOTE:
 """
 
 
 def _parse_flashcards(raw: str) -> List[Dict[str, str]]:
-    """Parse LLM flashcard output into [{front, back}, ...] list."""
-    cards = []
-    front = back = None
+    cards, front, back = [], None, None
     for line in raw.strip().splitlines():
         line = line.strip()
         if line.startswith("FRONT:"):
-            front = line[len("FRONT:"):].strip()
+            front = line[6:].strip()
         elif line.startswith("BACK:"):
-            back = line[len("BACK:"):].strip()
+            back = line[5:].strip()
             if front and back:
                 cards.append({"front": front, "back": back})
                 front = back = None
@@ -92,44 +75,38 @@ def _parse_flashcards(raw: str) -> List[Dict[str, str]]:
 
 
 def _parse_quiz(raw: str) -> List[Dict[str, Any]]:
-    """Parse LLM quiz output into [{question, options, answer}, ...] list."""
-    questions = []
-    current: Dict[str, Any] = {}
+    questions, current = [], {}
     for line in raw.strip().splitlines():
         line = line.strip()
         if line.startswith("Q:"):
             if current.get("question"):
                 questions.append(current)
             current = {"question": line[2:].strip(), "options": {}}
-        elif line[:2] in ("A)", "B)", "C)", "D)"):
-            current.setdefault("options", {})[line[0]] = line[3:].strip()
+        elif len(line) >= 2 and line[0] in "ABCD" and line[1] == ")":
+            current.setdefault("options", {})[line[0]] = line[2:].strip()
         elif line.startswith("ANSWER:"):
-            current["answer"] = line[len("ANSWER:"):].strip()
+            current["answer"] = line[7:].strip()
     if current.get("question"):
         questions.append(current)
     return questions
 
 
-# ── StudyModePipeline ─────────────────────────────────────────────────────────
-
 class StudyModePipeline:
     """
-    Entry point for Study Mode.
-
     Parameters
     ----------
-    hybrid_retriever     : HybridRetriever
-    contextual_compressor: ContextualCompressor
-    reranker             : Reranker  (BAAI/bge-reranker-base, lazy-loaded)
-    llm                  : callable(prompt: str) -> str
-    study_mode_retriever : StudyModeRetriever (graph augmentation, optional)
-    top_k                : base retrieval count before compression/rerank (default 12)
-    score_threshold      : drop reranked chunks below this score (default 0.0)
-    n_flashcards         : flashcards to generate per run (default 5)
-    n_quiz_questions     : MCQ questions to generate per run (default 5)
-    generate_flashcards  : bool (default True)
-    generate_quiz        : bool (default True)
-    generate_summary     : bool (default True)
+    hybrid_retriever      : HybridRetriever
+    contextual_compressor : ContextualCompressor
+    reranker              : Reranker
+    llm                   : callable(prompt) -> str
+    study_mode_retriever  : StudyModeRetriever | None  (graph augmentation)
+    top_k                 : retrieval count (default 12)
+    score_threshold       : rerank score floor (default 0.0)
+    n_flashcards          : flashcards per run (default 5)
+    n_quiz_questions      : MCQ questions per run (default 5)
+    generate_flashcards   : bool (default True)
+    generate_quiz         : bool (default True)
+    generate_summary      : bool (default True)
     """
 
     def __init__(
@@ -166,51 +143,26 @@ class StudyModePipeline:
         top_k: Optional[int] = None,
         score_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """
-        Full study mode turn.
-
-        Args:
-            query          : topic / concept the user wants to study
-            top_k          : override instance top_k for this turn
-            score_threshold: override instance score_threshold for this turn
-
-        Returns
-        -------
-        {
-          "chunks"       : List[Dict]  — final chunks passed to generation
-          "learning_path": List[Dict]  — concept hops from graph (if available)
-          "flashcards"   : List[Dict]  — [{front, back}, ...]
-          "quiz"         : List[Dict]  — [{question, options, answer}, ...]
-          "summary"      : str         — concise study note
-          "sources_used" : List[str]   — chunk ids used
-        }
-        """
         effective_top_k = top_k if top_k is not None else self.top_k
         effective_threshold = score_threshold if score_threshold is not None else self.score_threshold
 
-        # ── Step 1: Hybrid retrieval ──────────────────────────────────
-        # Wide initial fetch: top_k * 3 candidates for compression/rerank headroom
-        candidate_k = effective_top_k * 3
-        raw_chunks: List[Dict] = self.retriever.retrieve(query, top_k=candidate_k)
+        # Step 1: Hybrid retrieve (wide)
+        raw_chunks: List[Dict] = self.retriever.retrieve(query, top_k=effective_top_k * 3)
 
-        # ── Step 2: Contextual compression ───────────────────────────
-        # Strip each chunk to only the sentences relevant to the study topic.
+        # Step 2: Contextual compression
         try:
             compressed = self.compressor.compress(raw_chunks, query)
         except Exception as exc:
-            logger.warning("StudyMode[compress] failed, using raw chunks: %s", exc)
+            logger.warning("StudyMode[compress] fallback: %s", exc)
             compressed = raw_chunks
 
-        # ── Step 3: Cross-encoder rerank + score threshold ────────────
+        # Step 3: Rerank + threshold
         try:
             reranked = self.reranker.rerank(query, compressed, top_k=len(compressed))
-            reranked = [
-                c for c in reranked
-                if c.get("rerank_score", 1.0) >= effective_threshold
-            ]
+            reranked = [c for c in reranked if c.get("rerank_score", 1.0) >= effective_threshold]
             reranked = reranked[:effective_top_k]
         except Exception as exc:
-            logger.warning("StudyMode[rerank] failed, using compressed chunks: %s", exc)
+            logger.warning("StudyMode[rerank] fallback: %s", exc)
             reranked = compressed[:effective_top_k]
 
         logger.debug(
@@ -218,56 +170,61 @@ class StudyModePipeline:
             len(raw_chunks), len(compressed), len(reranked),
         )
 
-        # ── Step 4: Graph augmentation (optional) ─────────────────────
-        # StudyModeRetriever adds concept-relationship hops from the
-        # KnowledgeGraph — unique to study mode, gives a richer learning path.
+        # Step 4: Graph augmentation
         learning_path: List[Dict] = []
         if self.study_retriever is not None:
             try:
-                graph_result = self.study_retriever.retrieve(query)
-                # Merge unique graph chunks
-                seen_ids = {c["id"] for c in reranked if "id" in c}
-                for gc in graph_result.get("chunks", []):
-                    if gc.get("id") not in seen_ids:
+                gr = self.study_retriever.retrieve(query)
+                seen = {c["id"] for c in reranked if "id" in c}
+                for gc in gr.get("chunks", []):
+                    if gc.get("id") not in seen:
                         reranked.append(gc)
-                        seen_ids.add(gc["id"])
-                learning_path = graph_result.get("learning_path", [])
+                        seen.add(gc["id"])
+                learning_path = gr.get("learning_path", [])
             except Exception as exc:
-                logger.warning("StudyMode[graph_augment] failed: %s", exc)
+                logger.warning("StudyMode[graph_augment] fallback: %s", exc)
 
-        # Build context string for generation steps
-        context = "\n\n---\n\n".join(c["content"] for c in reranked if c.get("content"))
+        # Build compact source block [S1], [S2]…
+        context = "\n\n".join(
+            f"[S{i+1}] {c['content']}" for i, c in enumerate(reranked) if c.get("content")
+        )
         sources_used = [c["id"] for c in reranked if c.get("id")]
 
-        # ── Step 5: Flashcard generation ──────────────────────────────
+        # Step 5: Flashcards
         flashcards: List[Dict[str, str]] = []
         if self.do_flashcards and context:
             try:
                 raw = self.llm(
-                    _FLASHCARD_PROMPT.format(n=self.n_flashcards, context=context)
+                    _FLASHCARD_PROMPT.format(
+                        persona=_PERSONA_STUDY, n=self.n_flashcards, context=context
+                    )
                 )
                 flashcards = _parse_flashcards(raw)
             except Exception as exc:
-                logger.warning("StudyMode[flashcards] LLM call failed: %s", exc)
+                logger.warning("StudyMode[flashcards] fallback: %s", exc)
 
-        # ── Step 6: Quiz generation ────────────────────────────────────
+        # Step 6: Quiz
         quiz: List[Dict[str, Any]] = []
         if self.do_quiz and context:
             try:
                 raw = self.llm(
-                    _QUIZ_PROMPT.format(n=self.n_quiz_questions, context=context)
+                    _QUIZ_PROMPT.format(
+                        persona=_PERSONA_STUDY, n=self.n_quiz_questions, context=context
+                    )
                 )
                 quiz = _parse_quiz(raw)
             except Exception as exc:
-                logger.warning("StudyMode[quiz] LLM call failed: %s", exc)
+                logger.warning("StudyMode[quiz] fallback: %s", exc)
 
-        # ── Step 7: Study summary ──────────────────────────────────────
+        # Step 7: Summary
         summary = ""
         if self.do_summary and context:
             try:
-                summary = self.llm(_SUMMARY_PROMPT.format(context=context)).strip()
+                summary = self.llm(
+                    _SUMMARY_PROMPT.format(persona=_PERSONA_STUDY, context=context)
+                ).strip()
             except Exception as exc:
-                logger.warning("StudyMode[summary] LLM call failed: %s", exc)
+                logger.warning("StudyMode[summary] fallback: %s", exc)
 
         return {
             "chunks":        reranked,
