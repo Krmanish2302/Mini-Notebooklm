@@ -352,6 +352,15 @@ async def query(req: QueryRequest):
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
+            if any(v is not None for v in (req.temperature, req.top_p, req.max_tokens)):
+                if pipeline.llm:
+                    pipeline.llm.update_tuning(
+                        **{k: v for k, v in {
+                            "temperature": req.temperature,
+                            "top_p":       req.top_p,
+                            "max_tokens":  req.max_tokens,
+                        }.items() if v is not None}
+                    )
             lambda: pipeline.generate(
                 req.query,
                 stream=False,
