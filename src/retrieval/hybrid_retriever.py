@@ -4,20 +4,40 @@ from rank_bm25 import BM25Okapi
 
 
 class HybridRetriever:
-    """Combines FAISS (dense) + BM25 (sparse) with Reciprocal Rank Fusion."""
+    """
+    Core retriever used by ALL three modes.
+
+    Strategy
+    --------
+    1. Dense  : Search EVERY active FAISS index (one per embedding dim).
+                Each index was built with a different embedding model, so
+                we embed the query with ALL registered models and fire one
+                search per (dim, query_vector) pair — in parallel via a
+                simple loop (FAISS releases the GIL; add ThreadPoolExecutor
+                if you want true parallelism later).
+
+    2. Sparse : BM25Okapi over the tokenised corpus of all stored chunks
+                (built once after ingestion, rebuilt on source add/delete).
+
+    3. Fusion  : Reciprocal Rank Fusion across ALL dense results + sparse
+                 results.  RRF score = sum( weight / (k + rank) ) per chunk.
+                 dense_weight=0.7, sparse_weight=0.3 (tunable).
+
+    4. Hydrate : chunk_ids → full chunk dicts via StorageManager.
+    """
 
     def __init__(
         self,
-        faiss_store,
-        storage_manager=None,
-        dim: int = 768,
+        faiss_store,          # MultiFAISSStore — holds all dim-keyed indexes
+        storage_manager,      # StorageManager  — SQLite hydration
+        embedders: Dict[int, Any],  # {dim: SentenceTransformer | OpenAIEmbedder}
         top_k: int = 5,
         dense_weight: float = 0.7,
         sparse_weight: float = 0.3,
     ):
         self.faiss_store = faiss_store
-        self.storage_manager = storage_manager  # required for chunk hydration
-        self.dim = dim
+        self.storage_manager = storage_manager
+        self.embedders = embedders          # ALL active embedding models keyed by dim
         self.top_k = top_k
         self.dense_weight = dense_weight
         self.sparse_weight = sparse_weight
@@ -25,98 +45,127 @@ class HybridRetriever:
         self.corpus: List[List[str]] = []
         self.corpus_ids: List[str] = []
 
+    # ------------------------------------------------------------------
+    # Index maintenance
+    # ------------------------------------------------------------------
+
     def build_sparse_index(self, chunks: List[Dict[str, Any]]):
-        """Build BM25 index from chunks."""
+        """(Re)build BM25 index.  Call after every ingestion or deletion."""
         self.corpus = [c["content"].split() for c in chunks]
         self.corpus_ids = [c["id"] for c in chunks]
         self.bm25 = BM25Okapi(self.corpus)
 
+    # ------------------------------------------------------------------
+    # Main retrieval
+    # ------------------------------------------------------------------
+
     def retrieve(
         self,
         query: str,
-        query_embedding: np.ndarray,
-        dim: Optional[int] = None,
+        top_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve using dense + sparse methods and return fused results.
+        Full hybrid retrieval.
 
-        Args:
-            query:           Raw query string (used for BM25).
-            query_embedding: 1-D numpy array for the query.
-            dim:             Embedding dimension key.  Falls back to self.dim.
+        Steps
+        -----
+        1. Embed query with EVERY active model  → query_vectors {dim: vec}
+        2. Dense search on EVERY FAISS index    → dense_hits {dim: [(id,score)]}
+        3. BM25 search                          → sparse_hits [(id,score)]
+        4. RRF fusion over all hits
+        5. Hydrate top_k chunk_ids from SQLite
         """
-        embed_dim = dim if dim is not None else self.dim
+        k = top_k or self.top_k
+        fetch_k = k * 3   # over-fetch before fusion
 
-        # ── Dense retrieval ────────────────────────────────────────────────
-        # MultiFAISSStore.search() requires Dict[int, np.ndarray]
-        raw_dense = self.faiss_store.search(
-            query_vectors={embed_dim: query_embedding},
-            k=self.top_k * 2,
-        )
+        # ── Step 1 & 2 : Dense (all dims in parallel) ─────────────────────
+        query_vectors: Dict[int, np.ndarray] = {}
+        for dim, embedder in self.embedders.items():
+            query_vectors[dim] = embedder.encode(query)
+
+        raw_dense = self.faiss_store.search(query_vectors, k=fetch_k)
         # raw_dense → {dim: [(chunk_id, score), ...]}
-        dense_hits = raw_dense.get(embed_dim, [])
-        dense_results = [
-            {"chunk_id": cid, "score": score, "method": "dense"}
-            for cid, score in dense_hits
-        ]
 
-        # ── Sparse retrieval ───────────────────────────────────────────────
-        sparse_results = []
+        # Flatten: collect all (chunk_id, rank, weight) tuples for RRF
+        dense_ranked: List[Dict] = []
+        for dim, hits in raw_dense.items():
+            for rank, (cid, score) in enumerate(hits):
+                dense_ranked.append({"chunk_id": cid, "rank": rank,
+                                     "score": score, "dim": dim})
+
+        # ── Step 3 : Sparse ───────────────────────────────────────────────
+        sparse_ranked: List[Dict] = []
         if self.bm25:
-            tokenized = query.split()
-            scores = self.bm25.get_scores(tokenized)
-            top_indices = np.argsort(scores)[-(self.top_k * 2):][::-1]
-            for idx in top_indices:
+            scores = self.bm25.get_scores(query.split())
+            top_idx = np.argsort(scores)[-fetch_k:][::-1]
+            for rank, idx in enumerate(top_idx):
                 if scores[idx] > 0:
-                    sparse_results.append(
-                        {
-                            "chunk_id": self.corpus_ids[idx],
-                            "score": float(scores[idx]),
-                            "method": "sparse",
-                        }
-                    )
+                    sparse_ranked.append({"chunk_id": self.corpus_ids[idx],
+                                          "rank": rank, "score": float(scores[idx])})
 
-        # ── Reciprocal Rank Fusion ─────────────────────────────────────────
-        fused = self._reciprocal_rank_fusion(dense_results, sparse_results)
-        return fused[: self.top_k]
+        # ── Step 4 : RRF Fusion ───────────────────────────────────────────
+        fused = self._rrf_fuse(dense_ranked, sparse_ranked, k=60)
 
-    def _reciprocal_rank_fusion(
+        # ── Step 5 : Hydrate ─────────────────────────────────────────────
+        return self._hydrate(fused[:k])
+
+    # ------------------------------------------------------------------
+    # RRF
+    # ------------------------------------------------------------------
+
+    def _rrf_fuse(
         self,
         dense: List[Dict],
         sparse: List[Dict],
         k: int = 60,
     ) -> List[Dict]:
-        """RRF: score = sum(weight / (k + rank))"""
-        rrf_scores: Dict[str, float] = {}
+        """
+        RRF score = dense_weight/(k+rank_dense) + sparse_weight/(k+rank_sparse)
 
-        for rank, item in enumerate(dense):
-            cid = item.get("chunk_id", item.get("id"))
-            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + self.dense_weight / (k + rank + 1)
+        For dense hits from multiple dims we keep the BEST rank per chunk_id
+        across all dimensions (a chunk present in two indexes gets a bonus).
+        """
+        rrf: Dict[str, float] = {}
 
-        for rank, item in enumerate(sparse):
+        # Aggregate dense: best rank per chunk across all active dims
+        best_dense_rank: Dict[str, int] = {}
+        for item in dense:
             cid = item["chunk_id"]
-            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + self.sparse_weight / (k + rank + 1)
+            if cid not in best_dense_rank or item["rank"] < best_dense_rank[cid]:
+                best_dense_rank[cid] = item["rank"]
 
-        sorted_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        for cid, rank in best_dense_rank.items():
+            rrf[cid] = rrf.get(cid, 0.0) + self.dense_weight / (k + rank + 1)
 
-        # ── Hydrate chunk data via StorageManager ──────────────────────────
-        results: List[Dict] = []
-        for cid, score in sorted_ids:
-            if self.storage_manager is not None:
-                docs = self.storage_manager.get_chunks_as_documents([cid])
-                if docs:
-                    chunk = {
-                        "id": cid,
-                        "content": docs[0].page_content,
-                        **docs[0].metadata,
-                    }
-                else:
-                    chunk = {"id": cid}
+        # Aggregate sparse
+        for item in sparse:
+            cid = item["chunk_id"]
+            rrf[cid] = rrf.get(cid, 0.0) + self.sparse_weight / (k + item["rank"] + 1)
+
+        return [
+            {"chunk_id": cid, "rrf_score": score}
+            for cid, score in sorted(rrf.items(), key=lambda x: x[1], reverse=True)
+        ]
+
+    # ------------------------------------------------------------------
+    # Hydration
+    # ------------------------------------------------------------------
+
+    def _hydrate(self, fused: List[Dict]) -> List[Dict]:
+        """Resolve chunk_ids → full content dicts via StorageManager."""
+        results = []
+        for item in fused:
+            cid = item["chunk_id"]
+            docs = self.storage_manager.get_chunks_as_documents([cid])
+            if docs:
+                chunk = {
+                    "id": cid,
+                    "content": docs[0].page_content,
+                    **docs[0].metadata,
+                }
             else:
-                chunk = {"id": cid}
-
-            chunk["score"] = score
+                chunk = {"id": cid, "content": ""}
+            chunk["rrf_score"] = item["rrf_score"]
             chunk["retrieval_method"] = "hybrid"
             results.append(chunk)
-
         return results
