@@ -159,6 +159,9 @@ class MasterPipeline:
         # Response cache for repeated queries (same mode + query text)
         self._response_cache: Dict[str, str] = {}
 
+        # Warm up EmbeddingRegistry for all persisted FAISS dims 
+        self._warmup_registry()  
+
     # ── Mode / LLM config ────────────────────────────────────────────────────
 
     def set_mode(self, mode: str) -> None:
@@ -184,7 +187,7 @@ class MasterPipeline:
             api_key=api_key,
             **kwargs,
         )
-        logger.info("MasterPipeline: LLM set to %s/%s", provider, model)
+        logger.info(": LLM set to %s/%s", provider, model)
 
     # ── Ingestion ─────────────────────────────────────────────────────────────
 
@@ -441,7 +444,36 @@ class MasterPipeline:
             return parsed
 
     # ── Utilities ─────────────────────────────────────────────────────────────
+    
+    def _warmup_registry(self) -> None:
+        """
+        On startup, FAISS reloads persisted indexes (e.g. faiss_768.index) from
+        disk, but EmbeddingRegistry._by_dim is empty (it's in-memory only).
+        This method pre-loads the correct EmbeddingPipeline for every active
+        FAISS dimension so generate() can embed queries with the right model
+        even after a server restart.
+        """
+        _DIM_TO_MODEL: Dict[int, str] = {
+            384:  "all-MiniLM-L6-v2",
+            768:  "all-mpnet-base-v2",
+            1024: "e5-large-v2",
+            1536: "text-embedding-3-small",
+            3072: "text-embedding-3-large",
+        }
+        for dim in self.storage_manager.faiss.active_dims():
+            if EmbeddingRegistry.get_by_dim(dim) is not None:
+                continue  # already registered (e.g. default model)
+            model_name = _DIM_TO_MODEL.get(dim)
+            if not model_name:
+                logger.warning("_warmup_registry: no model known for dim=%d — skipping", dim)
+                continue
+            try:
+                EmbeddingRegistry.get(model_name)  # loads model + registers dim
+                logger.info("_warmup_registry: registered dim=%d → %s", dim, model_name)
+            except Exception as exc:
+                logger.warning("_warmup_registry: failed for dim=%d (%s): %s", dim, model_name, exc)
 
+    
     def delete_source(self, source_id: str) -> bool:
         """Remove a source and all its chunks from every store."""
         try:
