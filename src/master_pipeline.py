@@ -1,23 +1,17 @@
 """
 master_pipeline.py  —  Top-level orchestrator for Mini NotebookLM
 
-Phase-1 fixes
+Fixes applied
 -------------
-- MultiFAISSStore (was FAISSStore — wrong class name)
-- StorageManager as orchestrator (was SourceManager — wrong class)
-- storage.store() called with correct 4-arg signature
-- BM25 rebuild uses storage_manager.get_all_chunks_for_bm25()
-- nest_asyncio applied at module top (fixes asyncio.run inside Streamlit)
-- set_mode() preserves session_id so history is NOT wiped on mode switch
-- ingest() has per-stage try/except + IngestionGraph stage tracking
-- generate() hydrates chunk_ids into LangChain Documents via StorageManager
-- EmbeddingPipeline dim inferred from embed_query() result shape
-- VideoAudioPipeline import removed (tombstoned — raises NotImplementedError)
-- WebSearchAgent import removed (file not present yet — Phase 5)
-
-Phase-2 fix
------------
-- HybridRetriever constructor now passes storage_manager + dim
+1. HybridRetriever constructed with embedders={dim: embedder} dict (not dim int).
+2. generate() delegates to ChatPipeline / DeepResearchPipeline / StudyPipeline
+   depending on self.mode — BM25 sparse path is now always exercised.
+3. ChatPipeline, DeepResearchPipeline, StudyPipeline are all instantiated at
+   startup and re-wired in set_mode() so the LLM callable is always current.
+4. set_mode() re-creates only the history objects; pipelines are updated in-place
+   via _rebuild_mode_pipelines().
+5. stream=True path in generate() is preserved for ChatPipeline only (Deep
+   Research and Study are never streamed — they do multi-step LLM calls).
 """
 from __future__ import annotations
 
@@ -28,11 +22,11 @@ import time
 from typing import Any, Dict, Iterator, List, Optional
 
 import nest_asyncio
-nest_asyncio.apply()  # must be applied before any event-loop usage in Streamlit
+nest_asyncio.apply()
 
 logger = logging.getLogger(__name__)
 
-# ── Core ─────────────────────────────────────────────────────────────────────
+# ── Core ──────────────────────────────────────────────────────────────────────
 from src.core.config import Config
 from src.core.models import Query, LLMResponse
 
@@ -46,10 +40,11 @@ from src.ingestion.pipelines.csv_pipeline import CSVPipeline
 from src.ingestion.preprocessing.adaptive_preprocessor import AdaptivePreprocessor
 from src.ingestion.chunking.chunker_registry import ChunkerRegistry
 from src.ingestion.embedding.embedding_pipeline import EmbeddingPipeline
+from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
 from src.ingestion.merging.cross_modal_merger import CrossModalMerger
 from src.ingestion.ingestion_graph import IngestionGraph
-from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
-# ── Storage (corrected class names + orchestrator) ────────────────────────────
+
+# ── Storage ───────────────────────────────────────────────────────────────────
 from src.storage import (
     MultiFAISSStore,
     SQLiteManager,
@@ -57,13 +52,19 @@ from src.storage import (
     StorageManager,
 )
 
-# ── Graph (legacy — kept for GraphRetriever / StudyMode) ─────────────────────
+# ── Graph ─────────────────────────────────────────────────────────────────────
 from src.graph.graph_storage import GraphStorage
 from src.graph.graph_retriever import GraphRetriever
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 from src.retrieval.hybrid_retriever import HybridRetriever
 from src.retrieval.reranker import Reranker
+from src.retrieval.contextual_compressor import ContextualCompressor
+
+# ── Mode Pipelines ────────────────────────────────────────────────────────────
+from src.pipelines.chat_pipeline import ChatPipeline
+from src.pipelines.deep_research_pipeline import DeepResearchPipeline
+from src.pipelines.study_pipeline import StudyPipeline
 
 # ── Generation ────────────────────────────────────────────────────────────────
 from src.generation.llm_client import LLMClient
@@ -72,6 +73,8 @@ from src.generation.response_parser import ResponseParser
 
 # ── Chat History ──────────────────────────────────────────────────────────────
 from src.chat_history.chat_history_manager import ChatHistoryManager
+from src.chat_history.rag_history import RAGChatHistory
+from src.chat_history.graph_history import GraphHistory
 
 
 class MasterPipeline:
@@ -80,28 +83,20 @@ class MasterPipeline:
 
     Ingestion flow:
         file/url
-          → FileDetector (auto-detect when source_type is None)
-          → Pipeline (PDF/Website/YouTube/CSV/Image)
-          → AdaptivePreprocessor
-          → ChunkerRegistry.get_chunker(strategy)
-          → EmbeddingPipeline.embed_chunks()
-          → CrossModalMerger.merge()
-          → StorageManager.store()    ← FAISS + SQLite + KnowledgeGraph
-          → HybridRetriever.build_sparse_index()  ← BM25 rebuild
+          -> FileDetector (auto-detect when source_type is None)
+          -> Pipeline (PDF/Website/YouTube/CSV/Image)
+          -> AdaptivePreprocessor
+          -> ChunkerRegistry.get_chunker(strategy)
+          -> EmbeddingPipeline.embed_chunks()
+          -> CrossModalMerger.merge()
+          -> StorageManager.store()               <- FAISS + SQLite + KnowledgeGraph
+          -> HybridRetriever.build_sparse_index() <- BM25 rebuild
 
-    Generation flow (phases 2-5 will upgrade this to LangGraph):
+    Generation flow (mode-dispatched):
         query
-          → EmbeddingPipeline.embed_query()
-          → HybridRetriever.retrieve()
-          → StorageManager.get_chunks_as_documents()  ← LC Documents
-          → ChatHistoryManager.get_history_context()
-          → PromptBuilder.build_*_prompt()
-          → LLMClient.invoke() / .stream()
-          → ResponseParser.parse()
-
-    FileDetector policy:
-        - source_type explicitly passed → FileDetector SKIPPED (trust caller).
-        - source_type is None           → FileDetector used for auto-detection.
+          -> ChatPipeline.run(query)          [chat mode]
+          -> DeepResearchPipeline.run(query)  [research mode]
+          -> StudyPipeline.run(query)         [study mode]
     """
 
     def __init__(self, mode: str = "chat", config_path: str = "config.yaml"):
@@ -109,85 +104,164 @@ class MasterPipeline:
         self.mode = mode
         self.session_id = str(uuid.uuid4())
 
-        # ── Storage ──────────────────────────────────────────────────────────
-        _faiss   = MultiFAISSStore(base_dir=self.config.get("storage.faiss_dir", "./data/vector_store"))
-        _sqlite  = SQLiteManager(db_path=self.config.get("storage.db_path", "./data/metadata.db"))
-        _graph   = KnowledgeGraph(
+        # ── Storage ───────────────────────────────────────────────────────────
+        _faiss  = MultiFAISSStore(
+            base_dir=self.config.get("storage.faiss_dir", "./data/vector_store")
+        )
+        _sqlite = SQLiteManager(
+            db_path=self.config.get("storage.db_path", "./data/metadata.db")
+        )
+        _graph  = KnowledgeGraph(
             edge_threshold=self.config.get("storage.graph_edge_threshold", 0.75)
         )
         self.storage_manager = StorageManager(_faiss, _sqlite, _graph)
 
-        # Legacy GraphStorage — kept for GraphRetriever / StudyModeRetriever
-        # until those are migrated to use KnowledgeGraph (Phase 3).
-        self.graph_storage = GraphStorage()
+        # Legacy GraphStorage — kept for GraphRetriever / StudyPipeline
+        self.graph_storage   = GraphStorage()
         self.graph_retriever = GraphRetriever(self.graph_storage)
 
         # ── Ingestion ─────────────────────────────────────────────────────────
-        self.file_detector  = FileDetector()
-        self.preprocessor   = AdaptivePreprocessor()
-        self._default_embed_model: str = self.config.get("embedding.default_model", "all-MiniLM-L6-v2")
-        self.embedder       = EmbeddingPipeline(model_name=self._default_embed_model)
+        self.file_detector      = FileDetector()
+        self.preprocessor       = AdaptivePreprocessor()
+        self._default_embed_model: str = self.config.get(
+            "embedding.default_model", "all-MiniLM-L6-v2"
+        )
+        self.embedder           = EmbeddingPipeline(model_name=self._default_embed_model)
         self.cross_modal_merger = CrossModalMerger(embedder=self.embedder.embedder)
         self.ingestion_graph    = IngestionGraph()
 
-        # Resolve embedding dimension once from a dummy query so MultiFAISSStore
-        # always gets the right dim even if config.yaml is stale.
+        # Probe to get correct dim (never trust config.yaml alone)
         _probe = self.embedder.embed_query("probe")
-        self._embed_dim: int = int(_probe.shape[0])
+        self._embed_dim: int   = int(_probe.shape[0])
         self._embed_model: str = self.embedder.model_name
-        logger.info("MasterPipeline: embedding dim=%d model=%s", self._embed_dim, self._embed_model)
+        logger.info(
+            "MasterPipeline: embedding dim=%d model=%s",
+            self._embed_dim, self._embed_model,
+        )
 
         # ── Retrieval ─────────────────────────────────────────────────────────
-        # Phase-2 fix: pass storage_manager + dim so HybridRetriever can call
-        # faiss_store.search({dim: qvec}) and hydrate results via StorageManager.
+        # FIX 1: embedders must be Dict[int, embedder], not a plain dim int.
+        # We start with the default model; _warmup_registry() adds any
+        # persisted dims from previous sessions.
+        self._embedders: Dict[int, Any] = {self._embed_dim: self.embedder}
+
         self.hybrid_retriever = HybridRetriever(
-            self.storage_manager.faiss,
+            faiss_store=self.storage_manager.faiss,
             storage_manager=self.storage_manager,
-            dim=self._embed_dim,
+            embedders=self._embedders,          # <- correct: Dict[int, embedder]
+            top_k=self.config.get("retrieval.top_k", 5),
         )
+
+        # Reranker + compressor (shared by DeepResearch & Study)
+        self.reranker   = Reranker()
+        self.compressor = ContextualCompressor()
 
         # ── Generation ────────────────────────────────────────────────────────
         self.llm: Optional[LLMClient] = None
         self.prompt_builder  = PromptBuilder()
         self.response_parser = ResponseParser()
 
-        # ── Chat History ──────────────────────────────────────────────────────
+        # ── Chat History (per-session) ────────────────────────────────────────
+        self.rag_history   = RAGChatHistory(session_id=self.session_id)
+        self.graph_history = GraphHistory(
+            session_id=self.session_id,
+            knowledge_graph=self.storage_manager.graph,
+        )
+        # Legacy manager kept for Streamlit UI helpers
         self.chat_history = ChatHistoryManager(
             self.session_id, mode, self.graph_storage
         )
 
-        # Response cache for repeated queries (same mode + query text)
+        # ── Mode Pipelines (FIX 3: instantiate all three at startup) ─────────
+        # llm callable is injected later via set_llm(); placeholders until then.
+        self._chat_pipeline:     Optional[ChatPipeline]         = None
+        self._research_pipeline: Optional[DeepResearchPipeline] = None
+        self._study_pipeline:    Optional[StudyPipeline]        = None
+
+        # Response cache
         self._response_cache: Dict[str, str] = {}
 
-        # Warm up EmbeddingRegistry for all persisted FAISS dims 
-        self._warmup_registry()  
+        # Warm up EmbeddingRegistry for all persisted FAISS dims
+        self._warmup_registry()
 
-    # ── Mode / LLM config ────────────────────────────────────────────────────
-
-    def set_mode(self, mode: str) -> None:
-        """
-        Switch conversation mode.
-
-        Preserves session_id so chat history is NOT wiped on mode switch.
-        Only the backend selector inside ChatHistoryManager changes.
-        """
-        self.mode = mode
-        self.chat_history = ChatHistoryManager(
-            self.session_id,  # <-- same session, NOT a new uuid
-            mode,
-            self.graph_storage,
-        )
-        logger.info("MasterPipeline: mode switched to '%s' (session=%s)", mode, self.session_id)
+    # ── LLM / Mode config ─────────────────────────────────────────────────────
 
     def set_llm(self, provider: str, model: str, api_key: str, **kwargs) -> None:
-        """Configure (or reconfigure) the LLM client."""
+        """Configure (or reconfigure) the LLM client, then rebuild mode pipelines."""
         self.llm = LLMClient(
             provider=provider,
             model=model,
             api_key=api_key,
             **kwargs,
         )
-        logger.info(": LLM set to %s/%s", provider, model)
+        logger.info("MasterPipeline: LLM set to %s/%s", provider, model)
+        # FIX 3: build / rebuild all three mode pipelines now that LLM is ready
+        self._rebuild_mode_pipelines()
+
+    def set_mode(self, mode: str) -> None:
+        """
+        Switch conversation mode.  Preserves session_id so history is NOT wiped.
+        Only the active pipeline changes.
+        """
+        self.mode = mode
+        # Recreate history objects with same session_id
+        self.rag_history   = RAGChatHistory(session_id=self.session_id)
+        self.graph_history = GraphHistory(
+            session_id=self.session_id,
+            knowledge_graph=self.storage_manager.graph,
+        )
+        self.chat_history = ChatHistoryManager(
+            self.session_id, mode, self.graph_storage
+        )
+        # Rewire pipelines to use the new history objects
+        if self.llm:
+            self._rebuild_mode_pipelines()
+        logger.info(
+            "MasterPipeline: mode switched to '%s' (session=%s)",
+            mode, self.session_id,
+        )
+
+    def _rebuild_mode_pipelines(self) -> None:
+        """
+        (Re)build ChatPipeline, DeepResearchPipeline, StudyPipeline.
+        Called after set_llm() or set_mode().
+        """
+        if self.llm is None:
+            return  # defer until LLM is configured
+
+        llm_callable = self.llm.invoke   # callable(prompt: str) -> str
+
+        # -- Chat -------------------------------------------------------
+        self._chat_pipeline = ChatPipeline(
+            hybrid_retriever=self.hybrid_retriever,
+            rag_history=self.rag_history,
+            llm=llm_callable,
+            top_k=self.config.get("retrieval.top_k", 5),
+            history_k=3,
+        )
+
+        # -- Deep Research ----------------------------------------------
+        self._research_pipeline = DeepResearchPipeline(
+            hybrid_retriever=self.hybrid_retriever,
+            rag_history=self.rag_history,
+            contextual_compressor=self.compressor,
+            reranker=self.reranker,
+            llm=llm_callable,
+            raptor=None,          # set to RaptorRetriever instance if RAPTOR built
+            top_k=self.config.get("retrieval.top_k", 8),
+            history_k=5,
+            expansion_n=3,
+        )
+
+        # -- Study ------------------------------------------------------
+        self._study_pipeline = StudyPipeline(
+            deep_research_pipeline=self._research_pipeline,
+            graph_retriever=self.graph_retriever,
+            graph_history=self.graph_history,
+            llm=llm_callable,
+        )
+
+        logger.info("MasterPipeline: mode pipelines rebuilt for mode='%s'", self.mode)
 
     # ── Ingestion ─────────────────────────────────────────────────────────────
 
@@ -202,20 +276,10 @@ class MasterPipeline:
         """
         Ingest a file or URL into the knowledge base.
 
-        Parameters
-        ----------
-        file_path   : local path to a file (PDF, CSV, image …)
-        url         : remote URL (website or YouTube link)
-        source_type : explicit type string — when given the FileDetector is
-                      skipped.  Valid values:
-                      'pdf' | 'image' | 'website' | 'youtube' | 'csv'
-
         Returns
         -------
-        Dict with:
-            source_id : str   — unique ID assigned to this source
-            num_chunks: int   — number of chunks stored
-            profile   : dict  — DocumentProfiler output (PDF only, else None)
+        Dict with source_id, num_chunks, profile, chunking_strategy,
+        embedding_model, embedding_dim.
         """
         source_id = str(uuid.uuid4())
 
@@ -224,7 +288,7 @@ class MasterPipeline:
             resolved_type = source_type.lower().strip()
         else:
             try:
-                detection = self.file_detector.detect(file_path=file_path, url=url)
+                detection     = self.file_detector.detect(file_path=file_path, url=url)
                 resolved_type = detection["source_type"]
             except Exception as exc:
                 raise RuntimeError(f"FileDetector failed: {exc}") from exc
@@ -242,14 +306,12 @@ class MasterPipeline:
             elif resolved_type == "image":
                 result = ImagePipeline.process(file_path, source_id)
             elif resolved_type in ("video", "audio"):
-                # Tombstoned: VideoAudioPipeline raises NotImplementedError.
-                # Lazy import so the dead module never loads at startup.
                 from src.ingestion.pipelines.video_audio_pipeline import VideoAudioPipeline
                 result = VideoAudioPipeline.process(file_path, source_id)
             elif resolved_type == "youtube":
                 result = YouTubePipeline.process(url, source_id)
             elif resolved_type == "website":
-                loop = asyncio.get_event_loop()
+                loop   = asyncio.get_event_loop()
                 result = loop.run_until_complete(
                     WebsitePipeline.process(url, source_id)
                 )
@@ -268,7 +330,9 @@ class MasterPipeline:
 
         # ── Step 3: preprocess ────────────────────────────────────────────────
         try:
-            preprocessed = self.preprocessor.preprocess(raw_content, source_type=resolved_type)
+            preprocessed = self.preprocessor.preprocess(
+                raw_content, source_type=resolved_type
+            )
         except Exception as exc:
             self.ingestion_graph.mark_error(source_id, stage="preprocess", error=str(exc))
             raise RuntimeError(f"Preprocessing failed: {exc}") from exc
@@ -276,7 +340,6 @@ class MasterPipeline:
 
         # ── Step 4: chunk ─────────────────────────────────────────────────────
         try:
-            # Use user-selected strategy if provided, else default for source type
             effective_strategy = chunking_strategy or resolved_type
             chunker = ChunkerRegistry.get_chunker(effective_strategy)
             chunks  = chunker.chunk(preprocessed, source_id=source_id)
@@ -284,17 +347,21 @@ class MasterPipeline:
             self.ingestion_graph.mark_error(source_id, stage="chunk", error=str(exc))
             raise RuntimeError(f"Chunking failed: {exc}") from exc
         self.ingestion_graph.mark_stage(source_id, "chunk")
-        
+
         # ── Step 5: embed ─────────────────────────────────────────────────────
         try:
-            # Use user-selected embedding model if provided, else pipeline default
             if embedding_model and embedding_model != self._embed_model:
-                from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
                 active_embedder = EmbeddingRegistry.get(embedding_model)
-                _probe = active_embedder.embed_query("probe")
-                active_dim   = int(_probe.shape[0])
-                active_model = embedding_model
-                logger.info("ingest: using user-selected embedder %s (dim=%d)", active_model, active_dim)
+                _probe          = active_embedder.embed_query("probe")
+                active_dim      = int(_probe.shape[0])
+                active_model    = embedding_model
+                logger.info(
+                    "ingest: user-selected embedder %s (dim=%d)",
+                    active_model, active_dim,
+                )
+                # Register this embedder in HybridRetriever so future queries
+                # also search this new dimension.
+                self._embedders[active_dim] = active_embedder
             else:
                 active_embedder = self.embedder
                 active_dim      = self._embed_dim
@@ -306,11 +373,10 @@ class MasterPipeline:
             raise RuntimeError(f"Embedding failed: {exc}") from exc
         self.ingestion_graph.mark_stage(source_id, "embed")
 
-        # ── Step 6: merge cross-modal (no-op for single-source ingestion) ─────
+        # ── Step 6: cross-modal merge (no-op for single-source) ───────────────
         try:
             merged_chunks = self.cross_modal_merger.merge([embedded_chunks])
         except Exception as exc:
-            # Non-fatal — fall back to un-merged chunks
             logger.warning("CrossModalMerger failed (non-fatal): %s", exc)
             merged_chunks = embedded_chunks
 
@@ -350,7 +416,7 @@ class MasterPipeline:
             "embedding_dim":     active_dim,
         }
 
-    # ── Generation ────────────────────────────────────────────────────────────
+    # ── Generation (FIX 2 + FIX 3) ───────────────────────────────────────────
 
     def generate(
         self,
@@ -358,100 +424,91 @@ class MasterPipeline:
         stream: bool = False,
     ):
         """
-        Generate a response for *query* against the stored knowledge base.
+        Route query to the correct mode pipeline.
 
-        Parameters
-        ----------
-        query  : the user's question
-        stream : if True yield token-by-token strings, else return full string
+        Chat mode supports stream=True.
+        Deep Research and Study mode always return a full string
+        (they make multiple internal LLM calls; streaming is not meaningful).
 
         Returns
         -------
-        str  (stream=False)
-        Iterator[str]  (stream=True)
+        str              (stream=False, or Research/Study mode)
+        Iterator[str]    (stream=True, Chat mode only)
         """
         if not self.llm:
-            raise RuntimeError("LLM not configured.  Call set_llm() first.")
+            raise RuntimeError("LLM not configured. Call set_llm() first.")
+        if self._chat_pipeline is None:
+            raise RuntimeError(
+                "Mode pipelines not initialised. "
+                "This should not happen — call set_llm() before generate()."
+            )
 
-        # ── Embed query ───────────────────────────────────────────────────────
-        query_embedding = self.embedder.embed_query(query)
+        # ── Chat mode ────────────────────────────────────────────────────────
+        if self.mode == "chat":
+            if stream:
+                # Stream path: use llm.stream() directly, update history after.
+                chunks = self.hybrid_retriever.retrieve(
+                    query,
+                    top_k=self.config.get("retrieval.top_k", 5),
+                )
+                history_context = self.rag_history.format_for_prompt(query, k=3)
+                prompt = self._chat_pipeline._build_prompt(query, chunks, history_context)
 
-        # ── Retrieve ──────────────────────────────────────────────────────────
-        active_dims = self.storage_manager.faiss.active_dims()
-        query_vectors = {}
-        for dim in active_dims:
-            ep = EmbeddingRegistry.get_by_dim(dim)
-            if ep is not None:
-                query_vectors[dim] = ep.embed_query(query)
-            elif dim == self._embed_dim:
-                query_vectors[dim] = query_embedding  # fallback to default
-        
-        if not query_vectors:
-            query_vectors = {self._embed_dim: query_embedding}
-        
-        raw_results = self.storage_manager.faiss.search(
-            query_vectors=query_vectors,
-            k=self.config.get("retrieval.top_k", 10),
-        )
-        
-        # RRF fusion across all dims
-        from collections import defaultdict
-        rrf_scores: dict = defaultdict(float)
-        K = 60
-        for dim_results in raw_results.values():
-            for rank, (cid, _score) in enumerate(dim_results):
-                rrf_scores[cid] += 1.0 / (K + rank + 1)
-        
-        top_k = self.config.get("retrieval.top_k", 10)
-        chunk_ids = [cid for cid, _ in sorted(rrf_scores.items(), key=lambda x: -x[1])[:top_k]]
+                def _stream_and_record() -> Iterator[str]:
+                    full = ""
+                    for token in self.llm.stream(prompt):
+                        full += token
+                        yield token
+                    self.rag_history.add_message("user", query)
+                    self.rag_history.add_message("assistant", full)
 
-        # Hydrate chunk IDs → LangChain Documents
-        documents = self.storage_manager.get_chunks_as_documents(chunk_ids)
+                return _stream_and_record()
+            else:
+                result = self._chat_pipeline.run(query)
+                return result["answer"]
 
-        # ── Chat history ──────────────────────────────────────────────────────
-        history_context = self.chat_history.get_history_context(
-            query, max_messages=self.config.get("chat.history_window", 6)
-        )
+        # ── Deep Research mode ───────────────────────────────────────────────
+        elif self.mode == "research":
+            result = self._research_pipeline.run(query)
+            return result["answer"]
 
-        # ── Build prompt ──────────────────────────────────────────────────────
-        build_fn = {
-            "chat":     self.prompt_builder.build_chat_prompt,
-            "study":    self.prompt_builder.build_study_prompt,
-            "research": self.prompt_builder.build_research_prompt,
-        }.get(self.mode, self.prompt_builder.build_chat_prompt)
+        # ── Study mode ───────────────────────────────────────────────────────
+        elif self.mode == "study":
+            result = self._study_pipeline.run(query)
+            return result["answer"]
 
-        prompt = build_fn(
-            query=query,
-            documents=documents,
-            history=history_context,
-        )
-
-        # ── Call LLM ──────────────────────────────────────────────────────────
-        if stream:
-            def _stream_and_record() -> Iterator[str]:
-                full = ""
-                for token in self.llm.stream(prompt):
-                    full += token
-                    yield token
-                self.chat_history.add_message("user",      query)
-                self.chat_history.add_message("assistant", full)
-            return _stream_and_record()
         else:
-            response = self.llm.invoke(prompt)
-            parsed   = self.response_parser.parse(response)
-            self.chat_history.add_message("user",      query)
-            self.chat_history.add_message("assistant", parsed)
-            return parsed
+            raise ValueError(f"Unknown mode: '{self.mode}'")
+
+    def generate_full(
+        self,
+        query: str,
+    ) -> Dict[str, Any]:
+        """
+        Like generate() but returns the full result dict including sources,
+        learning_path, sub_queries etc.  Always non-streaming.
+        """
+        if not self.llm:
+            raise RuntimeError("LLM not configured. Call set_llm() first.")
+        if self._chat_pipeline is None:
+            raise RuntimeError("Mode pipelines not initialised.")
+
+        if self.mode == "chat":
+            return self._chat_pipeline.run(query)
+        elif self.mode == "research":
+            return self._research_pipeline.run(query)
+        elif self.mode == "study":
+            return self._study_pipeline.run(query)
+        else:
+            raise ValueError(f"Unknown mode: '{self.mode}'")
 
     # ── Utilities ─────────────────────────────────────────────────────────────
-    
+
     def _warmup_registry(self) -> None:
         """
-        On startup, FAISS reloads persisted indexes (e.g. faiss_768.index) from
-        disk, but EmbeddingRegistry._by_dim is empty (it's in-memory only).
-        This method pre-loads the correct EmbeddingPipeline for every active
-        FAISS dimension so generate() can embed queries with the right model
-        even after a server restart.
+        Pre-load EmbeddingPipeline for every FAISS dim that was persisted
+        in a previous session so generate() can embed queries correctly
+        after a server restart.
         """
         _DIM_TO_MODEL: Dict[int, str] = {
             384:  "all-MiniLM-L6-v2",
@@ -461,24 +518,30 @@ class MasterPipeline:
             3072: "text-embedding-3-large",
         }
         for dim in self.storage_manager.faiss.active_dims():
-            if EmbeddingRegistry.get_by_dim(dim) is not None:
-                continue  # already registered (e.g. default model)
+            if dim in self._embedders:
+                continue  # already registered
             model_name = _DIM_TO_MODEL.get(dim)
             if not model_name:
-                logger.warning("_warmup_registry: no model known for dim=%d — skipping", dim)
+                logger.warning(
+                    "_warmup_registry: no model known for dim=%d — skipping", dim
+                )
                 continue
             try:
-                EmbeddingRegistry.get(model_name)  # loads model + registers dim
-                logger.info("_warmup_registry: registered dim=%d → %s", dim, model_name)
+                ep = EmbeddingRegistry.get(model_name)
+                self._embedders[dim] = ep
+                logger.info(
+                    "_warmup_registry: registered dim=%d -> %s", dim, model_name
+                )
             except Exception as exc:
-                logger.warning("_warmup_registry: failed for dim=%d (%s): %s", dim, model_name, exc)
+                logger.warning(
+                    "_warmup_registry: failed for dim=%d (%s): %s",
+                    dim, model_name, exc,
+                )
 
-    
     def delete_source(self, source_id: str) -> bool:
         """Remove a source and all its chunks from every store."""
         try:
             self.storage_manager.delete_source(source_id)
-            # Rebuild BM25 after deletion
             all_chunks = self.storage_manager.get_all_chunks_for_bm25()
             self.hybrid_retriever.build_sparse_index(all_chunks)
             return True
@@ -487,11 +550,12 @@ class MasterPipeline:
             return False
 
     def get_stats(self) -> Dict[str, Any]:
-        """Return a snapshot of what is currently stored."""
+        """Return a snapshot of current state."""
         return {
-            "session_id": self.session_id,
-            "mode":       self.mode,
-            "embed_dim":  self._embed_dim,
-            "embed_model": self._embed_model,
-            "storage":    self.storage_manager.get_stats(),
+            "session_id":   self.session_id,
+            "mode":         self.mode,
+            "embed_dim":    self._embed_dim,
+            "embed_model":  self._embed_model,
+            "active_dims":  list(self._embedders.keys()),
+            "storage":      self.storage_manager.get_stats(),
         }
