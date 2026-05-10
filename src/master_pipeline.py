@@ -12,6 +12,9 @@ Fixes applied
    via _rebuild_mode_pipelines().
 5. stream=True path in generate() is preserved for ChatPipeline only (Deep
    Research and Study are never streamed — they do multi-step LLM calls).
+6. persona_config parameter wired through generate() → ChatPipeline.run().
+7. Mode string "deep_research" now matched correctly (was only "research").
+8. generate() (non-streaming) now returns the full result dict, not bare str.
 """
 from __future__ import annotations
 
@@ -95,7 +98,7 @@ class MasterPipeline:
     Generation flow (mode-dispatched):
         query
           -> ChatPipeline.run(query)          [chat mode]
-          -> DeepResearchPipeline.run(query)  [research mode]
+          -> DeepResearchPipeline.run(query)  [research / deep_research mode]
           -> StudyPipeline.run(query)         [study mode]
     """
 
@@ -140,15 +143,12 @@ class MasterPipeline:
         )
 
         # ── Retrieval ─────────────────────────────────────────────────────────
-        # FIX 1: embedders must be Dict[int, embedder], not a plain dim int.
-        # We start with the default model; _warmup_registry() adds any
-        # persisted dims from previous sessions.
         self._embedders: Dict[int, Any] = {self._embed_dim: self.embedder}
 
         self.hybrid_retriever = HybridRetriever(
             faiss_store=self.storage_manager.faiss,
             storage_manager=self.storage_manager,
-            embedders=self._embedders,          # <- correct: Dict[int, embedder]
+            embedders=self._embedders,
             top_k=self.config.get("retrieval.top_k", 5),
         )
 
@@ -167,13 +167,11 @@ class MasterPipeline:
             session_id=self.session_id,
             knowledge_graph=self.storage_manager.graph,
         )
-        # Legacy manager kept for Streamlit UI helpers
         self.chat_history = ChatHistoryManager(
             self.session_id, mode, self.graph_storage
         )
 
-        # ── Mode Pipelines (FIX 3: instantiate all three at startup) ─────────
-        # llm callable is injected later via set_llm(); placeholders until then.
+        # ── Mode Pipelines ────────────────────────────────────────────────────
         self._chat_pipeline:     Optional[ChatPipeline]         = None
         self._research_pipeline: Optional[DeepResearchPipeline] = None
         self._study_pipeline:    Optional[StudyPipeline]        = None
@@ -195,7 +193,6 @@ class MasterPipeline:
             **kwargs,
         )
         logger.info("MasterPipeline: LLM set to %s/%s", provider, model)
-        # FIX 3: build / rebuild all three mode pipelines now that LLM is ready
         self._rebuild_mode_pipelines()
 
     def set_mode(self, mode: str) -> None:
@@ -204,7 +201,6 @@ class MasterPipeline:
         Only the active pipeline changes.
         """
         self.mode = mode
-        # Recreate history objects with same session_id
         self.rag_history   = RAGChatHistory(session_id=self.session_id)
         self.graph_history = GraphHistory(
             session_id=self.session_id,
@@ -213,7 +209,6 @@ class MasterPipeline:
         self.chat_history = ChatHistoryManager(
             self.session_id, mode, self.graph_storage
         )
-        # Rewire pipelines to use the new history objects
         if self.llm:
             self._rebuild_mode_pipelines()
         logger.info(
@@ -227,9 +222,9 @@ class MasterPipeline:
         Called after set_llm() or set_mode().
         """
         if self.llm is None:
-            return  # defer until LLM is configured
+            return
 
-        llm_callable = self.llm.invoke   # callable(prompt: str) -> str
+        llm_callable = self.llm.invoke
 
         # -- Chat -------------------------------------------------------
         self._chat_pipeline = ChatPipeline(
@@ -247,7 +242,7 @@ class MasterPipeline:
             contextual_compressor=self.compressor,
             reranker=self.reranker,
             llm=llm_callable,
-            raptor=None,          # set to RaptorRetriever instance if RAPTOR built
+            raptor=None,
             top_k=self.config.get("retrieval.top_k", 8),
             history_k=5,
             expansion_n=3,
@@ -359,8 +354,7 @@ class MasterPipeline:
                     "ingest: user-selected embedder %s (dim=%d)",
                     active_model, active_dim,
                 )
-                # Register this embedder in HybridRetriever so future queries
-                # also search this new dimension.
+                # Register in HybridRetriever so future queries search this dim too
                 self._embedders[active_dim] = active_embedder
             else:
                 active_embedder = self.embedder
@@ -416,23 +410,24 @@ class MasterPipeline:
             "embedding_dim":     active_dim,
         }
 
-    # ── Generation (FIX 2 + FIX 3) ───────────────────────────────────────────
+    # ── Generation ────────────────────────────────────────────────────────────
 
     def generate(
         self,
         query: str,
         stream: bool = False,
+        persona_config=None,          # FIX 6: wired through to ChatPipeline
     ):
         """
         Route query to the correct mode pipeline.
 
         Chat mode supports stream=True.
-        Deep Research and Study mode always return a full string
+        Deep Research and Study mode always return a full dict
         (they make multiple internal LLM calls; streaming is not meaningful).
 
         Returns
         -------
-        str              (stream=False, or Research/Study mode)
+        Dict[str, Any]   (stream=False — full result with answer + citations)
         Iterator[str]    (stream=True, Chat mode only)
         """
         if not self.llm:
@@ -446,13 +441,15 @@ class MasterPipeline:
         # ── Chat mode ────────────────────────────────────────────────────────
         if self.mode == "chat":
             if stream:
-                # Stream path: use llm.stream() directly, update history after.
+                # Stream path: retrieve → build prompt → stream tokens → record history
                 chunks = self.hybrid_retriever.retrieve(
                     query,
                     top_k=self.config.get("retrieval.top_k", 5),
                 )
                 history_context = self.rag_history.format_for_prompt(query, k=3)
-                prompt = self._chat_pipeline._build_prompt(query, chunks, history_context)
+                prompt = self._chat_pipeline._build_prompt(
+                    query, chunks, history_context, persona_config=persona_config
+                )
 
                 def _stream_and_record() -> Iterator[str]:
                     full = ""
@@ -464,18 +461,16 @@ class MasterPipeline:
 
                 return _stream_and_record()
             else:
-                result = self._chat_pipeline.run(query)
-                return result["answer"]
+                # FIX 6 + FIX 8: pass persona_config, return full dict
+                return self._chat_pipeline.run(query, persona_config=persona_config)
 
-        # ── Deep Research mode ───────────────────────────────────────────────
-        elif self.mode == "research":
-            result = self._research_pipeline.run(query)
-            return result["answer"]
+        # ── Deep Research mode (FIX 7: accept both "research" and "deep_research") ─
+        elif self.mode in ("research", "deep_research"):
+            return self._research_pipeline.run(query)
 
         # ── Study mode ───────────────────────────────────────────────────────
         elif self.mode == "study":
-            result = self._study_pipeline.run(query)
-            return result["answer"]
+            return self._study_pipeline.run(query)
 
         else:
             raise ValueError(f"Unknown mode: '{self.mode}'")
@@ -483,10 +478,11 @@ class MasterPipeline:
     def generate_full(
         self,
         query: str,
+        persona_config=None,
     ) -> Dict[str, Any]:
         """
-        Like generate() but returns the full result dict including sources,
-        learning_path, sub_queries etc.  Always non-streaming.
+        Like generate() but always non-streaming and always returns the full
+        result dict including sources, learning_path, sub_queries etc.
         """
         if not self.llm:
             raise RuntimeError("LLM not configured. Call set_llm() first.")
@@ -494,8 +490,8 @@ class MasterPipeline:
             raise RuntimeError("Mode pipelines not initialised.")
 
         if self.mode == "chat":
-            return self._chat_pipeline.run(query)
-        elif self.mode == "research":
+            return self._chat_pipeline.run(query, persona_config=persona_config)
+        elif self.mode in ("research", "deep_research"):
             return self._research_pipeline.run(query)
         elif self.mode == "study":
             return self._study_pipeline.run(query)
@@ -519,7 +515,7 @@ class MasterPipeline:
         }
         for dim in self.storage_manager.faiss.active_dims():
             if dim in self._embedders:
-                continue  # already registered
+                continue
             model_name = _DIM_TO_MODEL.get(dim)
             if not model_name:
                 logger.warning(
