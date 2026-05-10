@@ -304,7 +304,6 @@ function MiniGraph() {
 
   const { nodes, edges } = graphData;
 
-  // Fallback static display when backend has no graph data yet
   const displayNodes = nodes.length > 0 ? nodes : [
     {id:"n0",x:50,y:38,hub:true, label:"Waiting for sources",edges_count:0},
   ];
@@ -346,39 +345,35 @@ function MiniGraph() {
 //  EMBED FLOW — wired to real /api/analyze + /api/ingest
 // ─────────────────────────────────────────────────────────────────────────────
 function EmbedFlow({pendingSources, chunker, setChunker, embModel, setEmbModel, embModels, onDone, analysisData, analyzing}) {
-  const [phase, setPhase]       = useState("idle");
-  const [progress, setProgress] = useState(0);
+  const [phase, setPhase]         = useState("idle");
+  const [progress, setProgress]   = useState(0);
   const [stepLabel, setStepLabel] = useState("");
 
   const emb = embModels.find(e => e.id === embModel) || embModels[0];
 
   // Use real per-strategy stats if available, else fall back to static estimate
-  const strat = analysisData?.[chunker];
-  const totalChunks = strat ? strat.total_chunks : (CHUNK_EST[chunker] || 0) * pendingSources.length;
+  const strat      = analysisData?.[chunker];
+  const totalChunks = strat ? strat.total_chunks ?? strat.count ?? 0
+                            : (CHUNK_EST[chunker] || 0) * pendingSources.length;
   const totalTokens = totalChunks * (emb?.tokens || 256);
 
   const run = async () => {
     setPhase("analyzing"); setProgress(10); setStepLabel("Sending to ingest pipeline…");
     try {
-      // Process each pending source sequentially
       for (const src of pendingSources) {
         const form = new FormData();
-        // FIXED: send correct field names matching api.py
         form.append("chunking_strategy", chunker);
         form.append("embedding_model",   embModel);
 
         if (src._file) {
-          // PDF / file upload — send actual binary
           form.append("file", src._file);
           const ext = src._file.name.split(".").pop().toLowerCase();
           const typeMap = {pdf:"pdf",csv:"csv",png:"image",jpg:"image",jpeg:"image",mp4:"video"};
           form.append("source_type", typeMap[ext] || "text");
         } else if (src.type === "youtube" || src.type === "website") {
-          // URL-based source
           form.append("url", src.name);
           form.append("source_type", src.type);
         } else {
-          // Plain text
           const blob = new Blob([src._text || src.name], {type:"text/plain"});
           form.append("file", blob, "paste.txt");
           form.append("source_type", "text");
@@ -500,7 +495,7 @@ function EmbedFlow({pendingSources, chunker, setChunker, embModel, setEmbModel, 
 //  APP
 // ─────────────────────────────────────────────────────────────────────────────
 function useToast() {
-  const [t, setT]   = useState(null);
+  const [t, setT]     = useState(null);
   const [err, setErr] = useState(false);
   const show = (msg, isErr=false) => {
     setT(msg); setErr(isErr);
@@ -521,47 +516,49 @@ export default function App() {
   const [searchResults, setSearchResults] = useState([]);
   const [selectedSR, setSelectedSR]       = useState({});
 
-  // Sources fetched from GET /api/sources on mount
-  const [sources, setSources]           = useState([]);
+  const [sources, setSources]               = useState([]);
   const [pendingSources, setPendingSources] = useState([]);
-  const [ingestTab, setIngestTab]         = useState("pdf");
-  const [ytUrl, setYtUrl]               = useState("");
-  const [webUrl, setWebUrl]             = useState("");
-  const [pasteText, setPasteText]       = useState("");
+  const [ingestTab, setIngestTab]           = useState("pdf");
+  const [ytUrl, setYtUrl]                   = useState("");
+  const [webUrl, setWebUrl]                 = useState("");
+  const [pasteText, setPasteText]           = useState("");
   const fileRef = useRef(null);
-  const [chunker, setChunker]           = useState("hierarchical");
-  const [embModel, setEmbModel]         = useState("all-MiniLM-L6-v2");
-  // Embedding models fetched from GET /api/embedding-models
-  const [embModels, setEmbModels]       = useState(DEFAULT_EMB_MODELS);
+  const [chunker, setChunker]   = useState("hierarchical");
+  const [embModel, setEmbModel] = useState("all-MiniLM-L6-v2");
+  const [embModels, setEmbModels] = useState(DEFAULT_EMB_MODELS);
+
   // Real per-strategy token analysis from /api/analyze → token_stats key
   const [analysisData, setAnalysisData] = useState(null);
   const [analyzing, setAnalyzing]       = useState(false);
-  // Stats from GET /api/stats
-  const [stats, setStats]               = useState({total_chunks:0,total_sources:0,graph:{nodes:0,edges:0},chunks:{dimensions:{}}});
 
-  const [history, setHistory]           = useState([]);
+  const [stats, setStats] = useState({
+    total_chunks:0, total_sources:0,
+    graph:{nodes:0,edges:0},
+    chunks:{dimensions:{}},
+  });
+
+  const [history, setHistory]             = useState([]);
   const [activeSession, setActiveSession] = useState(null);
-  const [messages, setMessages]         = useState([]);
-  const [input, setInput]               = useState("");
-  const [loading, setLoading]           = useState(false);
-  const [temp, setTemp]                 = useState(0.7);
-  const [topP, setTopP]                 = useState(0.9);
-  const [topK, setTopK]                 = useState(40);
-  const [maxTokens, setMaxTokens]       = useState(1024);
-  const [toast, toastErr, showToast]    = useToast();
+  const [messages, setMessages]           = useState([]);
+  const [input, setInput]                 = useState("");
+  const [loading, setLoading]             = useState(false);
+  const [temp, setTemp]                   = useState(0.7);
+  const [topP, setTopP]                   = useState(0.9);
+  const [topK, setTopK]                   = useState(40);
+  const [maxTokens, setMaxTokens]         = useState(1024);
+  const [toast, toastErr, showToast]      = useToast();
   const bottomRef = useRef(null);
   const abortRef  = useRef(null);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({behavior:"smooth"}); }, [messages, loading]);
 
-  // ── on mount: fetch sources + embedding models ──────────────────────────────
+  // ── on mount: fetch sources + embedding models ───────────────────────────────
   useEffect(() => {
-    // Fetch persisted sources
     fetch(`${API}/api/sources`)
       .then(r => r.json())
       .then(data => {
         const raw = data.sources || [];
-        const normalised = raw.map(s => ({
+        setSources(raw.map(s => ({
           id:       s.source_id || s.id || String(Math.random()),
           type:     s.source_type || s.type || "text",
           name:     s.name || s.source_id || "Unknown",
@@ -569,12 +566,10 @@ export default function App() {
           vectors:  s.vector_count || s.vectors || 0,
           embModel: s.embedding_model || s.embModel || "all-MiniLM-L6-v2",
           status:   "ready",
-        }));
-        setSources(normalised);
+        })));
       })
       .catch(() => {});
 
-    // Fetch embedding model catalogue
     fetch(`${API}/api/embedding-models`)
       .then(r => r.json())
       .then(data => {
@@ -585,18 +580,13 @@ export default function App() {
           tokens: m.max_tokens,
           note:   m.note || "",
         }));
-        if (models.length > 0) {
-          setEmbModels(models);
-          setEmbModel(models[0].id);
-        }
+        if (models.length > 0) { setEmbModels(models); setEmbModel(models[0].id); }
       })
       .catch(() => {});
 
-    // Fetch initial stats
     refreshStats();
   }, []);
 
-  // ── refresh stats from GET /api/stats ───────────────────────────────────────
   const refreshStats = useCallback(() => {
     fetch(`${API}/api/stats`)
       .then(r => r.json())
@@ -604,21 +594,18 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  // ── derived display values from live stats ───────────────────────────────────
-  const totalChunks   = stats.total_chunks  || stats.chunks?.total_chunks  || 0;
-  const totalSources  = stats.total_sources || sources.length;
-  const graphNodes    = stats.graph?.nodes  || 0;
-  const graphEdges    = stats.graph?.edges  || 0;
-  const dimBreakdown  = Object.entries(stats.chunks?.dimensions || {}).map(([dim, count]) => ({
+  const totalChunks  = stats.total_chunks  || stats.chunks?.total_chunks  || 0;
+  const totalSources = stats.total_sources || sources.length;
+  const graphNodes   = stats.graph?.nodes  || 0;
+  const graphEdges   = stats.graph?.edges  || 0;
+  const dimBreakdown = Object.entries(stats.chunks?.dimensions || {}).map(([dim, count]) => ({
     dim: Number(dim), count,
     label: embModels.find(e => e.dim === Number(dim))?.name?.split("-")[0] || `${dim}d`,
   }));
 
-  const selEmb        = embModels.find(e => e.id === embModel) || embModels[0];
-  const modeBadge     = {chat:"mb-chat",deep:"mb-deep",study:"mb-study"}[mode];
-  const modeLabel     = {chat:"Chat",deep:"Deep Research",study:"Study"}[mode];
+  const modeBadge = {chat:"mb-chat",deep:"mb-deep",study:"mb-study"}[mode];
+  const modeLabel = {chat:"Chat",deep:"Deep Research",study:"Study"}[mode];
 
-  // ── mode switch → POST /api/mode ────────────────────────────────────────────
   const switchMode = (m) => {
     setMode(m);
     fetch(`${API}/api/mode`, {
@@ -628,7 +615,6 @@ export default function App() {
     }).catch(() => {});
   };
 
-  // ── LLM config → POST /api/config ───────────────────────────────────────────
   const applyConfig = () => {
     if (!apiKey.trim() && provider !== "ollama") return showToast("Enter API key first", true);
     fetch(`${API}/api/config`, {
@@ -641,7 +627,6 @@ export default function App() {
       .catch(e => showToast(`Config failed: ${e.message}`, true));
   };
 
-  // ── web search (local fallback; replace with real search API if needed) ──────
   const doSearch = () => {
     if (!searchQ.trim()) return;
     setSearchResults([
@@ -663,21 +648,72 @@ export default function App() {
     showToast(`${news.length} source(s) queued`);
   };
 
-  // ── file upload: queue + call /api/analyze for token stats ──────────────────
+  // ── shared helper: apply token_stats from /api/analyze response ─────────────
+  const applyAnalysis = (data) => {
+    setAnalysisData(data.token_stats ?? null);
+  };
+
+  // ── FILE upload: queue + fire /api/analyze (multipart) ───────────────────────
   const analyzeFile = async (file) => {
     setAnalyzing(true);
     setAnalysisData(null);
     const form = new FormData();
     form.append("file", file);
-    form.append("source_type", "pdf");
+    const ext  = file.name.split(".").pop().toLowerCase();
+    const type = {pdf:"pdf",csv:"csv",png:"image",jpg:"image",jpeg:"image",mp4:"video"}[ext] || "text";
+    form.append("source_type", type);
     try {
       const res = await fetch(`${API}/api/analyze`, {method:"POST", body:form});
       if (!res.ok) throw new Error(`analyze ${res.status}`);
-      const data = await res.json();
-      // API returns token_stats key — map it to analysisData
-      setAnalysisData(data.token_stats ?? null);
+      applyAnalysis(await res.json());
     } catch (err) {
-      console.warn("analyze fallback:", err.message);
+      console.warn("analyze file fallback:", err.message);
+      setAnalysisData(null);
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  // ── URL source (YouTube / Website): queue + fire /api/analyze (JSON) ─────────
+  // FIX: URL sources previously never triggered /api/analyze, so the token
+  // table was always hidden for YouTube and website sources. Now we POST
+  // {url, source_type} as JSON — the backend fetches/extracts the text and
+  // runs ContentAnalyzer on it, returning the same token_stats shape.
+  const analyzeUrl = async (url, sourceType) => {
+    setAnalyzing(true);
+    setAnalysisData(null);
+    try {
+      const res = await fetch(`${API}/api/analyze`, {
+        method:  "POST",
+        headers: {"Content-Type": "application/json"},
+        body:    JSON.stringify({url, source_type: sourceType}),
+      });
+      if (!res.ok) throw new Error(`analyze ${res.status}`);
+      applyAnalysis(await res.json());
+    } catch (err) {
+      // Non-fatal: backend may not have fetched the URL yet.
+      // The token table simply stays hidden; user can still embed.
+      console.warn("analyze url fallback:", err.message);
+      setAnalysisData(null);
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  // ── Pasted text: queue + fire /api/analyze (JSON with raw text) ──────────────
+  const analyzeText = async (text) => {
+    setAnalyzing(true);
+    setAnalysisData(null);
+    try {
+      const res = await fetch(`${API}/api/analyze`, {
+        method:  "POST",
+        headers: {"Content-Type": "application/json"},
+        body:    JSON.stringify({text, source_type: "text"}),
+      });
+      if (!res.ok) throw new Error(`analyze ${res.status}`);
+      applyAnalysis(await res.json());
+    } catch (err) {
+      console.warn("analyze text fallback:", err.message);
       setAnalysisData(null);
     } finally {
       setAnalyzing(false);
@@ -694,22 +730,33 @@ export default function App() {
     analyzeFile(f);
   };
 
+  // FIX: call analyzeUrl after queuing so token table appears for URL sources
   const addUrl = () => {
-    const url = ingestTab==="yt" ? ytUrl : webUrl;
+    const url  = ingestTab==="yt" ? ytUrl : webUrl;
     if (!url.trim()) return;
     const type = ingestTab==="yt" ? "youtube" : "website";
-    setPendingSources(p => [...p, {id:`src_${Date.now()}`,type,name:url.slice(0,44),chunks:0,vectors:0,embModel,status:"pending"}]);
+    setPendingSources(p => [...p, {
+      id:`src_${Date.now()}`,type,name:url.slice(0,44),
+      chunks:0,vectors:0,embModel,status:"pending",
+    }]);
     ingestTab==="yt" ? setYtUrl("") : setWebUrl("");
-    showToast("Source queued");
+    showToast("Source queued — analysing…");
+    analyzeUrl(url, type);           // ← FIX
   };
 
+  // FIX: call analyzeText after queuing so token table appears for pasted text
   const addPaste = () => {
     if (!pasteText.trim()) return;
-    setPendingSources(p => [...p, {id:`src_${Date.now()}`,type:"text",name:"Pasted text",chunks:0,vectors:0,embModel,status:"pending",_text:pasteText}]);
-    setPasteText(""); showToast("Text queued");
+    const snapshot = pasteText;      // capture before clearing
+    setPendingSources(p => [...p, {
+      id:`src_${Date.now()}`,type:"text",name:"Pasted text",
+      chunks:0,vectors:0,embModel,status:"pending",_text:snapshot,
+    }]);
+    setPasteText("");
+    showToast("Text queued — analysing…");
+    analyzeText(snapshot);           // ← FIX
   };
 
-  // ── embed done callback ──────────────────────────────────────────────────────
   const handleEmbedDone = (emb, chk, count, errMsg) => {
     if (errMsg) { showToast(`⚠ Ingest failed: ${errMsg}`, true); return; }
     const chunkCount = count || CHUNK_EST[chk] || 0;
@@ -721,7 +768,6 @@ export default function App() {
     showToast(`✓ ${done.length} source(s) embedded`);
   };
 
-  // ── delete source: DELETE /api/sources/:id ───────────────────────────────────
   const deleteSource = async (id) => {
     try {
       const res = await fetch(`${API}/api/sources/${id}`, {method:"DELETE"});
@@ -734,7 +780,6 @@ export default function App() {
     }
   };
 
-  // ── send message: streams from POST /api/query/stream ───────────────────────
   const sendMessage = async () => {
     if (!input.trim() || loading) return;
     const userMsg = {id:`m${Date.now()}`,role:"user",content:input};
@@ -764,7 +809,7 @@ export default function App() {
         if (done) break;
         buffer += decoder.decode(value, {stream:true});
         const lines = buffer.split("\n");
-        buffer = lines.pop(); // keep incomplete last line
+        buffer = lines.pop();
 
         for (const line of lines) {
           if (!line.startsWith("data: ")) continue;
@@ -785,11 +830,8 @@ export default function App() {
                   })),
                 } : msg
               ));
-            } else if (event.type === "done") {
-              break;
-            } else if (event.type === "error") {
-              throw new Error(event.detail);
-            }
+            } else if (event.type === "done")  { break; }
+              else if (event.type === "error") { throw new Error(event.detail); }
           } catch (parseErr) { /* skip malformed line */ }
         }
       }
@@ -802,7 +844,6 @@ export default function App() {
     } finally {
       setLoading(false);
       abortRef.current = null;
-      // Update history label from first user message
       const title = userMsg.content.slice(0,40);
       const hid   = `h${Date.now()}`;
       setHistory(h => [{ id:hid, title }, ...h.slice(0,19)]);
@@ -810,7 +851,6 @@ export default function App() {
     }
   };
 
-  // ── new chat ─────────────────────────────────────────────────────────────────
   const newChat = () => {
     abortRef.current?.abort();
     fetch(`${API}/api/new-chat`, {method:"POST"}).catch(() => {});
@@ -821,12 +861,8 @@ export default function App() {
     showToast("New chat started");
   };
 
-  const loadSession = (id) => {
-    setActiveSession(id);
-    setMessages([]);
-  };
+  const loadSession = (id) => { setActiveSession(id); setMessages([]); };
 
-  // ── keyboard shortcut: Enter to send ────────────────────────────────────────
   const onKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   };
@@ -945,7 +981,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* EmbedFlow — shown when pending sources exist */}
+          {/* EmbedFlow */}
           <div style={{padding:"0 14px 14px"}}>
             <EmbedFlow
               pendingSources={pendingSources}
@@ -1099,7 +1135,6 @@ export default function App() {
 
         {/* ── RIGHT PANEL ── */}
         <div className={`right-panel${rpOpen?"":" collapsed"}`}>
-          {/* Knowledge Graph */}
           <div className="rp-section">
             <div className="rp-label">Knowledge Graph</div>
             <MiniGraph/>
@@ -1109,7 +1144,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* DB Stats */}
           <div className="rp-section">
             <div className="rp-label">Vector Store</div>
             <div className="db-row"><span>Total Chunks</span><span className="db-num">{totalChunks.toLocaleString()}</span></div>
@@ -1130,7 +1164,6 @@ export default function App() {
             )}
           </div>
 
-          {/* Generation Params */}
           <div className="rp-section">
             <div className="rp-label">Generation Params</div>
             {[{label:"Temperature",val:temp,set:setTemp,min:0,max:1,step:.05},
@@ -1146,7 +1179,6 @@ export default function App() {
             ))}
           </div>
 
-          {/* Actions */}
           <div className="rp-section">
             <div className="rp-label">Actions</div>
             <button className="action-btn" onClick={refreshStats}>↻ Refresh Stats</button>
