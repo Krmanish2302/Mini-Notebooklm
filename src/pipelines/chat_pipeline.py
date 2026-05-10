@@ -1,6 +1,12 @@
 """
 chat_pipeline.py  —  Chat mode pipeline.
 
+Bug fixes applied (2026-05-10 audit):
+  BUG-004: stream() no longer iterates self.llm (invoke callable) char-by-char.
+           Constructor now accepts a separate llm_stream callable.
+           Falls back to splitting the invoke() result by words if no stream
+           callable is provided (backward compat).
+
 Flow
 ----
 1. QueryRewriter   : HyDE / expand / both based on query shape
@@ -30,7 +36,9 @@ class ChatPipeline:
     ----------
     hybrid_retriever : HybridRetriever
     rag_history      : RAGChatHistory
-    llm              : callable (str) -> str   (invoke, NOT the LLMClient object)
+    llm              : callable (str) -> str    (invoke, NOT the LLMClient object)
+    llm_stream       : callable (str) -> Iterator[str]  (streaming tokens)
+                       If None, stream() falls back to word-splitting invoke().
     top_k            : int   chunks to retrieve
     history_k        : int   recent turns to include in prompt
     max_ctx_tokens   : int   token budget for context block
@@ -41,15 +49,17 @@ class ChatPipeline:
         hybrid_retriever,
         rag_history: RAGChatHistory,
         llm: Callable[[str], str],
+        llm_stream: Optional[Callable[[str], Iterator[str]]] = None,  # BUG-004
         top_k: int = 5,
         history_k: int = 3,
         max_ctx_tokens: int = 3000,
     ):
-        self.retriever  = hybrid_retriever
-        self.history    = rag_history
-        self.llm        = llm
-        self.top_k      = top_k
-        self.history_k  = history_k
+        self.retriever    = hybrid_retriever
+        self.history      = rag_history
+        self.llm          = llm
+        self.llm_stream   = llm_stream          # BUG-004
+        self.top_k        = top_k
+        self.history_k    = history_k
         self._ctx_builder = ContextBuilder(max_tokens=max_ctx_tokens)
         self._rewriter    = QueryRewriter()
 
@@ -62,42 +72,20 @@ class ChatPipeline:
         query: str,
         persona_config=None,
     ) -> Dict[str, Any]:
-        """
-        Run a full non-streaming chat turn.
-
-        Returns
-        -------
-        dict with: answer, citations, follow_ups, sources_used,
-                   chunks_used, retrieved_chunks, tokens_estimate
-        """
-        # 1. Retrieve
         raw_chunks = self._retrieve(query)
-
-        # 2. Build context
         context_chunks, _sources = self._ctx_builder.build(raw_chunks, query=query)
-
-        # 3. Build prompt
         history_str = self.history.format_for_prompt(query, k=self.history_k)
         prompt = PromptBuilder.build_chat_prompt(
-            query,
-            context_chunks,
-            history=history_str,
-            persona_config=persona_config,
-            rewrite=True,
+            query, context_chunks,
+            history=history_str, persona_config=persona_config, rewrite=True,
         )
-
-        # 4. LLM call
         raw_output = self.llm(prompt)
-
-        # 5. Structure response
         gen = ResponseGenerator(context_chunks=context_chunks)
         result = gen.assemble(raw_output, query=query, generate_follow_ups=True)
         result["retrieved_chunks"] = raw_chunks
-
-        # 6. Persist history
+        result["context_chunks"]   = context_chunks   # BUG-007 fix: always set
         self.history.add_message("user", query)
         self.history.add_message("assistant", result["answer"])
-
         return result
 
     # ─────────────────────────────────────────────────────────────────────
@@ -113,15 +101,12 @@ class ChatPipeline:
     ) -> str:
         context_chunks, _ = self._ctx_builder.build(raw_chunks, query=query)
         return PromptBuilder.build_chat_prompt(
-            query,
-            context_chunks,
-            history=history_context,
-            persona_config=persona_config,
-            rewrite=True,
+            query, context_chunks,
+            history=history_context, persona_config=persona_config, rewrite=True,
         )
 
     # ─────────────────────────────────────────────────────────────────────
-    #  Streaming helper
+    #  Streaming  (BUG-004)
     # ─────────────────────────────────────────────────────────────────────
 
     def stream(
@@ -132,39 +117,54 @@ class ChatPipeline:
     ) -> Iterator[str]:
         """
         Streaming variant.  Yields tokens from the LLM.
-        Persists history after the stream is exhausted.
 
-        Parameters
-        ----------
-        llm_stream_fn : optional alternative streaming callable.
-                        Falls back to self.llm (non-streaming) if not provided.
+        BUG-004 fix: uses self.llm_stream (a proper token-streaming callable)
+        instead of self.llm (invoke, returns full str).  Iterating a str
+        yields individual characters, not semantic tokens.
+
+        Priority order for stream callable:
+          1. llm_stream_fn argument (caller override)
+          2. self.llm_stream (set at construction by master_pipeline)
+          3. word-split fallback on self.llm (no-op graceful degradation)
         """
         raw_chunks = self._retrieve(query)
         context_chunks, _ = self._ctx_builder.build(raw_chunks, query=query)
         history_str = self.history.format_for_prompt(query, k=self.history_k)
         prompt = PromptBuilder.build_chat_prompt(
-            query,
-            context_chunks,
-            history=history_str,
-            persona_config=persona_config,
-            rewrite=True,
+            query, context_chunks,
+            history=history_str, persona_config=persona_config, rewrite=True,
         )
 
-        stream_fn = llm_stream_fn or self.llm
+        # BUG-004: resolve the streaming callable with fallback chain
+        _stream_fn = llm_stream_fn or self.llm_stream
+
         full_response = ""
-        for token in stream_fn(prompt):  # type: ignore[call-arg]
-            full_response += token
-            yield token
+
+        if _stream_fn is not None:
+            # True token streaming
+            for token in _stream_fn(prompt):
+                full_response += token
+                yield token
+        else:
+            # Graceful fallback: call invoke() and word-split
+            logger.warning(
+                "ChatPipeline.stream(): no llm_stream callable — "
+                "falling back to word-split of invoke() result"
+            )
+            response = self.llm(prompt)
+            for word in response.split(" "):
+                token = word + " "
+                full_response += token
+                yield token
 
         self.history.add_message("user", query)
-        self.history.add_message("assistant", full_response)
+        self.history.add_message("assistant", full_response.strip())
 
     # ─────────────────────────────────────────────────────────────────────
     #  Retrieval helper
     # ─────────────────────────────────────────────────────────────────────
 
     def _retrieve(self, query: str) -> List[Dict]:
-        """Embed-query rewrite then retrieve top_k chunks."""
         try:
             return self.retriever.retrieve(query, top_k=self.top_k)
         except Exception as exc:

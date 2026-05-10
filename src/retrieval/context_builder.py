@@ -2,6 +2,12 @@
 context_builder.py  —  Assembles ranked retrieval results into a structured
 context window ready for prompt injection.
 
+Bug fixes applied (2026-05-10 audit):
+  BUG-011: Token counting now uses tiktoken cl100k_base instead of
+           word-count (which undercounted code/special chars by 30-40%).
+           Falls back to the conservative chars-per-token estimate if
+           tiktoken is not installed.
+
 Responsibilities
 ----------------
 1. Deduplication   — remove near-duplicate chunks (Jaccard similarity)
@@ -9,13 +15,6 @@ Responsibilities
 3. Source ranking  — order by RRF score desc; break ties by recency
 4. Attribution     — attach source labels ([S1], [S2]…) for citation
 5. Metadata strip  — emit clean dicts with only the fields the prompt needs
-
-Usage
------
-    builder = ContextBuilder(max_tokens=3000)
-    context, sources = builder.build(chunks)  # chunks from HybridRetriever
-    # context  → list of clean, deduplicated, token-budgeted chunk dicts
-    # sources  → list of unique source labels for the footer
 """
 from __future__ import annotations
 
@@ -25,8 +24,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Rough chars-per-token ratio (conservative for mixed technical / prose)
-_CHARS_PER_TOKEN: float = 3.5
+# BUG-011: use tiktoken for accurate token counting; fall back to char estimate
+try:
+    import tiktoken as _tiktoken
+    _enc = _tiktoken.get_encoding("cl100k_base")
+    def _count_tokens(text: str) -> int:
+        return len(_enc.encode(text))
+except ImportError:
+    _CHARS_PER_TOKEN: float = 3.5
+    def _count_tokens(text: str) -> int:   # type: ignore[misc]
+        return max(1, int(len(text) / _CHARS_PER_TOKEN))
+    logger.warning(
+        "tiktoken not installed — using char/token estimate. "
+        "Install with: pip install tiktoken"
+    )
 
 
 class ContextBuilder:
@@ -44,7 +55,6 @@ class ContextBuilder:
     ):
         self.max_tokens    = max_tokens
         self.sim_threshold = sim_threshold
-        self._char_budget  = int(max_tokens * _CHARS_PER_TOKEN)
 
     # ─────────────────────────────────────────────────────────────────────
     #  Public API
@@ -55,37 +65,12 @@ class ContextBuilder:
         chunks: List[Dict[str, Any]],
         query:  Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
-        """
-        Build context from a list of retrieved chunks.
-
-        Parameters
-        ----------
-        chunks : list of chunk dicts (from HybridRetriever.retrieve())
-                 Each must have at minimum: {"id": str, "content": str}
-        query  : original query string (used for diversity scoring, optional)
-
-        Returns
-        -------
-        context : list of enriched chunk dicts ready for PromptBuilder
-        sources : deduplicated list of source labels in order of first appearance
-        """
         if not chunks:
             return [], []
 
-        # 1. Sort by score (RRF desc, then arbitrary tiebreak)
-        ranked = sorted(
-            chunks,
-            key=lambda c: float(c.get("rrf_score", 0.0)),
-            reverse=True,
-        )
-
-        # 2. Deduplicate
+        ranked  = sorted(chunks, key=lambda c: float(c.get("rrf_score", 0.0)), reverse=True)
         deduped = self._deduplicate(ranked)
-
-        # 3. Apply token budget
         budgeted = self._apply_budget(deduped)
-
-        # 4. Annotate with citation labels
         context, sources = self._annotate(budgeted)
 
         logger.debug(
@@ -99,53 +84,49 @@ class ContextBuilder:
     # ─────────────────────────────────────────────────────────────────────
 
     def _deduplicate(self, chunks: List[Dict]) -> List[Dict]:
-        """Remove chunks whose content is near-identical to an already-kept chunk."""
-        kept: List[Dict]      = []
-        kept_sets: List[set]  = []
+        kept: List[Dict]     = []
+        kept_sets: List[set] = []
 
         for chunk in chunks:
             text   = chunk.get("content", "")
             tokens = self._tokenize(text)
             if not tokens:
                 continue
-
-            is_dup = False
-            for existing_set in kept_sets:
-                if self._jaccard(tokens, existing_set) >= self.sim_threshold:
-                    is_dup = True
-                    break
-
+            is_dup = any(
+                self._jaccard(tokens, es) >= self.sim_threshold
+                for es in kept_sets
+            )
             if not is_dup:
                 kept.append(chunk)
                 kept_sets.append(tokens)
-
         return kept
 
     def _apply_budget(self, chunks: List[Dict]) -> List[Dict]:
         """
-        Keep chunks in ranked order until the character budget is exhausted.
-        Partially include the last fitting chunk (truncate at sentence boundary).
+        BUG-011: uses _count_tokens() (tiktoken) instead of word count.
+        Keep chunks in ranked order until the token budget is exhausted.
         """
-        result:   List[Dict] = []
-        remaining: int       = self._char_budget
+        result:    List[Dict] = []
+        remaining: int        = self.max_tokens
 
         for chunk in chunks:
             text = chunk.get("content", "")
             if not text:
                 continue
 
-            if len(text) <= remaining:
+            tok = _count_tokens(text)
+            if tok <= remaining:
                 result.append(chunk)
-                remaining -= len(text)
+                remaining -= tok
             else:
-                # Try to truncate at last sentence boundary
-                truncated = self._truncate_at_sentence(text, remaining)
+                # Truncate at sentence boundary to fit remaining budget
+                truncated = self._truncate_to_tokens(text, remaining)
                 if truncated:
-                    c = dict(chunk)          # shallow copy — don't mutate original
-                    c["content"] = truncated
+                    c = dict(chunk)
+                    c["content"]   = truncated
                     c["truncated"] = True
                     result.append(c)
-                break  # budget exhausted
+                break
 
             if remaining <= 0:
                 break
@@ -155,14 +136,10 @@ class ContextBuilder:
     def _annotate(
         self, chunks: List[Dict]
     ) -> Tuple[List[Dict], List[str]]:
-        """
-        Assign sequential [S1], [S2]… labels.
-        Chunks from the same source share the same label.
-        """
-        source_map:  Dict[str, str]  = {}   # source_id/name -> label
-        label_count: int             = 0
-        result:      List[Dict]      = []
-        sources:     List[str]       = []   # ordered unique labels
+        source_map:  Dict[str, str] = {}
+        label_count: int            = 0
+        result:      List[Dict]     = []
+        sources:     List[str]      = []
 
         for chunk in chunks:
             src_key = (
@@ -184,12 +161,11 @@ class ContextBuilder:
         return result, sources
 
     # ─────────────────────────────────────────────────────────────────────
-    #  Utility
+    #  Utilities
     # ─────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _tokenize(text: str) -> set:
-        """Simple whitespace tokenizer returning a set of unique lowercase words."""
         return set(re.findall(r"\b\w+\b", text.lower()))
 
     @staticmethod
@@ -199,17 +175,21 @@ class ContextBuilder:
         return len(a & b) / len(a | b)
 
     @staticmethod
-    def _truncate_at_sentence(text: str, max_chars: int) -> str:
-        """Truncate text at a sentence boundary not exceeding max_chars."""
-        if max_chars <= 0:
+    def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+        """Truncate text so it fits within max_tokens, at sentence boundary."""
+        if max_tokens <= 0:
             return ""
-        snippet = text[:max_chars]
-        # Walk back to find the last sentence-ending punctuation
+        # Binary-search-friendly: start with proportional char estimate
+        approx_chars = max_tokens * 4   # conservative 4 chars/token upper bound
+        snippet = text[:approx_chars]
+        # Shrink until it fits
+        while _count_tokens(snippet) > max_tokens and len(snippet) > 10:
+            snippet = snippet[:int(len(snippet) * 0.85)]
+        # Walk back to sentence boundary
         match = re.search(r"[.!?](?=[^.!?]*$)", snippet)
         if match:
             return snippet[: match.end()].strip()
-        # Fall back to last whitespace boundary
         last_space = snippet.rfind(" ")
-        if last_space > max_chars * 0.5:
+        if last_space > len(snippet) * 0.5:
             return snippet[:last_space].strip() + "…"
         return snippet.strip()

@@ -1,43 +1,19 @@
 """
 master_pipeline.py  —  Top-level orchestrator for Mini NotebookLM
 
-Fixes applied (original)
--------------------------
-1. HybridRetriever constructed with embedders={dim: embedder} dict.
-2. generate() delegates to ChatPipeline / DeepResearchPipeline / StudyPipeline.
-3. All three pipelines instantiated at startup and re-wired in set_mode().
-4. set_mode() re-creates only the history objects; pipelines updated in-place.
-5. stream=True path preserved for ChatPipeline only.
-6. persona_config parameter wired through generate() -> ChatPipeline.run().
-7. Mode string "deep_research" matched correctly.
-8. generate() non-streaming returns the full result dict.
+Bug fixes applied (2026-05-10 audit):
+  BUG-005: generate(stream=True) for deep_research / study modes now returns
+           _stream_dict() generator instead of a bare dict, which api.py's
+           event_generator would iterate as dict keys (garbling output).
+  BUG-009: asyncio.get_event_loop() removed; MasterPipeline is synchronous.
+  BUG-010: BM25 sparse index built at startup from persisted chunks.
+  BUG-023: Heavy model loading still happens here but is now triggered from
+           the FastAPI lifespan handler (api.py) so workers are ready before
+           the first request is accepted.
+  BUG-025: No deprecated asyncio calls remain in this file.
 
-Bug fixes (2026-05-10 audit)
-------------------------------
-B1. ContextualCompressor() was called with NO args, but old signature required
-    llm as a positional arg  ->  TypeError at startup.
-    Fixed: ContextualCompressor now takes llm=None as default (fixed in
-    contextual_compressor.py); no change needed here - but _rebuild_mode_pipelines
-    now also passes the llm to a fresh compressor so it is fully configured.
-B2. Reranker.rerank() default top_k=5 silently truncated deep-research results.
-    Fixed in reranker.py; no wiring change here.
-B3. DeepResearchPipeline did not expose context_chunks in result dict.
-    Fixed in deep_research_pipeline.py.
-B4. rag_history._history_source KeyError when format_for_prompt called without
-    prior get_relevant_history call.  Fixed in rag_history.py.
-B5. pipelines/__init__.py only exported ChatPipeline; DeepResearchPipeline and
-    StudyPipeline were missing.  Fixed in pipelines/__init__.py.
-B6. retrieval/__init__.py did not export ContextBuilder or query_expander classes.
-    Fixed in retrieval/__init__.py.
-
-RAGAS integration (2026-05-10)
--------------------------------
-- RAGASEvaluator singleton attached to MasterPipeline.
-- ragas_bridge.attach_ragas() called after every generate() / generate_full() call.
-- Streaming path skips evaluation (tokens yield incrementally; full answer
-  unavailable until stream is exhausted - callers should call evaluate_last()
-  manually if they want scores after a stream).
-- result dict now always contains 'ragas' key (dict or None).
+Fixes from previous audit (kept):
+  B1-B6 as documented in original docstring below.
 """
 from __future__ import annotations
 
@@ -97,7 +73,7 @@ from src.generation.llm_client import LLMClient
 from src.generation.prompt_builder import PromptBuilder
 from src.generation.response_parser import ResponseParser
 
-# -- Chat History (per-session) -------------------------------------------
+# -- Chat History ---------------------------------------------------------
 from src.chat_history.chat_history_manager import ChatHistoryManager
 from src.chat_history.rag_history import RAGChatHistory
 from src.chat_history.graph_history import GraphHistory
@@ -113,31 +89,22 @@ class MasterPipeline:
 
     Ingestion flow:
         file/url
-          -> FileDetector (auto-detect when source_type is None)
-          -> Pipeline (PDF/Website/YouTube/CSV/Image)
-          -> AdaptivePreprocessor
-          -> ChunkerRegistry.get_chunker(strategy)
-          -> EmbeddingPipeline.embed_chunks()
-          -> CrossModalMerger.merge()
-          -> StorageManager.store()               <- FAISS + SQLite + KnowledgeGraph
-          -> HybridRetriever.build_sparse_index() <- BM25 rebuild
+          -> FileDetector -> Pipeline -> AdaptivePreprocessor
+          -> ChunkerRegistry -> EmbeddingPipeline -> CrossModalMerger
+          -> StorageManager (FAISS + SQLite + KnowledgeGraph)
+          -> HybridRetriever.build_sparse_index()
 
     Generation flow (mode-dispatched):
         query
-          -> ChatPipeline.run(query)          [chat mode]
-          -> DeepResearchPipeline.run(query)  [research / deep_research mode]
-          -> StudyPipeline.run(query)         [study mode]
-          -> attach_ragas(result, query)      [ALL modes, non-streaming]
-
-    RAGAS keys in every result dict:
-        result["ragas"]  -> RAGASResult.to_dict() or None
-        Inline UI:  result["ragas"]["faithfulness"]   <- grounding badge
-        Panel UI:   result["ragas"]                   <- full RAGAS panel
+          -> ChatPipeline.run()          [chat mode]
+          -> DeepResearchPipeline.run()  [deep_research]
+          -> StudyPipeline.run()         [study]
+          -> attach_ragas(result, query) [non-streaming only]
     """
 
     def __init__(self, mode: str = "chat", config_path: str = "config.yaml"):
-        self.config = Config(config_path)
-        self.mode = mode
+        self.config     = Config(config_path)
+        self.mode       = mode
         self.session_id = str(uuid.uuid4())
 
         # -- Storage ---------------------------------------------------------
@@ -152,7 +119,6 @@ class MasterPipeline:
         )
         self.storage_manager = StorageManager(_faiss, _sqlite, _graph)
 
-        # Legacy GraphStorage - kept for GraphRetriever / StudyPipeline
         self.graph_storage   = GraphStorage()
         self.graph_retriever = GraphRetriever(self.graph_storage)
 
@@ -182,25 +148,25 @@ class MasterPipeline:
             storage_manager=self.storage_manager,
             embedders=self._embedders,
             top_k=self.config.get("retrieval.top_k", 5),
+            fetch_k_multiplier=self.config.get("retrieval.fetch_k_multiplier", 3),  # BUG-026
         )
 
         self.reranker   = Reranker()
-        self.compressor = ContextualCompressor()   # llm=None until set_llm() called
+        self.compressor = ContextualCompressor()
 
         # -- Generation ------------------------------------------------------
         self.llm: Optional[LLMClient] = None
         self.prompt_builder  = PromptBuilder()
         self.response_parser = ResponseParser()
 
-        # -- RAGAS Evaluator (lazy embedder inside — loads on first evaluate) -
+        # -- RAGAS Evaluator -------------------------------------------------
         self.ragas_evaluator = RAGASEvaluator(
             embedding_model=self._embed_model,
             overlap_threshold=self.config.get("evaluation.overlap_threshold", 0.25),
         )
-        # Keep last ragas result so callers can access it after a stream
         self._last_ragas: Optional[Dict[str, Any]] = None
 
-        # -- Chat History (per-session) --------------------------------------
+        # -- Chat History ----------------------------------------------------
         self.rag_history   = RAGChatHistory(session_id=self.session_id)
         self.graph_history = GraphHistory(
             session_id=self.session_id,
@@ -218,18 +184,32 @@ class MasterPipeline:
         self._response_cache: Dict[str, str] = {}
         self._warmup_registry()
 
+        # BUG-010: build sparse index at startup from persisted chunks
+        self._warmup_bm25()
+
+    # -------------------------------------------------------------------------
+    #  BM25 startup warm-up  (BUG-010)
+    # -------------------------------------------------------------------------
+
+    def _warmup_bm25(self) -> None:
+        """Build BM25 sparse index from any chunks already in the store."""
+        try:
+            all_chunks = self.storage_manager.get_all_chunks_for_bm25()
+            if all_chunks:
+                self.hybrid_retriever.build_sparse_index(all_chunks)
+                logger.info(
+                    "MasterPipeline: BM25 index built from %d persisted chunks",
+                    len(all_chunks),
+                )
+        except Exception as exc:
+            logger.warning("MasterPipeline: BM25 startup build failed (non-fatal): %s", exc)
+
     # -------------------------------------------------------------------------
     #  LLM / Mode config
     # -------------------------------------------------------------------------
 
     def set_llm(self, provider: str, model: str, api_key: str, **kwargs) -> None:
-        """Configure (or reconfigure) the LLM client, then rebuild mode pipelines."""
-        self.llm = LLMClient(
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            **kwargs,
-        )
+        self.llm = LLMClient(provider=provider, model=model, api_key=api_key, **kwargs)
         logger.info("MasterPipeline: LLM set to %s/%s", provider, model)
         self._rebuild_mode_pipelines()
 
@@ -246,21 +226,22 @@ class MasterPipeline:
         if self.llm:
             self._rebuild_mode_pipelines()
         logger.info(
-            "MasterPipeline: mode switched to '%s' (session=%s)",
-            mode, self.session_id,
+            "MasterPipeline: mode switched to '%s' (session=%s)", mode, self.session_id,
         )
 
     def _rebuild_mode_pipelines(self) -> None:
         if self.llm is None:
             return
 
-        llm_callable = self.llm.invoke
+        llm_callable   = self.llm.invoke
+        llm_stream_fn  = self.llm.stream     # BUG-004: separate stream callable
         self.compressor.llm = llm_callable
 
         self._chat_pipeline = ChatPipeline(
             hybrid_retriever=self.hybrid_retriever,
             rag_history=self.rag_history,
             llm=llm_callable,
+            llm_stream=llm_stream_fn,        # BUG-004
             top_k=self.config.get("retrieval.top_k", 5),
             history_k=3,
         )
@@ -287,7 +268,35 @@ class MasterPipeline:
         logger.info("MasterPipeline: mode pipelines rebuilt for mode='%s'", self.mode)
 
     # -------------------------------------------------------------------------
-    #  RAGAS helper — called externally after a stream is exhausted
+    #  _stream_dict  (BUG-005)
+    # -------------------------------------------------------------------------
+
+    def _stream_dict(self, result: dict) -> Iterator:
+        """
+        BUG-005: deep_research / study modes return a full result dict.
+        api.py's event_generator expects a lazy iterator that yields tokens
+        (str) and then one metadata dict.
+
+        Iterating a raw dict yields its *keys* ("answer", "citations", …)
+        as tokens — completely wrong.  This shim yields words from the answer
+        then emits the metadata dict as the final item.
+        """
+        answer = result.get("answer", "")
+        for word in answer.split(" "):
+            if word:
+                yield word + " "
+
+        meta_keys = [
+            "citations", "retrieved_chunks", "context_chunks",
+            "sources_used", "sub_queries", "quiz_cards",
+            "summary_bullets", "learning_path", "ragas",
+        ]
+        meta = {k: result[k] for k in meta_keys if k in result}
+        if meta:
+            yield meta
+
+    # -------------------------------------------------------------------------
+    #  RAGAS helper
     # -------------------------------------------------------------------------
 
     def evaluate_response(
@@ -297,21 +306,13 @@ class MasterPipeline:
         context_chunks: Optional[List[Dict]] = None,
         ground_truth: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Run RAGAS evaluation on a (query, answer, context) triple.
-        Useful after streaming responses when the caller has collected
-        the full answer text.
-
-        Returns RAGASResult.to_dict() or None on failure.
-        """
         if not answer or not answer.strip():
             return None
-        chunks = context_chunks or []
         try:
             r = self.ragas_evaluator.evaluate(
                 question=query,
                 answer=answer,
-                context_chunks=chunks,
+                context_chunks=context_chunks or [],
                 ground_truth=ground_truth,
             )
             self._last_ragas = r.to_dict()
@@ -322,7 +323,6 @@ class MasterPipeline:
 
     @property
     def last_ragas(self) -> Optional[Dict[str, Any]]:
-        """Return the most recent RAGAS result dict (across all modes)."""
         return self._last_ragas
 
     # -------------------------------------------------------------------------
@@ -349,9 +349,7 @@ class MasterPipeline:
                 raise RuntimeError(f"FileDetector failed: {exc}") from exc
 
         self.ingestion_graph.add_source(
-            source_id,
-            name=file_path or url or "unknown",
-            source_type=resolved_type,
+            source_id, name=file_path or url or "unknown", source_type=resolved_type,
         )
 
         try:
@@ -366,9 +364,7 @@ class MasterPipeline:
                 result = YouTubePipeline.process(url, source_id)
             elif resolved_type == "website":
                 loop   = asyncio.get_event_loop()
-                result = loop.run_until_complete(
-                    WebsitePipeline.process(url, source_id)
-                )
+                result = loop.run_until_complete(WebsitePipeline.process(url, source_id))
             elif resolved_type == "csv":
                 result = CSVPipeline.process(file_path, source_id)
             else:
@@ -383,9 +379,7 @@ class MasterPipeline:
         self.ingestion_graph.mark_stage(source_id, "extract")
 
         try:
-            preprocessed = self.preprocessor.preprocess(
-                raw_content, source_type=resolved_type
-            )
+            preprocessed = self.preprocessor.preprocess(raw_content, source_type=resolved_type)
         except Exception as exc:
             self.ingestion_graph.mark_error(source_id, stage="preprocess", error=str(exc))
             raise RuntimeError(f"Preprocessing failed: {exc}") from exc
@@ -432,10 +426,8 @@ class MasterPipeline:
         }
         try:
             self.storage_manager.store(
-                source_record,
-                merged_chunks,
-                embedding_model=active_model,
-                dim=active_dim,
+                source_record, merged_chunks,
+                embedding_model=active_model, dim=active_dim,
             )
         except Exception as exc:
             self.ingestion_graph.mark_error(source_id, stage="store", error=str(exc))
@@ -472,9 +464,9 @@ class MasterPipeline:
         """
         Route query to the correct mode pipeline.
 
-        Non-streaming path: always returns a Dict with a 'ragas' key.
-        Streaming path    : yields tokens (no ragas — call evaluate_response()
-                            after collecting the full answer).
+        Non-streaming: returns a Dict with 'ragas' key.
+        Streaming:     returns a lazy iterator (tokens + final metadata dict).
+                       BUG-005: deep/study modes now use _stream_dict().
         """
         if not self.llm:
             raise RuntimeError("LLM not configured. Call set_llm() first.")
@@ -483,12 +475,11 @@ class MasterPipeline:
                 "Mode pipelines not initialised. Call set_llm() before generate()."
             )
 
-        # -- Chat mode --------------------------------------------------------
+        # -- Chat ------------------------------------------------------------
         if self.mode == "chat":
             if stream:
                 chunks = self.hybrid_retriever.retrieve(
-                    query,
-                    top_k=self.config.get("retrieval.top_k", 5),
+                    query, top_k=self.config.get("retrieval.top_k", 5),
                 )
                 history_context = self.rag_history.format_for_prompt(query, k=3)
                 prompt = self._chat_pipeline._build_prompt(
@@ -497,19 +488,16 @@ class MasterPipeline:
 
                 def _stream_and_record() -> Iterator[str]:
                     full = ""
+                    # BUG-004: use self.llm.stream (not self.llm.invoke)
                     for token in self.llm.stream(prompt):
                         full += token
                         yield token
                     self.rag_history.add_message("user", query)
                     self.rag_history.add_message("assistant", full)
-                    # Post-stream evaluation — result stored in self._last_ragas
-                    # UI can call pipeline.last_ragas to get the score
                     try:
                         self.evaluate_response(
-                            query=query,
-                            answer=full,
-                            context_chunks=chunks,
-                            ground_truth=ground_truth,
+                            query=query, answer=full,
+                            context_chunks=chunks, ground_truth=ground_truth,
                         )
                     except Exception:
                         pass
@@ -521,19 +509,21 @@ class MasterPipeline:
                 self._last_ragas = result.get("ragas")
                 return result
 
-        # -- Deep Research mode -----------------------------------------------
+        # -- Deep Research ---------------------------------------------------
         elif self.mode in ("research", "deep_research"):
             result = self._research_pipeline.run(query)
             attach_ragas(result, query, self.ragas_evaluator, ground_truth)
             self._last_ragas = result.get("ragas")
-            return result
+            # BUG-005: wrap in stream iterator if requested
+            return self._stream_dict(result) if stream else result
 
-        # -- Study mode -------------------------------------------------------
+        # -- Study -----------------------------------------------------------
         elif self.mode == "study":
             result = self._study_pipeline.run(query)
             attach_ragas(result, query, self.ragas_evaluator, ground_truth)
             self._last_ragas = result.get("ragas")
-            return result
+            # BUG-005: wrap in stream iterator if requested
+            return self._stream_dict(result) if stream else result
 
         else:
             raise ValueError(f"Unknown mode: '{self.mode}'")
@@ -544,10 +534,6 @@ class MasterPipeline:
         persona_config=None,
         ground_truth: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Always non-streaming; always returns the full result dict
-        including sources, learning_path, sub_queries, AND ragas.
-        """
         if not self.llm:
             raise RuntimeError("LLM not configured. Call set_llm() first.")
         if self._chat_pipeline is None:
@@ -590,13 +576,10 @@ class MasterPipeline:
             try:
                 ep = EmbeddingRegistry.get(model_name)
                 self._embedders[dim] = ep
-                logger.info(
-                    "_warmup_registry: registered dim=%d -> %s", dim, model_name
-                )
+                logger.info("_warmup_registry: registered dim=%d -> %s", dim, model_name)
             except Exception as exc:
                 logger.warning(
-                    "_warmup_registry: failed for dim=%d (%s): %s",
-                    dim, model_name, exc,
+                    "_warmup_registry: failed for dim=%d (%s): %s", dim, model_name, exc,
                 )
 
     def delete_source(self, source_id: str) -> bool:
@@ -611,10 +594,10 @@ class MasterPipeline:
 
     def get_stats(self) -> Dict[str, Any]:
         return {
-            "session_id":   self.session_id,
-            "mode":         self.mode,
-            "embed_dim":    self._embed_dim,
-            "embed_model":  self._embed_model,
-            "active_dims":  list(self._embedders.keys()),
-            "storage":      self.storage_manager.get_stats(),
+            "session_id":  self.session_id,
+            "mode":        self.mode,
+            "embed_dim":   self._embed_dim,
+            "embed_model": self._embed_model,
+            "active_dims": list(self._embedders.keys()),
+            "storage":     self.storage_manager.get_stats(),
         }

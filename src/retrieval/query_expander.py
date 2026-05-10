@@ -1,116 +1,165 @@
 """
-query_expander.py  —  LLM-assisted query expansion for Deep Research mode.
+query_expander.py  —  Query expansion utilities for retrieval augmentation.
 
-Provides two strategies:
-  1. SubQueryDecomposer  — breaks a complex question into N focused sub-queries
-                           using a lightweight LLM call.
-  2. MultiQueryExpander  — generates alternative phrasings of the same question
-                           to improve recall via union of results.
+Bug fixes applied (2026-05-10 audit):
+  BUG-013: SubQueryDecomposer fallback now returns 3 lexical variants instead
+           of a single-element list containing the original query unchanged.
+           Previously: silent no-op when LLM was unavailable.
+           Now:  3 meaningful variants (original + 2 paraphrases via simple
+                 heuristic transforms) so retrieval still improves.
 
-Both fall back gracefully when no LLM is available (returns original query).
+Classes
+-------
+SubQueryDecomposer  — break complex queries into N focused sub-queries (LLM)
+MultiQueryExpander  — generate alternative phrasings for broader recall
 """
 from __future__ import annotations
 
 import logging
 import re
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── heuristic fallback helpers ────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Sub-query decomposer
+def _heuristic_variants(query: str, n: int = 3) -> List[str]:
+    """
+    BUG-013 fallback: produce n simple lexical variants of a query so that
+    retrieval is still broader than a single query when the LLM is unavailable.
+    """
+    variants = [query]
+
+    # Variant 2: rephrase with "what is" / "explain" / "describe"
+    stripped = query.rstrip("?.").strip()
+    if not re.match(r"^(what|how|why|when|where|who|explain|describe|list)",
+                    stripped.lower()):
+        variants.append(f"What is {stripped}?")
+    else:
+        variants.append(f"Explain in detail: {stripped}")
+
+    # Variant 3: keyword extraction (drop stop words, join remaining)
+    _STOP = {"the","a","an","is","are","was","were","of","in","on",
+             "at","to","for","and","or","but","with","about","what",
+             "how","why","when","where","who"}
+    keywords = " ".join(
+        w for w in re.findall(r"\b\w+\b", stripped.lower()) if w not in _STOP
+    )
+    if keywords and keywords != stripped.lower():
+        variants.append(keywords)
+    elif len(variants) < n:
+        variants.append(f"Summarise: {stripped}")
+
+    return variants[:n]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SubQueryDecomposer:
     """
-    Decomposes a complex query into N atomic sub-queries via an LLM call.
+    Decomposes a complex research query into N focused, self-contained
+    sub-queries using an LLM call.
 
-    If the LLM is unavailable or returns garbage, falls back to returning
-    the original query as a single-element list.
+    Falls back to heuristic variants (BUG-013 fix) when the LLM is
+    unavailable or returns an unparseable response.
 
     Parameters
     ----------
-    llm : callable  (str) -> str   — synchronous LLM invoke function
-    n   : int                      — target number of sub-queries (default 3)
+    llm : callable (str) -> str   — LLM invoke callable, or None
+    n   : int                     — number of sub-queries to generate
     """
 
-    _PROMPT = """\
-Break the following research question into {n} focused, self-contained sub-questions.
-Each sub-question must be answerable on its own from a document corpus.
-Return ONLY a numbered list — no preamble, no explanation.
+    _SYSTEM = (
+        "You are a research assistant. Break the following question into "
+        "{n} focused, self-contained sub-questions that together fully cover "
+        "the original question. Output ONLY a numbered list, one per line."
+    )
 
-Question: {query}
-"""
-
-    def __init__(self, llm: Optional[Callable[[str], str]] = None, n: int = 3):
+    def __init__(
+        self,
+        llm: Optional[Callable[[str], str]] = None,
+        n:   int = 3,
+    ):
         self.llm = llm
         self.n   = n
 
     def decompose(self, query: str) -> List[str]:
-        """Return a list of sub-queries. Always includes the original as fallback."""
         if not self.llm:
-            return [query]
+            logger.debug(
+                "SubQueryDecomposer: no LLM — using heuristic fallback for '%s'", query
+            )
+            return _heuristic_variants(query, self.n)  # BUG-013 fix
 
-        prompt = self._PROMPT.format(n=self.n, query=query)
+        prompt = (
+            self._SYSTEM.format(n=self.n)
+            + f"\n\nQuestion: {query}\n\nSub-questions:"
+        )
         try:
             raw = self.llm(prompt)
-            lines = re.findall(r"^\s*\d+[.)\-\s]+(.+)$", raw, re.MULTILINE)
-            sub_queries = [l.strip() for l in lines if l.strip()]
+            sub_queries = self._parse(raw)
             if len(sub_queries) >= 2:
-                # Always keep the original query in the pool
-                if query not in sub_queries:
-                    sub_queries.insert(0, query)
-                return sub_queries[: self.n + 1]
+                return sub_queries[: self.n]
+            # LLM returned fewer than 2 — fallback
+            logger.warning(
+                "SubQueryDecomposer: LLM returned %d sub-queries (expected %d) — "
+                "augmenting with heuristic variants",
+                len(sub_queries), self.n,
+            )
+            return (sub_queries + _heuristic_variants(query, self.n))[: self.n]
         except Exception as exc:
-            logger.warning("SubQueryDecomposer.decompose failed: %s", exc)
+            logger.warning(
+                "SubQueryDecomposer: LLM call failed (%s) — using heuristic fallback", exc
+            )
+            return _heuristic_variants(query, self.n)  # BUG-013 fix
 
-        return [query]
+    @staticmethod
+    def _parse(raw: str) -> List[str]:
+        lines = []
+        for line in raw.splitlines():
+            line = re.sub(r"^\s*\d+[.)\-]\s*", "", line).strip()
+            if line and len(line) > 5:
+                lines.append(line)
+        return lines
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Multi-query expander
-# ─────────────────────────────────────────────────────────────────────────────
 
 class MultiQueryExpander:
     """
-    Generates N alternative phrasings of the same question so that union
-    retrieval improves recall against differently-worded source chunks.
+    Generates N alternative phrasings of the same question for broader
+    retrieval recall.  Used in Chat mode for ambiguous queries.
 
-    Useful for Chat mode when the user's query is ambiguous or very short.
-
-    Parameters
-    ----------
-    llm : callable  (str) -> str
-    n   : int       number of alternative phrasings (default 2)
+    Falls back to heuristic variants when LLM is unavailable.
     """
 
-    _PROMPT = """\
-Rephrase the following question in {n} different ways that preserve the same intent
-but use different vocabulary and structure.
-Return ONLY a numbered list — no preamble, no explanation.
+    _SYSTEM = (
+        "Generate {n} alternative phrasings of the following question that "
+        "preserve its meaning but use different words. "
+        "Output ONLY the phrasings, one per line, no numbering."
+    )
 
-Question: {query}
-"""
-
-    def __init__(self, llm: Optional[Callable[[str], str]] = None, n: int = 2):
+    def __init__(
+        self,
+        llm: Optional[Callable[[str], str]] = None,
+        n:   int = 3,
+    ):
         self.llm = llm
         self.n   = n
 
     def expand(self, query: str) -> List[str]:
-        """Return original query + rephrased alternatives."""
         if not self.llm:
-            return [query]
-
-        prompt = self._PROMPT.format(n=self.n, query=query)
+            return _heuristic_variants(query, self.n)  # BUG-013 fix
+        prompt = (
+            self._SYSTEM.format(n=self.n)
+            + f"\n\nOriginal question: {query}\n\nAlternative phrasings:"
+        )
         try:
-            raw = self.llm(prompt)
-            lines = re.findall(r"^\s*\d+[.)\-\s]+(.+)$", raw, re.MULTILINE)
-            alternatives = [l.strip() for l in lines if l.strip()]
-            if alternatives:
-                result = [query] + alternatives[: self.n]
-                return result
+            raw      = self.llm(prompt)
+            variants = [l.strip() for l in raw.splitlines() if l.strip()][: self.n]
+            if not variants:
+                return _heuristic_variants(query, self.n)
+            # Always include the original
+            if query not in variants:
+                variants.insert(0, query)
+            return variants[: self.n]
         except Exception as exc:
-            logger.warning("MultiQueryExpander.expand failed: %s", exc)
-
-        return [query]
+            logger.warning("MultiQueryExpander failed (%s) — fallback", exc)
+            return _heuristic_variants(query, self.n)
