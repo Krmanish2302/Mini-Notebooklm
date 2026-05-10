@@ -107,6 +107,14 @@ html,body,#root{height:100%;background:var(--bg);color:var(--text);font-family:v
 .prow:last-child{border-bottom:none}
 .pval{color:var(--text);font-weight:500}
 
+/* token stats table */
+.token-table{width:100%;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:8px;font-family:var(--font-mono);font-size:10px}
+.token-table-hdr{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;background:var(--panel);padding:5px 8px;border-bottom:1px solid var(--border);font-size:9px;font-weight:700;letter-spacing:.08em;color:var(--muted);text-transform:uppercase}
+.token-table-row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;padding:5px 8px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s}
+.token-table-row:last-child{border-bottom:none}
+.token-table-row:hover{background:rgba(124,106,247,.05)}
+.token-table-row.active-row{background:rgba(124,106,247,.08);color:var(--accent)}
+
 /* embedding model options */
 .emb-opt{
   display:flex;align-items:center;justify-content:space-between;
@@ -253,6 +261,7 @@ input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer;height:3p
 .hdr-btn:hover{border-color:var(--accent);color:var(--accent)}
 
 .toast{position:fixed;bottom:18px;right:18px;background:var(--panel);border:1px solid var(--green);border-radius:10px;padding:9px 15px;font-size:12px;color:var(--green);z-index:999;animation:slideUp .22s;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+.toast.err{border-color:var(--red);color:var(--red)}
 
 @keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
 @keyframes slideUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
@@ -280,6 +289,7 @@ const CHUNKERS = [
   {id:"semantic",    label:"Semantic"},
   {id:"hierarchical",label:"Hierarchical"},
 ];
+// Fallback static estimates used only when /api/analyze is unavailable
 const CHUNK_EST = {paragraph:47,page:12,recursive:39,hierarchical:28,semantic:31};
 const SRC_ICONS = {pdf:"📄",youtube:"▶️",website:"🌐",text:"📝",image:"🖼️",csv:"📊",video:"🎬"};
 
@@ -348,35 +358,42 @@ function MiniGraph() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  EMBED FLOW
+//  EMBED FLOW  — wired to real /api/analyze + /api/ingest
 // ─────────────────────────────────────────────────────────────────────────────
-function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDone}){
+function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDone,analysisData,analyzing}){
   const [phase,setPhase]=useState("idle");
   const [progress,setProgress]=useState(0);
   const [stepLabel,setStepLabel]=useState("");
 
   const emb=EMB_MODELS.find(e=>e.id===embModel);
-  const totalChunks=CHUNK_EST[chunker]*pendingSources.length;
+
+  // Use real per-strategy stats if available, else fall back to static estimate
+  const strat=analysisData?.[chunker];
+  const totalChunks=strat ? strat.total_chunks : CHUNK_EST[chunker]*pendingSources.length;
   const totalTokens=totalChunks*(emb?.tokens||256);
 
-  const run=()=>{
-    setPhase("analyzing");setProgress(5);setStepLabel("Detecting content types…");
-    const steps=[
-      [18,"analyzing","Analysing document structure…"],
-      [36,"chunking", `Chunking · ${chunker} strategy…`],
-      [58,"chunking", `Generated ~${totalChunks} chunks`],
-      [78,"embedding",`Embedding with ${emb?.name}…`],
-      [94,"embedding","Writing to FAISS store…"],
-      [100,"done",    "✓ All sources embedded"],
-    ];
-    let i=0;
-    const tick=()=>{
-      if(i>=steps.length){onDone(embModel,chunker,totalChunks);return;}
-      const[p,ph,lbl]=steps[i++];
-      setProgress(p);setPhase(ph);setStepLabel(lbl);
-      setTimeout(tick,400+Math.random()*200);
-    };
-    setTimeout(tick,300);
+  const run=async()=>{
+    setPhase("analyzing");setProgress(10);setStepLabel("Sending to ingest pipeline…");
+    try{
+      const form=new FormData();
+      form.append("chunker",chunker);
+      form.append("emb_model",embModel);
+      pendingSources.forEach(s=>form.append("source_ids",s.id));
+
+      setProgress(30);setStepLabel(`Chunking · ${chunker} strategy…`);
+      const res=await fetch("/api/ingest",{method:"POST",body:form});
+      setProgress(65);setStepLabel(`Embedding with ${emb?.name}…`);
+      if(!res.ok) throw new Error(`Ingest failed: ${res.status}`);
+      const data=await res.json();
+      setProgress(90);setStepLabel("Writing to FAISS vector store…");
+      await new Promise(r=>setTimeout(r,350));
+      setProgress(100);setPhase("done");setStepLabel("✓ All sources embedded");
+      onDone(embModel,chunker,data.total_chunks??totalChunks);
+    }catch(err){
+      setPhase("idle");setProgress(0);setStepLabel("");
+      // bubble up to parent toast
+      onDone(null,null,0,err.message);
+    }
   };
 
   if(pendingSources.length===0)return null;
@@ -393,11 +410,11 @@ function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDon
           </div>
           <div style={{fontFamily:"var(--font-mono)",fontSize:10,color:"var(--muted)"}}>
             type: <span style={{color:"var(--text)"}}>{s.type}</span>
-            {" · "}est. chunks: <span style={{color:"var(--text)"}}>{CHUNK_EST[chunker]}</span>
             {" · "}dim: <span style={{color:"var(--text)"}}>{emb?.dim}</span>
           </div>
         </div>
       ))}
+
       <div className="sb-label" style={{marginTop:10}}>Chunking Strategy</div>
       <div className="chip-row">
         {CHUNKERS.map(c=>(
@@ -405,12 +422,42 @@ function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDon
             disabled={phase!=="idle"} onClick={()=>setChunker(c.id)}>{c.label}</button>
         ))}
       </div>
+
+      {/* Token stats — spinner while analyzing */}
+      {analyzing&&(
+        <div style={{fontFamily:"var(--font-mono)",fontSize:10,color:"var(--muted)",padding:"6px 0",display:"flex",alignItems:"center",gap:6}}>
+          <span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>⟳</span>
+          Analysing document structure…
+        </div>
+      )}
+
+      {/* Real per-strategy token table from /api/analyze */}
+      {analysisData&&!analyzing&&(
+        <div className="token-table">
+          <div className="token-table-hdr">
+            <span>Strategy</span><span>Avg tok</span><span style={{color:"var(--green)"}}>Min</span><span style={{color:"var(--amber)"}}>Max</span>
+          </div>
+          {Object.entries(analysisData).map(([key,val])=>(
+            <div key={key}
+              className={`token-table-row${chunker===key?" active-row":""}`}
+              onClick={()=>phase==="idle"&&setChunker(key)}>
+              <span style={{textTransform:"capitalize",fontWeight:chunker===key?700:400}}>{key}</span>
+              <span>{val.avg}</span>
+              <span style={{color:"var(--green)"}}>{val.min}</span>
+              <span style={{color:"var(--amber)"}}>{val.max}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Preview summary box */}
       <div className="preview-box">
         <div className="prow"><span>Est. chunks</span><span className="pval">{totalChunks}</span></div>
         <div className="prow"><span>Tokens/chunk</span><span className="pval">~{emb?.tokens}</span></div>
         <div className="prow"><span>Total tokens</span><span className="pval">{totalTokens.toLocaleString()}</span></div>
         <div className="prow"><span>Vector dim</span><span className="pval">{emb?.dim}</span></div>
       </div>
+
       <div className="sb-label">Embedding Model</div>
       {EMB_MODELS.map(e=>(
         <div key={e.id} className={`emb-opt${embModel===e.id?" active":""}`}
@@ -423,6 +470,7 @@ function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDon
           {embModel===e.id&&<span style={{color:"var(--accent)",fontSize:12}}>✓</span>}
         </div>
       ))}
+
       {phase!=="idle"&&(
         <div className="prog-wrap">
           <div className="prog-lbl">{phase.charAt(0).toUpperCase()+phase.slice(1)}…</div>
@@ -444,8 +492,9 @@ function EmbedFlow({pendingSources,chunker,setChunker,embModel,setEmbModel,onDon
 // ─────────────────────────────────────────────────────────────────────────────
 function useToast(){
   const[t,setT]=useState(null);
-  const show=(msg)=>{setT(msg);setTimeout(()=>setT(null),2600);};
-  return[t,show];
+  const[err,setErr]=useState(false);
+  const show=(msg,isErr=false)=>{setT(msg);setErr(isErr);setTimeout(()=>{setT(null);setErr(false);},2800);};
+  return[t,err,show];
 }
 
 export default function App(){
@@ -468,6 +517,9 @@ export default function App(){
   const fileRef=useRef(null);
   const[chunker,setChunker]=useState("hierarchical");
   const[embModel,setEmbModel]=useState("minilm");
+  // Real per-strategy token analysis data from /api/analyze
+  const[analysisData,setAnalysisData]=useState(null);
+  const[analyzing,setAnalyzing]=useState(false);
   const[history,setHistory]=useState(DEMO_HISTORY);
   const[activeSession,setActiveSession]=useState("h1");
   const[messages,setMessages]=useState(DEMO_MESSAGES);
@@ -477,7 +529,7 @@ export default function App(){
   const[topP,setTopP]=useState(0.9);
   const[topK,setTopK]=useState(40);
   const[maxTokens,setMaxTokens]=useState(1024);
-  const[toast,showToast]=useToast();
+  const[toast,toastErr,showToast]=useToast();
   const bottomRef=useRef(null);
 
   useEffect(()=>{bottomRef.current?.scrollIntoView({behavior:"smooth"});},[messages,loading]);
@@ -500,7 +552,7 @@ export default function App(){
 
   const ingestSelected=()=>{
     const sel=Object.entries(selectedSR).filter(([,v])=>v).map(([k])=>k);
-    if(!sel.length)return showToast("Select at least one result first");
+    if(!sel.length)return showToast("Select at least one result first",true);
     const news=sel.map(id=>{
       const r=searchResults.find(x=>x.id===id);
       return{id:`src_${id}`,type:"website",name:r.title.slice(0,42),chunks:0,vectors:0,embModel,status:"pending"};
@@ -510,13 +562,35 @@ export default function App(){
     showToast(`${news.length} source(s) queued`);
   };
 
+  // Call /api/analyze after a file is queued to get real per-strategy token stats
+  const analyzeFile=async(file)=>{
+    setAnalyzing(true);
+    setAnalysisData(null);
+    const form=new FormData();
+    form.append("file",file);
+    try{
+      const res=await fetch("/api/analyze",{method:"POST",body:form});
+      if(!res.ok) throw new Error(`analyze ${res.status}`);
+      const data=await res.json();
+      // Expected: { strategies: { paragraph:{avg,min,max,total_chunks}, ... } }
+      setAnalysisData(data.strategies??null);
+    }catch(err){
+      // Non-fatal: fall back to static estimates silently
+      console.warn("analyze fallback:",err.message);
+      setAnalysisData(null);
+    }finally{
+      setAnalyzing(false);
+    }
+  };
+
   const onFile=(e)=>{
     const f=e.target.files?.[0];if(!f)return;
     const ext=f.name.split(".").pop().toLowerCase();
     const type={pdf:"pdf",csv:"csv",png:"image",jpg:"image",mp4:"video"}[ext]||"text";
-    setPendingSources(p=>[...p,{id:`src_${Date.now()}`,type,name:f.name,chunks:0,vectors:0,embModel,status:"pending"}]);
+    setPendingSources(p=>[...p,{id:`src_${Date.now()}`,type,name:f.name,chunks:0,vectors:0,embModel,status:"pending",_file:f}]);
     e.target.value="";
-    showToast(`${f.name} queued`);
+    showToast(`${f.name} queued — analysing…`);
+    analyzeFile(f);
   };
 
   const addUrl=()=>{
@@ -534,14 +608,31 @@ export default function App(){
     setPasteText("");showToast("Text queued");
   };
 
-  const handleEmbedDone=(emb,chk,count)=>{
-    const done=pendingSources.map(s=>({...s,status:"ready",embModel:emb,chunks:CHUNK_EST[chk],vectors:CHUNK_EST[chk]}));
+  // Called by EmbedFlow when /api/ingest completes (or fails)
+  const handleEmbedDone=(emb,chk,count,errMsg)=>{
+    if(errMsg){
+      showToast(`⚠ Ingest failed: ${errMsg}`,true);
+      return;
+    }
+    const chunkCount=count||CHUNK_EST[chk]||0;
+    const done=pendingSources.map(s=>({...s,status:"ready",embModel:emb,chunks:chunkCount,vectors:chunkCount}));
     setSources(s=>[...s,...done]);
     setPendingSources([]);
+    setAnalysisData(null);
     showToast(`✓ ${done.length} source(s) embedded`);
   };
 
-  const deleteSource=(id)=>{setSources(s=>s.filter(x=>x.id!==id));showToast("Removed from DB + vector store");};
+  // Wired to DELETE /api/sources/:id — removes from FAISS + SQLite + state
+  const deleteSource=async(id)=>{
+    try{
+      const res=await fetch(`/api/sources/${id}`,{method:"DELETE"});
+      if(!res.ok) throw new Error(`${res.status}`);
+      setSources(s=>s.filter(x=>x.id!==id));
+      showToast("Removed from DB + vector store");
+    }catch(err){
+      showToast(`⚠ Delete failed (${err.message})`,true);
+    }
+  };
 
   const sendMessage=()=>{
     if(!input.trim())return;
@@ -607,7 +698,7 @@ export default function App(){
               <button className="send-btn" style={{width:32,height:32,borderRadius:8,fontSize:12}} onClick={doSearch}>↵</button>
             </div>
             {searchResults.map(r=>(
-              <div key={r.id} className={`search-result${selectedSR[r.id]?" sel":""}`} onClick={()=>setSelectedSR(s=>({...s,[r.id]:!s[r.id]}))}>  
+              <div key={r.id} className={`search-result${selectedSR[r.id]?" sel":""}`} onClick={()=>setSelectedSR(s=>({...s,[r.id]:!s[r.id]}))}>
                 <input type="checkbox" readOnly checked={!!selectedSR[r.id]} style={{marginTop:2,accentColor:"var(--accent)",flexShrink:0}}/>
                 <div><div className="sr-title">{r.title}</div><div className="sr-snip">{r.snippet}</div></div>
               </div>
@@ -629,7 +720,14 @@ export default function App(){
                 {ingestTab==="text"&&(<><textarea className="sb-input" rows={3} placeholder="Paste text here…" value={pasteText} onChange={e=>setPasteText(e.target.value)} style={{resize:"none"}}/><button className="action-btn" style={{marginTop:6,marginBottom:0,width:"100%"}} onClick={addPaste}>+ Add text</button></>)}
               </div>
             </div>
-            <EmbedFlow pendingSources={pendingSources} chunker={chunker} setChunker={setChunker} embModel={embModel} setEmbModel={setEmbModel} onDone={handleEmbedDone}/>
+            <EmbedFlow
+              pendingSources={pendingSources}
+              chunker={chunker} setChunker={setChunker}
+              embModel={embModel} setEmbModel={setEmbModel}
+              onDone={handleEmbedDone}
+              analysisData={analysisData}
+              analyzing={analyzing}
+            />
           </div>
           <div className="sb-section" style={{flex:1}}>
             <div className="sb-label" style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>Source List<span style={{color:"var(--muted)",fontFamily:"var(--font-mono)",fontSize:9,fontWeight:400}}>{sources.length} sources</span></div>
@@ -654,7 +752,7 @@ export default function App(){
             <div className="sb-label">Chat History</div>
             {history.map(h=>(
               <div key={h.id} className={`hist-item${activeSession===h.id?" active":""}`} onClick={()=>loadSession(h.id)}>
-                <div className={`hist-dot${activeSession===h.id?"":" old"}`}/>
+                <div className={`hist-dot${activeSession===h.id?"":""} ${activeSession===h.id?"":"old"}`}/>
                 <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.title}</span>
               </div>
             ))}
@@ -725,7 +823,7 @@ export default function App(){
           </div>
         </div>
       </div>
-      {toast&&<div className="toast">{toast}</div>}
+      {toast&&<div className={`toast${toastErr?" err":""}`}>{toast}</div>}
     </>
   );
 }
