@@ -1,6 +1,13 @@
 """
 faiss_store.py  —  Multi-dimensional FAISS store
 
+Fixes applied
+-------------
+BUG-C05  Added public get_internal_id(chunk_id, dim) -> Optional[int] so
+         StorageManager never accesses private _indexes or _DimIndex.id_map
+         directly.  The old code would AttributeError on any index type that
+         doesn't expose id_map as a Python dict.
+
 Design:
     One IndexIDMap2(IndexFlatIP) per embedding dimension.
     IndexIDMap2 + DirectMap.Hashtable enables O(1) deletion by FAISS internal
@@ -8,19 +15,6 @@ Design:
 
     dim_registry maps:  dim (int) -> FAISSIndex dataclass
     Each index is persisted at:  <base_dir>/faiss_<dim>.index
-
-Deletion flow:
-    delete_chunks(chunk_ids, dim)
-      -> group fids from id_map
-      -> index.remove_ids(IDSelectorArray)
-      -> update id_map / rev_map
-      -> persist
-
-Retrieval flow:
-    search(query_vectors_by_dim, k)
-      -> for each dim: search that index with correct query vector
-      -> return {dim: [(chunk_id, score), ...]}
-      -> caller applies RRF fusion
 """
 from __future__ import annotations
 
@@ -43,9 +37,7 @@ class _DimIndex:
     """One FAISS index for a specific embedding dimension."""
     dim: int
     index: faiss.Index
-    # chunk_id -> faiss internal int64 ID
     id_map: Dict[str, int] = field(default_factory=dict)
-    # faiss internal int64 ID -> chunk_id  (reverse map)
     rev_map: Dict[int, str] = field(default_factory=dict)
     _next_id: int = 0
 
@@ -58,30 +50,17 @@ class _DimIndex:
 class MultiFAISSStore:
     """
     Multi-dimensional FAISS store backed by LangChain-compatible metadata.
-
-    Each embedding model produces a fixed dimension.  Documents embedded with
-    different models are stored in separate per-dim indexes.  At query time the
-    caller provides a query vector per active dimension; results are merged by
-    the HybridRetriever using RRF.
     """
 
     def __init__(self, base_dir: str = _BASE_DIR):
         self.base_dir = base_dir
         os.makedirs(base_dir, exist_ok=True)
-        # dim -> _DimIndex
         self._indexes: Dict[int, _DimIndex] = {}
         self._load_all()
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def add_chunks(self, chunks: List[Dict], dim: int) -> None:
-        """
-        Add embedded chunks to the index for *dim*.
-
-        Each chunk must have:
-            chunk["id"]        : str
-            chunk["embedding"] : List[float] | np.ndarray  — length == dim
-        """
         if not chunks:
             return
         idx = self._get_or_create(dim)
@@ -109,16 +88,6 @@ class MultiFAISSStore:
         query_vectors: Dict[int, np.ndarray],
         k: int = 10,
     ) -> Dict[int, List[Tuple[str, float]]]:
-        """
-        Search all requested dimensions.
-
-        Args:
-            query_vectors: {dim: query_vector (1-D np.ndarray)}
-            k:             top-K per index
-
-        Returns:
-            {dim: [(chunk_id, score), ...]}  — sorted by score desc per dim
-        """
         results: Dict[int, List[Tuple[str, float]]] = {}
         for dim, qvec in query_vectors.items():
             if dim not in self._indexes:
@@ -143,10 +112,6 @@ class MultiFAISSStore:
         return results
 
     def delete_chunks(self, chunk_ids: List[str], dim: int) -> None:
-        """
-        Physically remove vectors from the index for *dim*.
-        Uses IndexIDMap2 + Hashtable direct map — O(1) per deletion.
-        """
         if dim not in self._indexes:
             return
         idx = self._indexes[dim]
@@ -162,8 +127,19 @@ class MultiFAISSStore:
         self._save(dim)
         logger.info("MultiFAISSStore: deleted %d vectors from dim=%d", len(fids), dim)
 
+    # BUG-C05: public method — never let callers reach into _indexes directly
+    def get_internal_id(self, chunk_id: str, dim: int) -> Optional[int]:
+        """
+        Return the FAISS internal int64 ID for *chunk_id* in index *dim*,
+        or None if not found.  Replaces the old pattern of directly accessing
+        self._indexes[dim].id_map from StorageManager.
+        """
+        idx = self._indexes.get(dim)
+        if idx is None:
+            return None
+        return idx.id_map.get(chunk_id)
+
     def active_dims(self) -> List[int]:
-        """Return list of dimensions that have at least one vector."""
         return [d for d, idx in self._indexes.items() if idx.index.ntotal > 0]
 
     def get_stats(self) -> Dict:
@@ -198,21 +174,12 @@ class MultiFAISSStore:
             )
 
     def _load_all(self) -> None:
-        """
-        Reload all persisted indexes on startup.
-
-        Fix (Bug 8): after read_index(), call set_direct_map(Hashtable) so
-        that delete_chunks -> remove_ids works correctly after a server
-        restart.  Without this, the DirectMap is not restored and remove_ids
-        raises a FAISS internal error.
-        """
         for fname in os.listdir(self.base_dir):
             if not fname.startswith("faiss_") or not fname.endswith(".index"):
                 continue
             try:
                 dim = int(fname.replace("faiss_", "").replace(".index", ""))
                 index = faiss.read_index(self._index_path(dim))
-                # Fix Bug 8 — restore DirectMap so delete works post-restart
                 try:
                     index.set_direct_map(faiss.DirectMap.Hashtable)
                 except Exception as dm_err:

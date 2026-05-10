@@ -1,27 +1,28 @@
 """
 ingest_graph.py  —  LangGraph IngestGraph
 
-The per-document ingestion pipeline implemented as a LangGraph StateGraph.
-Each node is a pure function operating on IngestState.
-
-Graph topology:
-    detect → clean → analyze → [PAUSE: user picks chunker + model] → chunk
-    → enrich → embed → store → done
-
-The PAUSE is implemented via LangGraph's interrupt_after=["analyze"] pattern.
-The Streamlit/FastAPI layer calls graph.invoke() for the first half (up to
-analyze), presents stats to the user, collects choices, then calls
-graph.invoke() again with the updated state to complete the second half.
-
-Mid-chat background ingest:
-    Use IngestGraph.run_background(source_config) which dispatches the full
-    graph in a daemon Thread and calls on_complete(source_id) when done.
+Fixes applied
+-------------
+BUG-C04  node_detect used nest_asyncio.apply() + get_event_loop().run_until_complete()
+         for the website pipeline.  Inside a FastAPI / uvicorn async context this
+         causes a deadlock.  Fixed: run WebsitePipeline in a ThreadPoolExecutor
+         with asyncio.run() so it gets its own event loop.
+BUG-R05  node_embed silently defaulted dim=384 when embed_chunks returned [].  A
+         missing embedding is a hard error — the store would silently route chunks
+         to the wrong FAISS index.  Now returns an error state instead.
+BUG-F03  _build_background_graph was called inside the thread closure on every
+         background ingest job — compiling a new StateGraph from scratch each time.
+         IngestGraph.__init__ now pre-compiles and caches self._bg_graph.
+BUG-Q04  Inline imports (asyncio, nest_asyncio inside node_detect) moved to the
+         module top level.
 """
 from __future__ import annotations
 
+import asyncio                     # BUG-Q04: moved from inside node_detect
 import logging
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor  # BUG-C04
 from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from langchain_core.documents import Document
@@ -46,38 +47,21 @@ logger = logging.getLogger(__name__)
 # ── State ─────────────────────────────────────────────────────────────────────
 
 class IngestState(TypedDict, total=False):
-    # Input
-    source_id:      str
-    file_path:      Optional[str]
-    url:            Optional[str]
-    source_type:    str            # pdf | website | youtube | csv
-
-    # After detect
-    raw_result:     Dict[str, Any]  # pipeline output dict
-
-    # After clean
-    cleaned_text:   str
-
-    # After analyze  ← PAUSE POINT — shown to UI
-    analysis:       Dict[str, Any]  # ContentAnalyzer output (stats + recommendation)
-
-    # User choices (filled in by UI before second invoke)
-    chunking_strategy: str          # recursive | semantic | paragraph | page | chapter | hierarchical
-    embedding_model:   str          # e.g. "all-MiniLM-L6-v2" | "all-mpnet-base-v2"
-
-    # After chunk
-    chunks:         List[Dict[str, Any]]
-
-    # After enrich
-    enriched_chunks: List[Dict[str, Any]]
-
-    # After embed
-    embedded_chunks: List[Dict[str, Any]]
-    embedding_dim:   int
-
-    # After store
-    stored:         bool
-    error:          Optional[str]
+    source_id:         str
+    file_path:         Optional[str]
+    url:               Optional[str]
+    source_type:       str
+    raw_result:        Dict[str, Any]
+    cleaned_text:      str
+    analysis:          Dict[str, Any]
+    chunking_strategy: str
+    embedding_model:   str
+    chunks:            List[Dict[str, Any]]
+    enriched_chunks:   List[Dict[str, Any]]
+    embedded_chunks:   List[Dict[str, Any]]
+    embedding_dim:     int
+    stored:            bool
+    error:             Optional[str]
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -85,16 +69,19 @@ class IngestState(TypedDict, total=False):
 def node_detect(state: IngestState) -> IngestState:
     """Run the appropriate extraction pipeline based on source_type."""
     try:
-        st = state["source_type"]
+        st  = state["source_type"]
         sid = state["source_id"]
         if st == "pdf":
             result = PDFPipeline.process(state["file_path"], sid)
         elif st == "website":
-            import asyncio, nest_asyncio
-            nest_asyncio.apply()
-            result = asyncio.get_event_loop().run_until_complete(
-                WebsitePipeline.process(state["url"], sid)
-            )
+            # BUG-C04: use ThreadPoolExecutor + asyncio.run() instead of
+            # nest_asyncio + run_until_complete() which deadlocks FastAPI.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    asyncio.run,
+                    WebsitePipeline.process(state["url"], sid),
+                )
+                result = future.result()
         elif st == "youtube":
             result = YouTubePipeline.process(state["url"], sid)
         elif st == "csv":
@@ -108,7 +95,6 @@ def node_detect(state: IngestState) -> IngestState:
 
 
 def node_clean(state: IngestState) -> IngestState:
-    """AdaptivePreprocessor: clean and normalise raw content."""
     if state.get("error"):
         return state
     try:
@@ -126,11 +112,6 @@ def node_clean(state: IngestState) -> IngestState:
 
 
 def node_analyze(state: IngestState) -> IngestState:
-    """
-    ContentAnalyzer: produce stats + strategy recommendation.
-    This is the PAUSE POINT — the UI reads state["analysis"] and presents
-    it to the user before the graph continues.
-    """
     if state.get("error"):
         return state
     try:
@@ -145,12 +126,11 @@ def node_analyze(state: IngestState) -> IngestState:
 
 
 def node_chunk(state: IngestState) -> IngestState:
-    """AdaptiveChunker: chunk with user-chosen strategy."""
     if state.get("error"):
         return state
     try:
         strategy = state.get("chunking_strategy", "recursive")
-        chunker = AdaptiveChunker(default_strategy=strategy)
+        chunker  = AdaptiveChunker(default_strategy=strategy)
         meta = {
             "source_id":   state["source_id"],
             "source_type": state["source_type"],
@@ -165,7 +145,6 @@ def node_chunk(state: IngestState) -> IngestState:
 
 
 def node_enrich(state: IngestState) -> IngestState:
-    """ContextualEnricher: add context windows + source headers."""
     if state.get("error"):
         return state
     try:
@@ -190,10 +169,15 @@ def node_embed(state: IngestState) -> IngestState:
         return state
     try:
         model_name = state.get("embedding_model", "all-MiniLM-L6-v2")
-        pipeline = EmbeddingRegistry.get(model_name)
-        embedded = pipeline.embed_chunks(state["enriched_chunks"])
-        # Determine dim from first embedding
-        dim = len(embedded[0]["embedding"]) if embedded else 384
+        pipeline   = EmbeddingRegistry.get(model_name)
+        embedded   = pipeline.embed_chunks(state["enriched_chunks"])
+
+        # BUG-R05: hard error on empty result — silent dim=384 fallback would
+        # route chunks to the wrong FAISS index.
+        if not embedded:
+            return {**state, "error": "embed_chunks returned empty — all chunks failed to embed"}
+
+        dim = len(embedded[0]["embedding"])
         return {**state, "embedded_chunks": embedded, "embedding_dim": dim}
     except Exception as exc:
         logger.error("IngestGraph[embed]: %s", exc)
@@ -201,9 +185,7 @@ def node_embed(state: IngestState) -> IngestState:
 
 
 def _make_node_store(source_manager: SourceManager):
-    """Factory — captures source_manager in closure."""
     def node_store(state: IngestState) -> IngestState:
-        """SourceManager: write to FAISS + SQLite + KnowledgeGraph."""
         if state.get("error"):
             return state
         try:
@@ -237,180 +219,26 @@ def _should_abort(state: IngestState) -> str:
 
 
 def build_ingest_graph(source_manager: SourceManager) -> StateGraph:
-    """
-    Build and compile the LangGraph IngestGraph.
-
-    The graph has an interrupt_after=["analyze"] so the UI can pause,
-    show the analysis to the user, collect chunking_strategy + embedding_model,
-    then resume.
-    """
     builder = StateGraph(IngestState)
-
-    # Register nodes
     builder.add_node("detect",  node_detect)
     builder.add_node("clean",   node_clean)
-    builder.add_node("analyze", node_analyze)   # ← PAUSE after this
+    builder.add_node("analyze", node_analyze)
     builder.add_node("chunk",   node_chunk)
     builder.add_node("enrich",  node_enrich)
     builder.add_node("embed",   node_embed)
     builder.add_node("store",   _make_node_store(source_manager))
-
-    # Edges
     builder.set_entry_point("detect")
-    builder.add_edge("detect",  "clean")
-    builder.add_edge("clean",   "analyze")
-    # After analyze: if error → END, else → chunk
+    builder.add_edge("detect", "clean")
+    builder.add_edge("clean",  "analyze")
     builder.add_conditional_edges(
-        "analyze",
-        _should_abort,
-        {"abort": END, "continue": "chunk"},
+        "analyze", _should_abort, {"abort": END, "continue": "chunk"},
     )
-    builder.add_edge("chunk",   "enrich")
-    builder.add_edge("enrich",  "embed")
-    builder.add_edge("embed",   "store")
-    builder.add_edge("store",   END)
-
+    builder.add_edge("chunk",  "enrich")
+    builder.add_edge("enrich", "embed")
+    builder.add_edge("embed",  "store")
+    builder.add_edge("store",  END)
     checkpointer = MemorySaver()
-    return builder.compile(
-        checkpointer=checkpointer,
-        interrupt_after=["analyze"],   # PAUSE: wait for user choices
-    )
-
-
-# ── IngestGraph façade ────────────────────────────────────────────────────────
-
-class IngestGraph:
-    """
-    High-level façade over the compiled LangGraph.
-
-    Usage — two-phase (interactive UI):
-        ig = IngestGraph(source_manager)
-
-        # Phase 1: extract + clean + analyze
-        thread_id, analysis = ig.phase1(file_path="doc.pdf", source_type="pdf")
-
-        # ... UI shows analysis, user picks strategy + model ...
-
-        # Phase 2: chunk + enrich + embed + store
-        result = ig.phase2(thread_id, chunking_strategy="recursive",
-                           embedding_model="all-MiniLM-L6-v2")
-
-    Usage — background (mid-chat ingest, no UI pause):
-        ig.run_background(
-            source_config={"file_path": "new.pdf", "source_type": "pdf",
-                           "chunking_strategy": "recursive",
-                           "embedding_model": "all-MiniLM-L6-v2"},
-            on_complete=lambda sid: print(f"Ready: {sid}"),
-            on_error=lambda e: print(f"Failed: {e}"),
-        )
-    """
-
-    def __init__(self, source_manager: SourceManager):
-        self.source_manager = source_manager
-        self.graph = build_ingest_graph(source_manager)
-
-    # ── two-phase interactive flow ────────────────────────────────────────────
-
-    def phase1(
-        self,
-        file_path: Optional[str] = None,
-        url: Optional[str] = None,
-        source_type: str = "pdf",
-    ) -> tuple[str, Dict[str, Any]]:
-        """
-        Run detect → clean → analyze.  Returns (thread_id, analysis_dict).
-        The graph is paused after analyze — call phase2() to continue.
-        """
-        source_id = str(uuid.uuid4())
-        thread_id = str(uuid.uuid4())
-        initial_state: IngestState = {
-            "source_id":   source_id,
-            "file_path":   file_path,
-            "url":         url,
-            "source_type": source_type,
-        }
-        config = {"configurable": {"thread_id": thread_id}}
-        # Graph runs until interrupt_after=["analyze"] and suspends
-        state = self.graph.invoke(initial_state, config=config)
-        if state.get("error"):
-            raise RuntimeError(f"IngestGraph phase1 error: {state['error']}")
-        return thread_id, state.get("analysis", {})
-
-    def phase2(
-        self,
-        thread_id: str,
-        chunking_strategy: str,
-        embedding_model: str,
-    ) -> Dict[str, Any]:
-        """
-        Resume from the pause point with user-chosen parameters.
-        Runs chunk → enrich → embed → store.
-        Returns final state dict.
-        """
-        config = {"configurable": {"thread_id": thread_id}}
-        # Resume: update state with user choices, then continue
-        update = {
-            "chunking_strategy": chunking_strategy,
-            "embedding_model":   embedding_model,
-        }
-        self.graph.update_state(config, update)
-        state = self.graph.invoke(None, config=config)
-        if state.get("error"):
-            raise RuntimeError(f"IngestGraph phase2 error: {state['error']}")
-        return state
-
-    # ── background ingest (mid-chat) ──────────────────────────────────────────
-
-    def run_background(
-        self,
-        source_config: Dict[str, Any],
-        on_complete: Optional[Callable[[str], None]] = None,
-        on_error: Optional[Callable[[str], None]] = None,
-    ) -> threading.Thread:
-        """
-        Run the full ingest pipeline in a daemon thread.
-        Ideal for mid-chat ingestion — chat continues unblocked.
-
-        Args:
-            source_config: dict with keys:
-                file_path, url, source_type,
-                chunking_strategy, embedding_model
-            on_complete: called with source_id when done
-            on_error:    called with error string on failure
-
-        Returns:
-            The daemon Thread (already started).
-        """
-        def _run():
-            source_id = str(uuid.uuid4())
-            thread_id = str(uuid.uuid4())
-            initial_state: IngestState = {
-                "source_id":         source_id,
-                "file_path":         source_config.get("file_path"),
-                "url":               source_config.get("url"),
-                "source_type":       source_config.get("source_type", "pdf"),
-                # Pre-fill user choices — no pause needed in background mode
-                "chunking_strategy": source_config.get("chunking_strategy", "recursive"),
-                "embedding_model":   source_config.get("embedding_model", "all-MiniLM-L6-v2"),
-            }
-            config = {"configurable": {"thread_id": thread_id}}
-            try:
-                # In background mode we skip the interrupt — invoke runs all nodes
-                # Build a no-interrupt version for background use
-                bg_graph = _build_background_graph(self.source_manager)
-                state = bg_graph.invoke(initial_state, config=config)
-                if state.get("error"):
-                    raise RuntimeError(state["error"])
-                if on_complete:
-                    on_complete(source_id)
-            except Exception as exc:
-                logger.error("IngestGraph background error: %s", exc)
-                if on_error:
-                    on_error(str(exc))
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        return t
+    return builder.compile(checkpointer=checkpointer, interrupt_after=["analyze"])
 
 
 def _build_background_graph(source_manager: SourceManager):
@@ -434,3 +262,97 @@ def _build_background_graph(source_manager: SourceManager):
     builder.add_edge("embed",  "store")
     builder.add_edge("store",  END)
     return builder.compile()
+
+
+# ── IngestGraph façade ────────────────────────────────────────────────────────
+
+class IngestGraph:
+    """
+    High-level façade over the compiled LangGraph.
+
+    BUG-F03 fix: both the interactive graph and the background graph are
+    compiled ONCE at __init__ time.  run_background() reuses self._bg_graph
+    instead of calling _build_background_graph() inside the thread closure.
+    """
+
+    def __init__(self, source_manager: SourceManager):
+        self.source_manager = source_manager
+        # BUG-F03: compile both graphs once
+        self.graph    = build_ingest_graph(source_manager)       # interactive (interrupt)
+        self._bg_graph = _build_background_graph(source_manager) # background (no interrupt)
+
+    # ── two-phase interactive flow ────────────────────────────────────────────
+
+    def phase1(
+        self,
+        file_path: Optional[str] = None,
+        url: Optional[str] = None,
+        source_type: str = "pdf",
+    ) -> tuple:
+        source_id = str(uuid.uuid4())
+        thread_id = str(uuid.uuid4())
+        initial_state: IngestState = {
+            "source_id":   source_id,
+            "file_path":   file_path,
+            "url":         url,
+            "source_type": source_type,
+        }
+        config = {"configurable": {"thread_id": thread_id}}
+        state = self.graph.invoke(initial_state, config=config)
+        if state.get("error"):
+            raise RuntimeError(f"IngestGraph phase1 error: {state['error']}")
+        return thread_id, state.get("analysis", {})
+
+    def phase2(
+        self,
+        thread_id: str,
+        chunking_strategy: str,
+        embedding_model: str,
+    ) -> Dict[str, Any]:
+        config = {"configurable": {"thread_id": thread_id}}
+        self.graph.update_state(config, {
+            "chunking_strategy": chunking_strategy,
+            "embedding_model":   embedding_model,
+        })
+        state = self.graph.invoke(None, config=config)
+        if state.get("error"):
+            raise RuntimeError(f"IngestGraph phase2 error: {state['error']}")
+        return state
+
+    # ── background ingest (mid-chat) ──────────────────────────────────────────
+
+    def run_background(
+        self,
+        source_config: Dict[str, Any],
+        on_complete: Optional[Callable[[str], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> threading.Thread:
+        # Capture the pre-compiled graph to avoid recompilation in the thread
+        bg_graph = self._bg_graph  # BUG-F03: cached at __init__
+
+        def _run():
+            source_id = str(uuid.uuid4())
+            thread_id = str(uuid.uuid4())
+            initial_state: IngestState = {
+                "source_id":         source_id,
+                "file_path":         source_config.get("file_path"),
+                "url":               source_config.get("url"),
+                "source_type":       source_config.get("source_type", "pdf"),
+                "chunking_strategy": source_config.get("chunking_strategy", "recursive"),
+                "embedding_model":   source_config.get("embedding_model", "all-MiniLM-L6-v2"),
+            }
+            config = {"configurable": {"thread_id": thread_id}}
+            try:
+                state = bg_graph.invoke(initial_state, config=config)
+                if state.get("error"):
+                    raise RuntimeError(state["error"])
+                if on_complete:
+                    on_complete(source_id)
+            except Exception as exc:
+                logger.error("IngestGraph background error: %s", exc)
+                if on_error:
+                    on_error(str(exc))
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return t
