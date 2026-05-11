@@ -1,13 +1,66 @@
-version: '3.8'
+# ─────────────────────────────────────────────────────────────────────────────
+#  Mini NotebookLM — Docker Compose
+#  Usage:
+#    cp .env.example .env          # fill in your API keys
+#    docker compose up --build
+# ─────────────────────────────────────────────────────────────────────────────
 
 services:
-  mininotebooklm:
-    build: .
+
+  # ── FastAPI backend ──────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: mini-notebooklm-api
+    restart: unless-stopped
     ports:
-      - "8501:8501"
-    volumes:
-      - ./data:/app/data
-      - ./config.yaml:/app/config.yaml
+      - "8000:8000"
+    env_file:
+      - .env
     environment:
       - PYTHONUNBUFFERED=1
-    command: streamlit run app.py
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONPATH=/app
+      - FAISS_INDEX_PATH=/app/data/vector_store
+      - SQLITE_DB_PATH=/app/data/sources.db
+      - GRAPH_STORAGE_PATH=/app/data/graph
+    volumes:
+      # Persist vector store, SQLite DB, and graph across container restarts
+      - notebooklm-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - notebooklm-net
+
+  # ── Optional: Ollama (local LLM server) ─────────────────────────────────
+  # Uncomment this block if you want to run a local LLM via Ollama.
+  # Requires: docker run --gpus all  (NVIDIA GPU) or CPU-only (slow).
+  #
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: mini-notebooklm-ollama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama-models:/root/.ollama
+  #   networks:
+  #     - notebooklm-net
+  #   # After starting, pull a model:
+  #   # docker exec mini-notebooklm-ollama ollama pull llama3.2
+
+volumes:
+  notebooklm-data:
+    driver: local
+  # ollama-models:
+  #   driver: local
+
+networks:
+  notebooklm-net:
+    driver: bridge
