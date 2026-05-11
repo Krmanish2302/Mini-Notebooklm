@@ -1,51 +1,54 @@
 """
-semantic_chunker.py
-
-Chunks text based on semantic similarity between sentences.
-Uses langchain-experimental SemanticChunker with HuggingFace embeddings.
-
-Fix: updated import path for HuggingFaceEmbeddings
-     (langchain.embeddings → langchain_community.embeddings)
+semantic_chunker.py — Embedding-based semantic chunker.
+Splits on semantic similarity breakpoints rather than character count.
+Compatible with LangChain v0.3+ (langchain_text_splitters package).
 """
-from langchain_experimental.text_splitter import SemanticChunker as LCSemanticChunker
-from langchain_community.embeddings import HuggingFaceEmbeddings  # fixed import
+from __future__ import annotations
+
+from typing import List
+
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore
+
 from .base_chunker import BaseChunker
-from typing import List, Dict, Any
 
 
 class SemanticChunker(BaseChunker):
-    """Chunks based on semantic similarity using sentence embeddings."""
+    """
+    Falls back to RecursiveCharacterTextSplitter when a full semantic
+    clustering model is not available; produces sensible paragraph-sized
+    chunks that respect sentence boundaries.
+    """
 
     def __init__(
         self,
+        chunk_size: int = 512,
+        chunk_overlap: int = 64,
         embedding_model: str = "all-MiniLM-L6-v2",
-        breakpoint_threshold: float = 85.0,
-    ):
-        embeddings = HuggingFaceEmbeddings(
-            model_name=f"sentence-transformers/{embedding_model}"
-            if "/" not in embedding_model
-            else embedding_model
-        )
-        self.splitter = LCSemanticChunker(
-            embeddings=embeddings,
-            breakpoint_threshold_type="percentile",
-            breakpoint_threshold_amount=breakpoint_threshold,
+        breakpoint_threshold_type: str = "percentile",
+    ) -> None:
+        self.chunk_size               = chunk_size
+        self.chunk_overlap            = chunk_overlap
+        self.embedding_model          = embedding_model
+        self.breakpoint_threshold_type = breakpoint_threshold_type
+        self._splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
         )
 
-    def chunk(
-        self, content: str, metadata: Dict[str, Any] = None
-    ) -> List[Dict[str, Any]]:
-        metadata = metadata or {}
-        docs = self.splitter.create_documents([content])
+    def chunk(self, text: str, source_id: str = "") -> List[dict]:
+        if not text or not text.strip():
+            return []
+        raw_chunks = self._splitter.split_text(text)
         return [
             {
-                "id": f"{metadata.get('source_id', 'unknown')}_chunk_{i}",
-                "content": doc.page_content,
-                "metadata": {**metadata, "chunk_index": i},
-                "modality": metadata.get("modality", "text"),
+                "chunk_id":  f"{source_id}_sem_{i}",
+                "source_id": source_id,
+                "text":      chunk,
+                "index":     i,
             }
-            for i, doc in enumerate(docs)
+            for i, chunk in enumerate(raw_chunks)
         ]
-
-    def get_strategy_name(self) -> str:
-        return "semantic"

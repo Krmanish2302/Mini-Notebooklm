@@ -1,50 +1,78 @@
+"""
+hierarchical_chunker.py — Multi-level parent/child chunk decomposition.
+Compatible with LangChain v0.3+ (langchain_text_splitters package).
+"""
+from __future__ import annotations
+
+from typing import List
+
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore
+
 from .base_chunker import BaseChunker
-from typing import List, Dict, Any
+
 
 class HierarchicalChunker(BaseChunker):
     """
-    Creates parent-child chunk relationships.
-    Parent = large section, Children = smaller chunks within.
+    Produces two levels of chunks:
+      - Parent chunks (large context window, e.g. 1024 tokens)
+      - Child chunks  (fine-grained retrieval units, e.g. 256 tokens)
+
+    Each child chunk carries a parent_chunk_id reference so the retriever
+    can optionally expand retrieved child chunks to their parent context.
     """
-    
-    def __init__(self, parent_size: int = 1000, child_size: int = 200, overlap: int = 50):
-        self.parent_size = parent_size
-        self.child_size = child_size
-        self.overlap = overlap
-    
-    def chunk(self, content: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        words = content.split()
-        chunks = []
-        parent_idx = 0
-        
-        for i in range(0, len(words), self.parent_size):
-            parent_words = words[i:i + self.parent_size]
-            parent_text = " ".join(parent_words)
-            parent_id = f"{metadata.get('source_id', 'unknown')}_parent_{parent_idx}"
-            
-            # Create child chunks within parent
-            child_idx = 0
-            for j in range(0, len(parent_words), self.child_size - self.overlap):
-                child_words = parent_words[j:j + self.child_size]
-                child_text = " ".join(child_words)
-                
+
+    def __init__(
+        self,
+        parent_chunk_size: int = 1024,
+        child_chunk_size:  int = 256,
+        chunk_overlap:     int = 32,
+        max_depth:         int = 3,
+    ) -> None:
+        self.parent_chunk_size = parent_chunk_size
+        self.child_chunk_size  = child_chunk_size
+        self.chunk_overlap     = chunk_overlap
+        self.max_depth         = max_depth
+
+        self._parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.parent_chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+        self._child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.child_chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+
+    def chunk(self, text: str, source_id: str = "") -> List[dict]:
+        if not text or not text.strip():
+            return []
+
+        chunks: List[dict] = []
+        parent_texts = self._parent_splitter.split_text(text)
+
+        for p_idx, parent_text in enumerate(parent_texts):
+            parent_id = f"{source_id}_par_{p_idx}"
+            # Include parent chunk itself
+            chunks.append({
+                "chunk_id":        parent_id,
+                "source_id":       source_id,
+                "text":            parent_text,
+                "index":           p_idx,
+                "level":           "parent",
+                "parent_chunk_id": None,
+            })
+            # Split into child chunks
+            child_texts = self._child_splitter.split_text(parent_text)
+            for c_idx, child_text in enumerate(child_texts):
                 chunks.append({
-                    "id": f"{parent_id}_child_{child_idx}",
-                    "content": child_text,
-                    "metadata": {
-                        **(metadata or {}),
-                        "parent_id": parent_id,
-                        "parent_content": parent_text,
-                        "chunk_level": "child",
-                        "chunk_index": child_idx
-                    },
-                    "modality": metadata.get("modality", "text")
+                    "chunk_id":        f"{parent_id}_ch_{c_idx}",
+                    "source_id":       source_id,
+                    "text":            child_text,
+                    "index":           c_idx,
+                    "level":           "child",
+                    "parent_chunk_id": parent_id,
                 })
-                child_idx += 1
-            
-            parent_idx += 1
-        
+
         return chunks
-    
-    def get_strategy_name(self) -> str:
-        return "hierarchical"

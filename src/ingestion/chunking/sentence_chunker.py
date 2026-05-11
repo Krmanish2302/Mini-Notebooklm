@@ -1,41 +1,57 @@
-"""sentence_chunker.py — splits preprocessed text into sentence-level chunks."""
+"""
+sentence_chunker.py — Sentence-level chunker.
+Splits text into individual sentences, then groups them into
+fixed-size windows to respect context boundaries.
+Compatible with LangChain v0.3+ (no LangChain dependency needed here).
+"""
 from __future__ import annotations
-import re, uuid
-from typing import Any, Dict, List
+
+import re
+from typing import List
+
 from .base_chunker import BaseChunker
+
+# Simple sentence boundary regex (handles Mr./Dr./etc. imperfectly but
+# avoids requiring nltk at runtime)
+_SENT_RE = re.compile(r'(?<=[.!?])\s+')
+
 
 class SentenceChunker(BaseChunker):
     """
-    Splits text into individual sentence chunks.
-    Uses a simple regex sentence splitter (no NLTK dependency).
-    Groups sentences into windows of `window_size` for context overlap.
+    Groups sentences into windows of `sentences_per_chunk` with
+    `overlap` sentences of context carry-over.
     """
-    def __init__(self, window_size: int = 3, **kwargs):
-        self.window_size = window_size
 
-    def chunk(self, preprocessed: Any, source_id: str = "") -> List[Dict]:
-        # Accept either a string or preprocessed dict
-        if isinstance(preprocessed, dict):
-            text = preprocessed.get("text") or preprocessed.get("content", "")
-        else:
-            text = str(preprocessed)
+    def __init__(
+        self,
+        sentences_per_chunk: int = 5,
+        overlap:             int = 1,
+    ) -> None:
+        self.sentences_per_chunk = sentences_per_chunk
+        self.overlap             = overlap
 
-        # Split into sentences
-        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-        sentences = [s.strip() for s in sentences if s.strip()]
+    def chunk(self, text: str, source_id: str = "") -> List[dict]:
+        if not text or not text.strip():
+            return []
 
-        chunks = []
-        for i in range(0, len(sentences), max(1, self.window_size - 1)):
-            window = sentences[i : i + self.window_size]
-            chunk_text = " ".join(window)
+        sentences = [s.strip() for s in _SENT_RE.split(text) if s.strip()]
+        if not sentences:
+            return []
+
+        chunks: List[dict] = []
+        step   = max(1, self.sentences_per_chunk - self.overlap)
+        idx    = 0
+        chunk_n = 0
+
+        while idx < len(sentences):
+            window = sentences[idx: idx + self.sentences_per_chunk]
             chunks.append({
-                "id":        str(uuid.uuid4()),
-                "text":      chunk_text,
+                "chunk_id":  f"{source_id}_sent_{chunk_n}",
                 "source_id": source_id,
-                "metadata":  {
-                    "chunker":        "sentence",
-                    "sentence_start": i,
-                    "sentence_end":   i + len(window) - 1,
-                },
+                "text":      " ".join(window),
+                "index":     chunk_n,
             })
+            idx    += step
+            chunk_n += 1
+
         return chunks
