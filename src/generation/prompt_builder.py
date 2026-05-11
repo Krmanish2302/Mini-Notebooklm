@@ -15,6 +15,9 @@ BUG-S01  sanitize_query() added — strips prompt-injection patterns and enforce
          a max-length cap before the query reaches any LLM prompt.
 BUG-Q02  _HISTORY_CHAR_LIMIT and _HISTORY_KEEP_TURNS promoted to named module
          constants.
+BUG-SYN1 Backslash inside f-string expression (line 232) — Python 3.11 raises
+         SyntaxError for this.  Fixed by pre-computing the conditional string
+         in a local variable before the f-string.
 """
 from __future__ import annotations
 
@@ -24,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.generation.persona_config import PersonaConfig
 
 
-# ── Module-level constants (BUG-Q02) ─────────────────────────────────────────
+# ── Module-level constants (BUG-Q02) ───────────────────────────────────────────────────
 HISTORY_CHAR_LIMIT  = 3_000
 HISTORY_KEEP_TURNS  = 4
 MAX_QUERY_LENGTH    = 1_200   # BUG-S01: hard cap on user query length
@@ -33,8 +36,11 @@ MAX_QUERY_LENGTH    = 1_200   # BUG-S01: hard cap on user query length
 _HISTORY_CHAR_LIMIT = HISTORY_CHAR_LIMIT
 _HISTORY_KEEP_TURNS = HISTORY_KEEP_TURNS
 
+# Em dash constant — avoids backslash-in-f-string (BUG-SYN1)
+_EM_DASH = "\u2014"
 
-# ── Hardcoded personas for Study / Research ───────────────────────────────────
+
+# ── Hardcoded personas for Study / Research ────────────────────────────────────────────────
 _PERSONA_STUDY = (
     "You're Carl Sagan if he were a chill classmate in teacher mode. "
     "Build intuition, use analogies, show how ideas connect.  "
@@ -64,7 +70,7 @@ _NO_SOURCES_BLOCK = (
 )
 
 
-# ── BUG-S01: Input sanitisation ───────────────────────────────────────────────
+# ── BUG-S01: Input sanitisation ──────────────────────────────────────────────────────────────
 
 def sanitize_query(query: str, max_len: int = MAX_QUERY_LENGTH) -> str:
     """
@@ -87,7 +93,7 @@ def sanitize_query(query: str, max_len: int = MAX_QUERY_LENGTH) -> str:
     return q
 
 
-# ── QueryRewriter ─────────────────────────────────────────────────────────────
+# ── QueryRewriter ──────────────────────────────────────────────────────────────────────────
 
 class QueryRewriter:
     """
@@ -144,7 +150,7 @@ class QueryRewriter:
         return "both"
 
 
-# ── HistoryCompressor ─────────────────────────────────────────────────────────
+# ── HistoryCompressor ──────────────────────────────────────────────────────────────────────
 
 class HistoryCompressor:
     """
@@ -194,15 +200,14 @@ class HistoryCompressor:
         turns = cls._split_turns(history)
         if len(turns) <= keep_turns:
             return history
-        old_turns  = turns[:-keep_turns]
+        old_turns    = turns[:-keep_turns]
         recent_turns = turns[-keep_turns:]
-        summary = cls._summarise_turns(old_turns)
+        summary      = cls._summarise_turns(old_turns)
         recent_block = "\n\n".join(recent_turns)
         return f"{summary}\n\nRECENT CONVERSATION:\n{recent_block}"
 
 
-# ── PromptBuilder ─────────────────────────────────────────────────────────────
-
+# ── PromptBuilder ────────────────────────────────────────────────────────────────────────────
 class PromptBuilder:
     """
     BUG-R02 fix: every build_*_prompt method now distinguishes between:
@@ -215,7 +220,7 @@ class PromptBuilder:
 
     _rewriter = QueryRewriter()
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
+    # ── Helpers ──────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def format_context(documents: List[Any]) -> str:
@@ -223,13 +228,18 @@ class PromptBuilder:
         for i, doc in enumerate(documents, 1):
             if hasattr(doc, "page_content"):
                 content = doc.page_content
-                meta = doc.metadata or {}
+                meta    = doc.metadata or {}
             else:
                 content = doc.get("content", "")
-                meta = {k: v for k, v in doc.items() if k != "content"}
+                meta    = {k: v for k, v in doc.items() if k != "content"}
 
             src = meta.get("source", meta.get("source_id", ""))
-            header = f"[S{i}]{' \u2014 ' + src if src else ''}"
+
+            # BUG-SYN1 fix: pre-compute the conditional part before the f-string
+            # so no backslash appears inside the f-string expression.
+            src_suffix = (" " + _EM_DASH + " " + src) if src else ""
+            header = f"[S{i}]{src_suffix}"
+
             block = f"{header}\n{content}"
 
             ctx = meta.get("context_window", "")
@@ -258,7 +268,7 @@ class PromptBuilder:
         ctx = PromptBuilder.format_context(documents)
         return True, f"SOURCES:\n{ctx}"
 
-    # ── Chat Mode ──────────────────────────────────────────────────────────────
+    # ── Chat Mode ─────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def build_chat_prompt(
@@ -273,18 +283,16 @@ class PromptBuilder:
         (via _retrieval_query).  The LLM always sees the original *query*.
         BUG-S01: query is sanitized before it reaches the prompt.
         """
-        cfg = persona_config or PersonaConfig()
+        cfg    = persona_config or PersonaConfig()
         system = cfg.build_system_prompt()
 
-        # BUG-S01: sanitize before any use
         safe_query = sanitize_query(query)
 
-        hist = PromptBuilder._compress_history(history)
+        hist       = PromptBuilder._compress_history(history)
         hist_block = f"HISTORY:\n{hist}\n\n" if hist else ""
 
         has_src, src_block = PromptBuilder._sources_block(documents)
 
-        # BUG-R02: LLM always sees original (sanitized) query, never the HyDE stub
         return (
             f"{system}\n\n"
             f"{hist_block}"
@@ -292,7 +300,7 @@ class PromptBuilder:
             f"Q: {safe_query}\nA:"
         )
 
-    # ── Study Mode ─────────────────────────────────────────────────────────────
+    # ── Study Mode ──────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def build_study_prompt(
@@ -303,20 +311,19 @@ class PromptBuilder:
         rewrite: bool = True,
     ) -> str:
         safe_query = sanitize_query(query)
-        hist = PromptBuilder._compress_history(history)
+        hist       = PromptBuilder._compress_history(history)
         hist_block = f"HISTORY:\n{hist}\n\n" if hist else ""
 
         path_block = ""
         if learning_path:
             steps = " \u2192 ".join(
-                f"{s.get('from', '')} \u279c {s.get('to', '')}"
+                "{} \u279c {}".format(s.get("from", ""), s.get("to", ""))
                 for s in learning_path[:4]
             )
             path_block = f"CONCEPT PATH: {steps}\n\n"
 
         has_src, src_block = PromptBuilder._sources_block(documents)
 
-        # BUG-R02: always use safe_query (original) in the LLM prompt
         return (
             f"{_PERSONA_STUDY}\n\n"
             f"{path_block}"
@@ -325,7 +332,7 @@ class PromptBuilder:
             f"TOPIC: {safe_query}\nEXPLAIN:"
         )
 
-    # ── Deep Research Mode ─────────────────────────────────────────────────────
+    # ── Deep Research Mode ────────────────────────────────────────────────────────────
 
     @staticmethod
     def build_research_prompt(
@@ -335,12 +342,11 @@ class PromptBuilder:
         rewrite: bool = True,
     ) -> str:
         safe_query = sanitize_query(query)
-        hist = PromptBuilder._compress_history(history)
+        hist       = PromptBuilder._compress_history(history)
         hist_block = f"HISTORY:\n{hist}\n\n" if hist else ""
 
         has_src, src_block = PromptBuilder._sources_block(documents)
 
-        # BUG-R02: always use safe_query in LLM prompt
         return (
             f"{_PERSONA_RESEARCH}\n\n"
             f"{hist_block}"
@@ -348,7 +354,7 @@ class PromptBuilder:
             f"RESEARCH Q: {safe_query}\nDETAILED ANSWER:"
         )
 
-    # ── Retrieval query helper (BUG-R02) ───────────────────────────────────────
+    # ── Retrieval query helper (BUG-R02) ─────────────────────────────────────────────
 
     @classmethod
     def get_retrieval_query(cls, query: str, rewrite: bool = True) -> str:
@@ -361,7 +367,7 @@ class PromptBuilder:
         """
         return cls._retrieval_query(query, rewrite)
 
-    # ── Backward-compat aliases ────────────────────────────────────────────────
+    # ── Backward-compat aliases ──────────────────────────────────────────────────────────
 
     @staticmethod
     def build_deep_research_prompt(
