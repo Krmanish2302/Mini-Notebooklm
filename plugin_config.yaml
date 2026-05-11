@@ -1,648 +1,670 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  Mini NotebookLM — Plugin Architecture Configuration
-#  ─────────────────────────────────────────────────────────────────────────────
-#
-#  This YAML file defines the plugin system for Mini NotebookLM, enabling:
-#    • Runtime plugin discovery and registration
-#    • Hot-swappable LLM providers, embedders, and document processors
-#    • Extensible retrieval and evaluation backends
-#    • Module-level dependency injection
-#
-#  Generated: 2026-05-10
-#  Version: 1.0.0
-#
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+#  Mini NotebookLM — Central Plugin & Application Configuration
+#  Version: 2.0.0
+# 
+#  SINGLE SOURCE OF TRUTH:
+#  Change model names, providers, or settings HERE once and it reflects
+#  across ALL pipelines (chat, deep_research, study, analyze, evaluation).
+# 
+#  Usage in Python:
+#    from src.core.config import cfg
+#    model = cfg.active_llm.chat_model
+#    provider = cfg.active_provider_name
+# =============================================================================
 
-plugin_system:
-  version: "1.0.0"
-  enabled: true
-  discovery_path: "src/plugins"
-  auto_reload: false
-  plugin_manifest: "plugin_manifest.json"
+version: "2.0.0"
+generated: "2026-05-11"
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUBSYSTEM: LLM PROVIDERS
-# ═════════════════════════════════════════════════════════════════════════════
-#
-#  Plugins define LLM backend integrations.
-#  Each provider implements:
-#    - invoke(prompt, **kwargs) → str
-#    - stream(prompt, **kwargs) → Iterator[str]
-#    - update_tuning(temperature, top_p, max_tokens) → None
-#
+# =============================================================================
+#  1. GLOBAL — change these two lines to switch provider + model everywhere
+# =============================================================================
+global:
+  active_provider: groq               # groq | openai | ollama
+  active_chat_model: llama-3.3-70b-versatile
+  active_reasoning_model: llama-3.3-70b-versatile
+  active_embedding_model: all-MiniLM-L6-v2
+  temperature: 0.2
+  max_tokens: 4096
+  log_level: INFO                     # DEBUG | INFO | WARNING | ERROR
+  environment: development            # development | staging | production
+  plugin_autoreload: true
 
+# =============================================================================
+#  2. LLM PROVIDERS
+#  All pipeline.model fields inherit from global.active_* unless overridden.
+# =============================================================================
 llm_providers:
-  # Built-in providers (no plugin registration needed)
+  plugin_system:
+    version: "2.0.0"
+    enabled: true
+    discovery_path: src/plugins
+    auto_reload: true
+    plugin_manifest: plugin_manifest.json
+
   builtin:
-    - name: "groq"
-      module: "src.core.llm.groq_provider"
-      class: "GroqLLM"
-      dependencies:
-        - groq>=0.4.0
-      config:
-        api_key_env: "GROQ_API_KEY"
-        base_url: "https://api.groq.com"
-        models:
-          - "llama-3.3-70b-versatile"
-          - "mixtral-8x7b-32768"
+    - name: groq
+      module: src.core.llm.groq_provider
+      class: GroqLLM
+      enabled: true
+      api_key_env: GROQ_API_KEY
+      base_url: https://api.groq.com/openai/v1
+      models:
+        chat:      llama-3.3-70b-versatile   # <-- change once, reflects everywhere
+        reasoning: llama-3.3-70b-versatile
+        fast:      llama3-8b-8192
+      temperature: 0.2
+      max_tokens: 4096
+      timeout_seconds: 60
       supports_streaming: true
       supports_vision: false
 
-    - name: "openai"
-      module: "src.core.llm.openai_provider"
-      class: "OpenAILLM"
-      dependencies:
-        - openai>=1.0.0
-      config:
-        api_key_env: "OPENAI_API_KEY"
-        base_url: "https://api.openai.com/v1"
-        models:
-          - "gpt-4o"
-          - "gpt-4-turbo"
-          - "gpt-3.5-turbo"
+    - name: openai
+      module: src.core.llm.openai_provider
+      class: OpenAILLM
+      enabled: true
+      api_key_env: OPENAI_API_KEY
+      base_url: https://api.openai.com/v1
+      models:
+        chat:      gpt-4.1-mini
+        reasoning: gpt-4.1
+        fast:      gpt-4.1-nano
+      temperature: 0.2
+      max_tokens: 4096
+      timeout_seconds: 60
       supports_streaming: true
       supports_vision: true
 
-    - name: "ollama"
-      module: "src.core.llm.ollama_provider"
-      class: "OllamaLLM"
-      dependencies: []
-      config:
-        api_key_env: null
-        base_url_env: "OLLAMA_BASE_URL"
-        base_url: "http://localhost:11434"
+    - name: ollama
+      module: src.core.llm.ollama_provider
+      class: OllamaLLM
+      enabled: true
+      api_key_env: null
+      base_url_env: OLLAMA_BASE_URL
+      base_url_default: http://localhost:11434
+      models:
+        chat:      llama3.1:8b
+        reasoning: llama3.1:8b
+        fast:      llama3.2:3b
+      temperature: 0.2
+      max_tokens: 4096
+      timeout_seconds: 120
       supports_streaming: true
       supports_vision: false
 
-  # Plugin slots for custom implementations
   plugins:
-    - id: "anthropic_claude"
-      name: "Claude (Anthropic)"
-      module: "plugins.llm.anthropic_claude"
-      class: "ClaudeLLMPlugin"
+    - id: anthropic_claude
+      name: Claude (Anthropic)
+      module: plugins.llm.anthropic_claude
+      class: ClaudeLLMPlugin
       version: "1.0.0"
-      author: "community"
-      dependencies:
-        - anthropic>=0.7.0
+      dependencies: [anthropic>=0.7.0]
       config:
-        api_key_env: "ANTHROPIC_API_KEY"
+        api_key_env: ANTHROPIC_API_KEY
+        models:
+          chat:      claude-3-5-sonnet-20241022
+          reasoning: claude-3-5-opus-20241022
       enabled: false
 
-    - id: "azure_openai"
-      name: "Azure OpenAI"
-      module: "plugins.llm.azure_openai"
-      class: "AzureOpenAIPlugin"
+    - id: azure_openai
+      name: Azure OpenAI
+      module: plugins.llm.azure_openai
+      class: AzureOpenAIPlugin
       version: "1.0.0"
-      author: "community"
-      dependencies:
-        - openai>=1.0.0
+      dependencies: [openai>=1.0.0]
       config:
-        api_key_env: "AZURE_OPENAI_KEY"
-        deployment_id_env: "AZURE_OPENAI_DEPLOYMENT_ID"
-        base_url_env: "AZURE_OPENAI_ENDPOINT"
+        api_key_env: AZURE_OPENAI_KEY
+        deployment_id_env: AZURE_OPENAI_DEPLOYMENT_ID
+        base_url_env: AZURE_OPENAI_ENDPOINT
       enabled: false
 
-    - id: "huggingface_local"
-      name: "HuggingFace (Local)"
-      module: "plugins.llm.huggingface_local"
-      class: "HuggingFaceLocalPlugin"
+    - id: huggingface_local
+      name: HuggingFace (Local)
+      module: plugins.llm.huggingface_local
+      class: HuggingFaceLocalPlugin
       version: "1.0.0"
-      author: "community"
-      dependencies:
-        - transformers>=4.30.0
-        - torch>=2.0.0
+      dependencies: [transformers>=4.30.0, torch>=2.0.0]
       config:
-        model_id: "meta-llama/Llama-2-7b-chat-hf"
-        device: "cuda"  # or "cpu"
+        model_id: meta-llama/Llama-3.1-8B-Instruct
+        device: cpu
       enabled: false
 
-# ════════════════════════════════════════════════════════════════════���════════
-#  SUBSYSTEM: EMBEDDINGS
-# ═════════════════════════════════════════════════════════════════════════════
-#
-#  Plugins define embedding backends for vector representation.
-#  Each embedder implements:
-#    - embed_text(text: str) → NDArray[float]
-#    - embed_batch(texts: List[str]) → NDArray[float]
-#    - dimension() → int
+# =============================================================================
+#  3. PIPELINE CONFIGURATION
+#  By default every pipeline inherits global.active_provider + model.
+#  Set provider/model explicitly here ONLY to override for a specific pipeline.
+# =============================================================================
+pipelines:
+  chat:
+    enabled: true
+    provider: "${global.active_provider}"         # inherits
+    model:    "${global.active_chat_model}"        # inherits
+    temperature: "${global.temperature}"
+    max_tokens: "${global.max_tokens}"
+    stream: true
+    use_history: true
 
+  deep_research:
+    enabled: true
+    provider: "${global.active_provider}"         # inherits
+    model:    "${global.active_reasoning_model}"   # uses reasoning model
+    temperature: 0.1
+    max_tokens: 8192
+    subquery_count: 4
+    use_reranker: true
+    use_contextual_compression: true
+    include_subqueries_in_response: true
+
+  study:
+    enabled: true
+    provider: "${global.active_provider}"         # inherits
+    model:    "${global.active_chat_model}"        # inherits
+    temperature: "${global.temperature}"
+    max_tokens: 6000
+    quiz_card_count: 6
+    summary_bullet_count: 5
+    include_learning_path: true
+
+  analyze:
+    enabled: true
+    provider: "${global.active_provider}"         # inherits
+    model:    "${global.active_reasoning_model}"   # uses reasoning model
+    temperature: 0.1
+    max_tokens: 4096
+    structured_output: true
+
+# =============================================================================
+#  4. EVALUATION
+#  Inherits global.active_provider + model by default.
+# =============================================================================
+evaluation:
+  enabled: true
+  provider: "${global.active_provider}"
+  model:    "${global.active_reasoning_model}"
+  ragas_enabled: true
+  store_history: true
+  metrics:
+    - faithfulness
+    - answer_relevance
+    - context_precision
+    - context_recall
+
+  evaluators:
+    builtin:
+      - id: ragas
+        name: RAGAS (Retrieval-Augmented Generation Assessment)
+        module: src.evaluation.ragas_evaluator
+        class: RAGASEvaluator
+        dependencies: [ragas>=0.1.0]
+        config:
+          batch_size: 10
+
+      - id: rouge
+        name: ROUGE (Reference-Based)
+        module: src.evaluation.rouge_evaluator
+        class: ROUGEEvaluator
+        dependencies: [rouge-score>=0.1.2]
+        metrics: [rouge1, rouge2, rougeL]
+
+    plugins:
+      - id: deepeval
+        name: DeepEval (LLM-Based)
+        module: plugins.evaluation.deepeval_evaluator
+        class: DeepEvalPlugin
+        version: "1.0.0"
+        dependencies: [deepeval>=0.20.0]
+        enabled: false
+
+# =============================================================================
+#  5. EMBEDDINGS
+# =============================================================================
 embedding_backends:
+  active: sentence-transformers
+  active_model: "${global.active_embedding_model}"  # inherits
+
   builtin:
-    - name: "sentence-transformers"
-      module: "src.core.embeddings.sentence_transformer_embedder"
-      class: "SentenceTransformerEmbedder"
-      dependencies:
-        - sentence-transformers>=2.2.2
+    - name: sentence-transformers
+      module: src.core.embeddings.sentence_transformer_embedder
+      class: SentenceTransformerEmbedder
+      dependencies: [sentence-transformers>=2.2.2]
       models:
-        - id: "all-MiniLM-L6-v2"
+        - id: all-MiniLM-L6-v2
           dimension: 384
           max_tokens: 256
-          speed: "fast"
+          speed: fast
           local: true
-
-        - id: "all-mpnet-base-v2"
+        - id: all-mpnet-base-v2
           dimension: 768
           max_tokens: 384
-          speed: "medium"
+          speed: medium
           local: true
-
-        - id: "e5-large-v2"
+        - id: e5-large-v2
           dimension: 1024
           max_tokens: 512
-          speed: "slow"
+          speed: slow
           local: true
-          requires_prefix: true
 
-    - name: "openai-embeddings"
-      module: "src.core.embeddings.openai_embedder"
-      class: "OpenAIEmbedder"
-      dependencies:
-        - openai>=1.0.0
+    - name: openai-embeddings
+      module: src.core.embeddings.openai_embedder
+      class: OpenAIEmbedder
+      dependencies: [openai>=1.0.0]
       models:
-        - id: "text-embedding-3-small"
+        - id: text-embedding-3-small
           dimension: 1536
           max_tokens: 8191
-          speed: "fast"
           local: false
-
-        - id: "text-embedding-3-large"
+        - id: text-embedding-3-large
           dimension: 3072
           max_tokens: 8191
-          speed: "medium"
           local: false
 
   plugins:
-    - id: "cohere_embeddings"
-      name: "Cohere Embeddings"
-      module: "plugins.embeddings.cohere_embedder"
-      class: "CohereEmbedderPlugin"
+    - id: cohere_embeddings
+      name: Cohere Embeddings
+      module: plugins.embeddings.cohere_embedder
+      class: CohereEmbedderPlugin
       version: "1.0.0"
-      dependencies:
-        - cohere>=4.0.0
+      dependencies: [cohere>=4.0.0]
       enabled: false
 
-    - id: "jina_embeddings"
-      name: "Jina AI Embeddings"
-      module: "plugins.embeddings.jina_embedder"
-      class: "JinaEmbedderPlugin"
+    - id: jina_embeddings
+      name: Jina AI Embeddings
+      module: plugins.embeddings.jina_embedder
+      class: JinaEmbedderPlugin
       version: "1.0.0"
-      dependencies:
-        - jinaai>=0.1.0
+      dependencies: [jinaai>=0.1.0]
       enabled: false
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUBSYSTEM: VECTOR STORES
-# ═════════════════════════════════════════════════════════════════════════════
-#
-#  Plugins define vector database backends.
-#  Each store implements:
-#    - add(vectors: NDArray, metadata: dict) → List[str]
-#    - search(query_vector: NDArray, k: int) → List[Result]
-#    - delete(ids: List[str]) → bool
+# =============================================================================
+#  6. RETRIEVAL
+# =============================================================================
+retrieval:
+  active_backend: hybrid
+  dense_top_k: 8
+  sparse_top_k: 8
+  final_top_k: 10
+  rrf_k: 60
+  reranker_enabled: true
+  reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  contextual_compression: true
+  query_rewrite_enabled: true
+  hyde_enabled: true
+  step_back_enabled: true
+  multi_query_enabled: true
+  graph_retrieval_enabled: true
+  max_context_tokens: 3000
+  deduplication:
+    enabled: true
+    method: jaccard
+    similarity_threshold: 0.82
+  citations:
+    enabled: true
+    source_label_prefix: S
 
+  retrieval_backends:
+    builtin:
+      - id: hybrid
+        name: Hybrid (Semantic + BM25)
+        module: src.retrieval.hybrid_retriever
+        class: HybridRetriever
+        dependencies: [rank-bm25>=0.2.2]
+        config:
+          semantic_weight: 0.7
+          bm25_weight: 0.3
+          rerank: true
+
+      - id: semantic
+        name: Semantic (Vector Similarity)
+        module: src.retrieval.semantic_retriever
+        class: SemanticRetriever
+        dependencies: []
+
+      - id: bm25
+        name: BM25 (Full-Text)
+        module: src.retrieval.bm25_retriever
+        class: BM25Retriever
+        dependencies: [rank-bm25>=0.2.2]
+
+    plugins:
+      - id: reranker
+        name: Cross-Encoder Reranking
+        module: plugins.retrieval.reranker
+        class: RerankerPlugin
+        version: "1.0.0"
+        dependencies: [sentence-transformers>=2.2.2]
+        config:
+          model: cross-encoder/ms-marco-MiniLM-L-6-v2
+        enabled: false
+
+# =============================================================================
+#  7. VECTOR STORES
+# =============================================================================
 vector_stores:
+  active: faiss
   builtin:
-    - name: "faiss"
-      module: "src.storage.vector_stores.faiss_store"
-      class: "FAISSVectorStore"
-      dependencies:
-        - faiss-cpu>=1.7.4
+    - name: faiss
+      module: src.storage.vector_stores.faiss_store
+      class: FAISSVectorStore
+      dependencies: [faiss-cpu>=1.7.4]
       config:
-        path_env: "FAISS_INDEX_PATH"
-        path: "data/vector_store"
-        index_type: "IVFFlat"  # or "HNSW", "IDMap"
+        path_env: FAISS_INDEX_PATH
+        path: data/vector_store
+        index_type: IVFFlat
         nprobe: 10
       supports_deletion: true
       supports_metadata: true
 
   plugins:
-    - id: "pinecone"
-      name: "Pinecone (Cloud)"
-      module: "plugins.vector_stores.pinecone_store"
-      class: "PineconeVectorStorePlugin"
+    - id: pinecone
+      name: Pinecone (Cloud)
+      module: plugins.vector_stores.pinecone_store
+      class: PineconeVectorStorePlugin
       version: "1.0.0"
-      dependencies:
-        - pinecone-client>=2.2.0
+      dependencies: [pinecone-client>=2.2.0]
       config:
-        api_key_env: "PINECONE_API_KEY"
-        environment_env: "PINECONE_ENVIRONMENT"
-        index_name: "mini-notebooklm"
+        api_key_env: PINECONE_API_KEY
+        environment_env: PINECONE_ENVIRONMENT
+        index_name: mini-notebooklm
       enabled: false
 
-    - id: "weaviate"
-      name: "Weaviate"
-      module: "plugins.vector_stores.weaviate_store"
-      class: "WeaviateVectorStorePlugin"
+    - id: qdrant
+      name: Qdrant
+      module: plugins.vector_stores.qdrant_store
+      class: QdrantVectorStorePlugin
       version: "1.0.0"
-      dependencies:
-        - weaviate-client>=3.0.0
+      dependencies: [qdrant-client>=1.7.0]
       config:
-        url_env: "WEAVIATE_URL"
-        api_key_env: "WEAVIATE_API_KEY"
+        url_env: QDRANT_URL
+        collection_name: mini_notebooklm
       enabled: false
 
-    - id: "qdrant"
-      name: "Qdrant"
-      module: "plugins.vector_stores.qdrant_store"
-      class: "QdrantVectorStorePlugin"
+    - id: weaviate
+      name: Weaviate
+      module: plugins.vector_stores.weaviate_store
+      class: WeaviateVectorStorePlugin
       version: "1.0.0"
-      dependencies:
-        - qdrant-client>=1.7.0
+      dependencies: [weaviate-client>=3.0.0]
       config:
-        url_env: "QDRANT_URL"
-        collection_name: "mini_notebooklm"
+        url_env: WEAVIATE_URL
+        api_key_env: WEAVIATE_API_KEY
       enabled: false
 
-    - id: "milvus"
-      name: "Milvus"
-      module: "plugins.vector_stores.milvus_store"
-      class: "MilvusVectorStorePlugin"
+    - id: milvus
+      name: Milvus
+      module: plugins.vector_stores.milvus_store
+      class: MilvusVectorStorePlugin
       version: "1.0.0"
-      dependencies:
-        - pymilvus>=2.3.0
+      dependencies: [pymilvus>=2.3.0]
       enabled: false
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUBSYSTEM: DOCUMENT PROCESSORS
-# ═════════════════════════════════════════════════════════════════════════════
-#
-#  Plugins define document parsing and content extraction.
-#  Each processor implements:
-#    - process(file_path: str, **kwargs) → str
-#    - supported_formats() → List[str]
-
+# =============================================================================
+#  8. DOCUMENT PROCESSORS
+# =============================================================================
 document_processors:
   builtin:
-    - name: "pdf"
-      module: "src.ingestion.processors.pdf_processor"
-      class: "PDFProcessor"
-      dependencies:
-        - pypdf>=3.17.0
-      formats:
-        - ".pdf"
+    - name: pdf
+      module: src.ingestion.processors.pdf_processor
+      class: PDFProcessor
+      dependencies: [pypdf>=3.17.0]
+      formats: [.pdf]
       supports_ocr: false
 
-    - name: "text"
-      module: "src.ingestion.processors.text_processor"
-      class: "TextProcessor"
+    - name: text
+      module: src.ingestion.processors.text_processor
+      class: TextProcessor
       dependencies: []
-      formats:
-        - ".txt"
-        - ".md"
-        - ".rst"
+      formats: [.txt, .md, .rst]
 
-    - name: "csv"
-      module: "src.ingestion.processors.csv_processor"
-      class: "CSVProcessor"
-      dependencies:
-        - pandas>=2.0.0
-      formats:
-        - ".csv"
-        - ".tsv"
+    - name: csv
+      module: src.ingestion.processors.csv_processor
+      class: CSVProcessor
+      dependencies: [pandas>=2.0.0]
+      formats: [.csv, .tsv]
 
-    - name: "web"
-      module: "src.ingestion.processors.web_processor"
-      class: "TrafilaturaWebProcessor"
-      dependencies:
-        - trafilatura>=1.6.0
-      formats:
-        - "http"
-        - "https"
+    - name: web
+      module: src.ingestion.processors.web_processor
+      class: TrafilaturaWebProcessor
+      dependencies: [trafilatura>=1.6.0]
+      formats: [http, https]
 
-    - name: "youtube"
-      module: "src.ingestion.processors.youtube_processor"
-      class: "YoutubeProcessor"
-      dependencies:
-        - youtube-transcript-api>=0.6.1
-      formats:
-        - "youtube"
+    - name: youtube
+      module: src.ingestion.processors.youtube_processor
+      class: YoutubeProcessor
+      dependencies: [youtube-transcript-api>=0.6.1]
+      formats: [youtube]
 
   plugins:
-    - id: "docx"
-      name: "Microsoft Word (DOCX)"
-      module: "plugins.processors.docx_processor"
-      class: "DOCXProcessorPlugin"
+    - id: docx
+      name: Microsoft Word (DOCX)
+      module: plugins.processors.docx_processor
+      class: DOCXProcessorPlugin
       version: "1.0.0"
-      dependencies:
-        - python-docx>=0.8.11
-      formats:
-        - ".docx"
+      dependencies: [python-docx>=0.8.11]
+      formats: [.docx]
       enabled: false
 
-    - id: "pptx"
-      name: "PowerPoint (PPTX)"
-      module: "plugins.processors.pptx_processor"
-      class: "PPTXProcessorPlugin"
+    - id: pptx
+      name: PowerPoint (PPTX)
+      module: plugins.processors.pptx_processor
+      class: PPTXProcessorPlugin
       version: "1.0.0"
-      dependencies:
-        - python-pptx>=0.6.21
-      formats:
-        - ".pptx"
+      dependencies: [python-pptx>=0.6.21]
+      formats: [.pptx]
       enabled: false
 
-    - id: "epub"
-      name: "EPUB Reader"
-      module: "plugins.processors.epub_processor"
-      class: "EPUBProcessorPlugin"
+    - id: epub
+      name: EPUB Reader
+      module: plugins.processors.epub_processor
+      class: EPUBProcessorPlugin
       version: "1.0.0"
-      dependencies:
-        - ebooklib>=0.18.0
-      formats:
-        - ".epub"
+      dependencies: [ebooklib>=0.18.0]
+      formats: [.epub]
       enabled: false
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUBSYSTEM: CHUNKING STRATEGIES
-# ═════════════════════════════════════════════════════════════════════════════
-#
-#  Plugins define document segmentation strategies.
-#  Each chunker implements:
-#    - chunk(text: str, **kwargs) → List[Chunk]
-#    - recommend_strategy(text: str, doc_type: str) → str
-
+# =============================================================================
+#  9. CHUNKING STRATEGIES
+# =============================================================================
 chunking_strategies:
+  active: recursive
   builtin:
-    - id: "recursive"
-      name: "Recursive Character Split"
-      module: "src.ingestion.chunking.recursive_chunker"
-      class: "RecursiveCharacterChunker"
-      dependencies:
-        - langchain-text-splitters>=0.3.0
+    - id: recursive
+      name: Recursive Character Split
+      module: src.ingestion.chunking.recursive_chunker
+      class: RecursiveCharacterChunker
+      dependencies: [langchain-text-splitters>=0.3.0]
       config:
         chunk_size: 512
         chunk_overlap: 64
-      best_for: ["general", "mixed"]
+      best_for: [general, mixed]
 
-    - id: "paragraph"
-      name: "Paragraph-Based"
-      module: "src.ingestion.chunking.paragraph_chunker"
-      class: "ParagraphChunker"
-      dependencies: []
+    - id: semantic
+      name: Semantic Clustering
+      module: src.ingestion.chunking.semantic_chunker
+      class: SemanticChunker
+      dependencies: [sentence-transformers>=2.2.2]
       config:
-        min_para_length: 100
-      best_for: ["longform", "articles"]
+        embedding_model: "${global.active_embedding_model}"  # inherits
+        breakpoint_threshold_type: percentile
+      best_for: [narrative, research]
 
-    - id: "page"
-      name: "Page-Based"
-      module: "src.ingestion.chunking.page_chunker"
-      class: "PageChunker"
-      dependencies: []
-      config:
-        page_size: 2048
-      best_for: ["pdf"]
-
-    - id: "semantic"
-      name: "Semantic Clustering"
-      module: "src.ingestion.chunking.semantic_chunker"
-      class: "SemanticChunker"
-      dependencies:
-        - sentence-transformers>=2.2.2
-      config:
-        embedding_model: "all-MiniLM-L6-v2"
-        breakpoint_threshold_type: "percentile"
-      best_for: ["narrative", "research"]
-
-    - id: "hierarchical"
-      name: "Hierarchical Decomposition"
-      module: "src.ingestion.chunking.hierarchical_chunker"
-      class: "HierarchicalChunker"
+    - id: hierarchical
+      name: Hierarchical Decomposition
+      module: src.ingestion.chunking.hierarchical_chunker
+      class: HierarchicalChunker
       dependencies: []
       config:
         max_depth: 3
-      best_for: ["structured", "technical"]
+      best_for: [structured, technical]
 
-  plugins:
-    - id: "sentence"
-      name: "Sentence-Level Chunking"
-      module: "plugins.chunking.sentence_chunker"
-      class: "SentenceChunkerPlugin"
-      version: "1.0.0"
-      dependencies:
-        - nltk>=3.8.0
-      enabled: false
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUBSYSTEM: RETRIEVAL STRATEGIES
-# ═════════════════════════════════════════════════════════════════════════════
-#
-#  Plugins define context retrieval methods.
-#  Each retriever implements:
-#    - retrieve(query: str, k: int) → List[Result]
-
-retrieval_backends:
-  builtin:
-    - id: "hybrid"
-      name: "Hybrid (Semantic + BM25)"
-      module: "src.retrieval.hybrid_retriever"
-      class: "HybridRetriever"
-      dependencies:
-        - rank-bm25>=0.2.2
-      config:
-        semantic_weight: 0.7
-        bm25_weight: 0.3
-        rerank: true
-
-    - id: "semantic"
-      name: "Semantic (Vector Similarity)"
-      module: "src.retrieval.semantic_retriever"
-      class: "SemanticRetriever"
+    - id: paragraph
+      name: Paragraph-Based
+      module: src.ingestion.chunking.paragraph_chunker
+      class: ParagraphChunker
       dependencies: []
+      config:
+        min_para_length: 100
+      best_for: [longform, articles]
 
-    - id: "bm25"
-      name: "BM25 (Full-Text)"
-      module: "src.retrieval.bm25_retriever"
-      class: "BM25Retriever"
-      dependencies:
-        - rank-bm25>=0.2.2
+    - id: page
+      name: Page-Based
+      module: src.ingestion.chunking.page_chunker
+      class: PageChunker
+      dependencies: []
+      config:
+        page_size: 2048
+      best_for: [pdf]
 
   plugins:
-    - id: "reranker"
-      name: "Cross-Encoder Reranking"
-      module: "plugins.retrieval.reranker"
-      class: "RerankerPlugin"
+    - id: sentence
+      name: Sentence-Level Chunking
+      module: plugins.chunking.sentence_chunker
+      class: SentenceChunkerPlugin
       version: "1.0.0"
-      dependencies:
-        - sentence-transformers>=2.2.2
-      config:
-        model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+      dependencies: [nltk>=3.8.0]
       enabled: false
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUBSYSTEM: EVALUATION METRICS
-# ═════════════════════════════════════════════════════════════════════════════
-#
-#  Plugins define answer quality evaluation.
-#  Each evaluator implements:
-#    - evaluate(question: str, answer: str, context: List[str]) → EvalResult
-
-evaluators:
-  builtin:
-    - id: "ragas"
-      name: "RAGAS (Retrieval-Augmented Generation Assessment)"
-      module: "src.evaluation.ragas_evaluator"
-      class: "RAGASEvaluator"
-      dependencies:
-        - ragas>=0.1.0
-      metrics:
-        - "faithfulness"
-        - "answer_relevance"
-        - "context_precision"
-        - "context_recall"
-      config:
-        batch_size: 10
-        llm_model: "gpt-3.5-turbo"
-
-    - id: "rouge"
-      name: "ROUGE (Reference-Based)"
-      module: "src.evaluation.rouge_evaluator"
-      class: "ROUGEEvaluator"
-      dependencies:
-        - rouge-score>=0.1.2
-      metrics:
-        - "rouge1"
-        - "rouge2"
-        - "rougeL"
-
-  plugins:
-    - id: "deepeval"
-      name: "DeepEval (LLM-Based)"
-      module: "plugins.evaluation.deepeval_evaluator"
-      class: "DeepEvalPlugin"
-      version: "1.0.0"
-      dependencies:
-        - deepeval>=0.20.0
-      enabled: false
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUBSYSTEM: KNOWLEDGE GRAPHS
-# ═════════════════════════════════════════════════════════════════════════════
-#
-#  Plugins define knowledge representation backends.
-
+# =============================================================================
+#  10. KNOWLEDGE GRAPH
+# =============================================================================
 knowledge_graph_backends:
+  active: networkx
   builtin:
-    - id: "networkx"
-      name: "NetworkX (In-Memory Graph)"
-      module: "src.graph.networkx_graph"
-      class: "NetworkXGraph"
-      dependencies:
-        - networkx>=3.0
+    - id: networkx
+      name: NetworkX (In-Memory Graph)
+      module: src.graph.networkx_graph
+      class: NetworkXGraph
+      dependencies: [networkx>=3.0]
       config:
-        path_env: "GRAPH_STORAGE_PATH"
-        path: "data/graph"
+        path_env: GRAPH_STORAGE_PATH
+        path: data/graph
       supports_persistence: true
 
   plugins:
-    - id: "neo4j"
-      name: "Neo4j (Property Graph)"
-      module: "plugins.graph.neo4j_graph"
-      class: "Neo4jGraphPlugin"
+    - id: neo4j
+      name: Neo4j (Property Graph)
+      module: plugins.graph.neo4j_graph
+      class: Neo4jGraphPlugin
       version: "1.0.0"
-      dependencies:
-        - neo4j>=5.0.0
+      dependencies: [neo4j>=5.0.0]
       config:
-        url_env: "NEO4J_URI"
-        user_env: "NEO4J_USER"
-        password_env: "NEO4J_PASSWORD"
+        url_env: NEO4J_URI
+        user_env: NEO4J_USER
+        password_env: NEO4J_PASSWORD
       enabled: false
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUBSYSTEM: STORAGE BACKENDS
-# ═════════════════════════════════════════════════════════════════════════════
-#
-#  Plugins define metadata and chat history persistence.
-
+# =============================================================================
+#  11. STORAGE BACKENDS
+# =============================================================================
 storage_backends:
+  active: sqlite
   builtin:
-    - id: "sqlite"
-      name: "SQLite (Local Database)"
-      module: "src.storage.sqlite_manager"
-      class: "SQLiteStorageManager"
-      dependencies:
-        - sqlite3  # builtin
+    - id: sqlite
+      name: SQLite (Local Database)
+      module: src.storage.sqlite_manager
+      class: SQLiteStorageManager
       config:
-        db_path_env: "SQLITE_DB_PATH"
-        db_path: "data/sources.db"
+        db_path_env: SQLITE_DB_PATH
+        db_path: data/sources.db
       supports_transactions: true
 
   plugins:
-    - id: "postgresql"
-      name: "PostgreSQL"
-      module: "plugins.storage.postgres_manager"
-      class: "PostgresStoragePlugin"
+    - id: postgresql
+      name: PostgreSQL
+      module: plugins.storage.postgres_manager
+      class: PostgresStoragePlugin
       version: "1.0.0"
-      dependencies:
-        - psycopg2-binary>=2.9.0
-        - sqlalchemy>=2.0.0
+      dependencies: [psycopg2-binary>=2.9.0, sqlalchemy>=2.0.0]
       config:
-        connection_string_env: "DATABASE_URL"
+        connection_string_env: DATABASE_URL
       enabled: false
 
-    - id: "mongodb"
-      name: "MongoDB"
-      module: "plugins.storage.mongo_manager"
-      class: "MongoStoragePlugin"
+    - id: mongodb
+      name: MongoDB
+      module: plugins.storage.mongo_manager
+      class: MongoStoragePlugin
       version: "1.0.0"
-      dependencies:
-        - pymongo>=4.0.0
+      dependencies: [pymongo>=4.0.0]
       config:
-        uri_env: "MONGODB_URI"
+        uri_env: MONGODB_URI
       enabled: false
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  PLUGIN REGISTRY & LIFECYCLE
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  12. API & CORS
+# =============================================================================
+api:
+  host: 0.0.0.0
+  port: 8000
+  cors:
+    enabled: true
+    allow_origins:
+      - http://localhost:3000
+      - http://localhost:5173
+      - http://127.0.0.1:3000
+      - http://127.0.0.1:5173
 
+# =============================================================================
+#  13. STORAGE PATHS
+# =============================================================================
+storage:
+  faiss_index_path: data/vector_store
+  sqlite_db_path: data/sources.db
+  graph_storage_path: data/graph
+
+# =============================================================================
+#  14. FEATURE FLAGS
+# =============================================================================
+feature_flags:
+  plugin_system: true
+  streaming: true
+  web_search: true
+  youtube_ingestion: true
+  url_ingestion: true
+  pdf_ingestion: true
+  ragas_evaluation: true
+  graph_retrieval: true
+  study_mode: true
+  deep_research_mode: true
+
+# =============================================================================
+#  15. PLUGIN LIFECYCLE
+# =============================================================================
 plugin_registry:
   auto_load: true
   load_order:
-    1. "llm_providers"
-    2. "embedding_backends"
-    3. "vector_stores"
-    4. "document_processors"
-    5. "chunking_strategies"
-    6. "retrieval_backends"
-    7. "evaluators"
-    8. "knowledge_graph_backends"
-    9. "storage_backends"
-
-  # Plugin initialization hooks
+    - llm_providers
+    - embedding_backends
+    - vector_stores
+    - document_processors
+    - chunking_strategies
+    - retrieval_backends
+    - evaluators
+    - knowledge_graph_backends
+    - storage_backends
   hooks:
-    on_plugin_load: "src.plugins.lifecycle.on_plugin_load"
-    on_plugin_unload: "src.plugins.lifecycle.on_plugin_unload"
-    on_config_change: "src.plugins.lifecycle.on_config_change"
+    on_plugin_load:   src.plugins.lifecycle.on_plugin_load
+    on_plugin_unload: src.plugins.lifecycle.on_plugin_unload
+    on_config_change: src.plugins.lifecycle.on_config_change
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  EXAMPLE: CUSTOM PLUGIN IMPLEMENTATION
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  HOW TO ADD A CUSTOM PLUGIN
+# =============================================================================
+# Add an entry under the relevant subsection:
 #
-#  To add a custom plugin, create a YAML entry like:
+#   llm_providers:
+#     plugins:
+#       - id: my_llm
+#         name: My Custom LLM
+#         module: plugins.llm.my_llm
+#         class: MyLLMPlugin
+#         version: "1.0.0"
+#         dependencies: [my-lib>=1.0.0]
+#         config:
+#           api_key_env: MY_LLM_KEY
+#         enabled: true
 #
-#  llm_providers:
-#    plugins:
-#      - id: "my_custom_llm"
-#        name: "My Custom LLM"
-#        module: "plugins.llm.my_custom_llm"
-#        class: "MyCustomLLMPlugin"
-#        version: "1.0.0"
-#        author: "your_name"
-#        dependencies:
-#          - custom-lib>=1.0.0
-#        config:
-#          api_key_env: "MY_CUSTOM_LLM_KEY"
-#        enabled: true
+#  Then implement in plugins/llm/my_llm.py:
 #
-#  Then implement in plugins/llm/my_custom_llm.py:
-#
-#  from src.core.llm import BaseLLM
-#
-#  class MyCustomLLMPlugin(BaseLLM):
-#      def invoke(self, prompt: str, **kwargs) -> str:
-#          # Implementation
-#          pass
-#
-#      def stream(self, prompt: str, **kwargs) -> Iterator[str]:
-#          # Implementation
-#          pass
-#
-# ═════════════════════════════════════════════════════════════════════════════
+#    from src.core.llm import BaseLLM
+#    class MyLLMPlugin(BaseLLM):
+#        def invoke(self, prompt, **kwargs): ...
+#        def stream(self, prompt, **kwargs): ...
+# =============================================================================
