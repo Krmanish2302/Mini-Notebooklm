@@ -27,7 +27,7 @@ def build_prompt(state: dict) -> dict:
         else:
             prompt = PromptBuilder.build_chat_prompt(query, documents, history, persona)
 
-        logger.info("[build_prompt] Mode=%s prompt_len=%d", mode, len(prompt))
+        logger.info("[build_prompt] mode=%s prompt_len=%d", mode, len(prompt))
         return {"prompt": prompt}
     except Exception as exc:
         logger.exception("[build_prompt] Failed: %s", exc)

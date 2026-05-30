@@ -2,7 +2,7 @@
 state.py — TypedDict flowing through every generation LangGraph node.
 """
 from __future__ import annotations
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, List, Optional
 from typing_extensions import TypedDict
 from langchain_core.documents import Document
 from src.generation.persona_config import PersonaConfig
@@ -13,6 +13,7 @@ class GenerationState(TypedDict, total=False):
     query:       str
     documents:   List[Document]
     mode:        str                  # "chat" | "study" | "research"
+    # RAG-based history: serialised turn pairs already retrieved from SQLite
     history:     str
     persona:     PersonaConfig
     stream:      bool

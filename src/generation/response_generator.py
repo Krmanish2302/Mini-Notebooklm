@@ -10,8 +10,6 @@ Takes raw LLM output and enriches into:
         "chunks_used":     List[dict],
         "tokens_estimate": int,
     }
-
-Uses LangChain StrOutputParser + PydanticOutputParser for structured output.
 """
 from __future__ import annotations
 import logging
@@ -38,10 +36,6 @@ _str_parser = StrOutputParser()
 class ResponseGenerator:
     """
     Stateless response assembler. Call assemble() after every LLM invocation.
-
-    Parameters
-    ----------
-    context_chunks : List[dict] from ContextBuilder — must include 'citation_label'.
     """
 
     def __init__(self, context_chunks: Optional[List[Dict[str, Any]]] = None):
@@ -53,26 +47,16 @@ class ResponseGenerator:
         query:          str  = "",
         generate_follow_ups: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Parse and enrich raw LLM output.
-
-        Returns dict: answer, citations, follow_ups, sources_used,
-                      chunks_used, tokens_estimate
-        """
         cleaned    = self._clean(raw_llm_output)
         answer     = self._strip_follow_up_block(cleaned)
         follow_ups = self._extract_follow_ups(cleaned, query, generate_follow_ups)
-
-        # Normalize citation labels: [s1] → [S1]
-        answer = _CITE_PATTERN.sub(lambda m: f"[{m.group(1).upper()}]", answer)
-
+        answer     = _CITE_PATTERN.sub(lambda m: f"[{m.group(1).upper()}]", answer)
         used_labels = list(dict.fromkeys(_CITE_PATTERN.findall(answer)))
         citations   = self._build_citations(used_labels)
         chunks_used = [
             c for c in self.context_chunks
             if c.get("citation_label", "") in used_labels
         ]
-
         return {
             "answer":          answer.strip(),
             "citations":       citations,
@@ -102,8 +86,8 @@ class ResponseGenerator:
         block = match.group(1)
         lines = re.findall(r"^\s*[-•*\d.)]+\s*(.+)$", block, re.MULTILINE)
         return [
-            (l.strip().rstrip(".") + "?") if not l.strip().endswith("?") else l.strip()
-            for l in lines if len(l.strip()) > 8
+            (line.strip().rstrip(".") + "?") if not line.strip().endswith("?") else line.strip()
+            for line in lines if len(line.strip()) > 8
         ][:3]
 
     def _build_citations(self, used_labels: List[str]) -> List[Dict[str, Any]]:
@@ -112,7 +96,6 @@ class ResponseGenerator:
             lbl = chunk.get("citation_label", "")
             if lbl and lbl not in label_map:
                 label_map[lbl] = chunk
-
         citations = []
         for lbl in used_labels:
             chunk = label_map.get(lbl)

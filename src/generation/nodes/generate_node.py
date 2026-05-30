@@ -21,7 +21,6 @@ def generate_response(state: dict) -> dict:
         llm = LLMRegistry.get()
 
         if stream:
-            # Collect streamed tokens into a single string
             tokens = []
             for chunk in llm.stream([HumanMessage(content=prompt)]):
                 tokens.append(chunk.content)

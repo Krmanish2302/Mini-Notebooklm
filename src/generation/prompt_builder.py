@@ -1,21 +1,25 @@
 """
-prompt_builder.py — Mode-specific prompt construction using LangChain ChatPromptTemplates.
+prompt_builder.py — Mode-specific prompt construction.
 
-Key rules (carried over from original fixes):
+Key rules:
   BUG-R02: retrieval_query (HyDE/expanded) is for the RETRIEVER only.
            The LLM always sees the original clean query.
   BUG-R04: HistoryCompressor includes User: turns in summary bullets.
-  BUG-S01: sanitize_query() strips prompt-injection patterns + length cap.
-  BUG-SYN1: No backslash inside f-string expressions.
+  BUG-S01: sanitize_query() strips prompt-injection + length cap.
+
+History strategy: RAG-based.
+  The caller (ChatGraph / pipeline) retrieves the N most-relevant past
+  turn pairs from SQLite via semantic search, serialises them to a plain-
+  text block, and passes it in as `history`.  No BufferWindowMemory or
+  MemorySaver is used here.
 """
 from __future__ import annotations
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
 
 from src.generation.persona_config import PersonaConfig
 
@@ -26,10 +30,6 @@ HISTORY_CHAR_LIMIT = 3_000
 HISTORY_KEEP_TURNS = 4
 MAX_QUERY_LENGTH   = 1_200
 _EM_DASH           = "\u2014"
-
-# Backward-compat aliases
-_HISTORY_CHAR_LIMIT = HISTORY_CHAR_LIMIT
-_HISTORY_KEEP_TURNS = HISTORY_KEEP_TURNS
 
 _NO_SOURCES_BLOCK = (
     "SOURCES: [none \u2014 the knowledge base returned no relevant chunks for this query]\n\n"
@@ -56,7 +56,6 @@ _PERSONA_RESEARCH = (
 # ── BUG-S01: Input sanitization ────────────────────────────────────────────────
 
 def sanitize_query(query: str, max_len: int = MAX_QUERY_LENGTH) -> str:
-    """Strip prompt-injection patterns and enforce a length cap."""
     q = query.strip()[:max_len]
     q = re.sub(
         r"(?i)(ignore|disregard|forget|override|bypass)\b.{0,50}\b"
@@ -119,8 +118,8 @@ class QueryRewriter:
 
 class HistoryCompressor:
     """
-    BUG-R04 fix: compress() includes User: turns in bullets so the LLM
-    sees both sides of old exchanges.
+    Compresses long RAG-retrieved history blocks.
+    BUG-R04 fix: includes User: turns in bullets.
     """
 
     @staticmethod
@@ -166,7 +165,6 @@ class HistoryCompressor:
 # ── Context formatter ──────────────────────────────────────────────────────────
 
 def format_context(documents: List[Any]) -> str:
-    """Format List[Document | dict] into a numbered source block."""
     if not documents:
         return _NO_SOURCES_BLOCK
     parts: List[str] = []
@@ -177,7 +175,6 @@ def format_context(documents: List[Any]) -> str:
         else:
             content = doc.get("content", "")
             meta    = {k: v for k, v in doc.items() if k != "content"}
-
         src = meta.get("source", meta.get("source_id", ""))
         src_suffix = (" " + _EM_DASH + " " + src) if src else ""
         header = f"[S{i}]{src_suffix}"
@@ -194,9 +191,12 @@ class PromptBuilder:
     """
     Builds LangChain ChatPromptTemplate-based prompts for each mode.
 
-    BUG-R02: retrieval_query (rewritten) is NEVER passed to LLM prompts.
-             Use get_retrieval_query() for retrieval only.
-    BUG-S01: sanitize_query() applied before every prompt assembly.
+    History contract (RAG-based):
+      - Caller retrieves relevant past turns from SQLite/FAISS.
+      - Serialises them as:  "User: ...\nAssistant: ...\n"
+      - Passes the block as `history` str.
+      - HistoryCompressor trims if > HISTORY_CHAR_LIMIT.
+      - NO MemorySaver / ConversationBufferWindowMemory used.
     """
 
     _rewriter   = QueryRewriter()
@@ -214,9 +214,8 @@ class PromptBuilder:
         cls,
         query:          str,
         documents:      List[Any],
-        history:        str            = "",
+        history:        str             = "",
         persona_config: Optional[PersonaConfig] = None,
-        rewrite:        bool           = True,   # BUG-R02: only affects retrieval, not prompt
     ) -> str:
         cfg        = persona_config or PersonaConfig()
         safe_query = sanitize_query(query)
@@ -241,23 +240,20 @@ class PromptBuilder:
         cls,
         query:         str,
         documents:     List[Any],
-        history:       str             = "",
+        history:       str              = "",
         learning_path: Optional[List[Dict]] = None,
-        rewrite:       bool            = True,
     ) -> str:
         safe_query = sanitize_query(query)
         hist       = cls._compressor.compress(history)
         hist_block = f"HISTORY:\n{hist}\n\n" if hist else ""
         sources    = format_context(documents)
-
         path_block = ""
         if learning_path:
             steps = " \u2192 ".join(
-                "{} \u279c {}".format(s.get("from", ""), s.get("to", ""))
+                "{}\u279c {}".format(s.get("from", ""), s.get("to", ""))
                 for s in learning_path[:4]
             )
             path_block = f"CONCEPT PATH: {steps}\n\n"
-
         return cls._STUDY_TEMPLATE.format(
             path_block=path_block,
             history=hist_block,
@@ -277,8 +273,7 @@ class PromptBuilder:
         cls,
         query:     str,
         documents: List[Any],
-        history:   str  = "",
-        rewrite:   bool = True,
+        history:   str = "",
     ) -> str:
         safe_query = sanitize_query(query)
         hist       = cls._compressor.compress(history)
@@ -295,9 +290,8 @@ class PromptBuilder:
     @classmethod
     def get_retrieval_query(cls, query: str, rewrite: bool = True) -> str:
         """
-        PUBLIC: return the rewritten (HyDE/expanded) query for the retriever.
-        This is the ONLY place the rewritten query should be used.
-        Never pass its output to any build_*_prompt method.
+        Return the rewritten (HyDE/expanded) query for the retriever ONLY.
+        Never pass this output into any build_*_prompt method.
         """
         if not rewrite:
             return query

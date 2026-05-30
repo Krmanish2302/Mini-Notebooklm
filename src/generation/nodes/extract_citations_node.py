@@ -1,5 +1,5 @@
 """
-extract_citations_node.py — LangGraph node: extract & resolve inline citations + final assembly.
+extract_citations_node.py — LangGraph node: extract citations + final assembly.
 """
 from __future__ import annotations
 import logging
@@ -9,13 +9,12 @@ logger = logging.getLogger(__name__)
 
 def extract_citations(state: dict) -> dict:
     try:
-        answer     = state.get("answer", "")
-        documents  = state.get("documents", [])
+        answer    = state.get("answer", "")
+        documents = state.get("documents", [])
 
         from src.generation.citation_extractor import CitationExtractor
         from src.generation.response_generator import ResponseGenerator
 
-        # Build context_chunks list (uniform dict format)
         chunks = []
         for i, doc in enumerate(documents, 1):
             if hasattr(doc, "page_content"):
@@ -24,25 +23,18 @@ def extract_citations(state: dict) -> dict:
             else:
                 content = doc.get("content", "")
                 meta    = {k: v for k, v in doc.items() if k != "content"}
-            chunks.append({
-                "citation_label": f"S{i}",
-                "content":        content,
-                **meta,
-            })
+            chunks.append({"citation_label": f"S{i}", "content": content, **meta})
 
-        # Extract citations
-        extractor   = CitationExtractor(chunks)
-        citations   = extractor.extract(answer)
-        validation  = extractor.validate(answer)
+        extractor  = CitationExtractor(chunks)
+        citations  = extractor.extract(answer)
+        validation = extractor.validate(answer)
 
-        # Assemble final response
-        generator   = ResponseGenerator(chunks)
-        assembled   = generator.assemble(
+        generator = ResponseGenerator(chunks)
+        assembled = generator.assemble(
             raw_llm_output=state.get("raw_output", answer),
             query=state.get("query", ""),
         )
 
-        # Merge: prefer assembled answer (it normalizes citations) but keep node-parsed follow_ups
         return {
             "answer":          assembled["answer"],
             "citations":       citations,

@@ -19,32 +19,32 @@ Flow:
      END
 
 Any node failure → handle_error → END
+
+NOTE: No MemorySaver / ConversationBufferWindowMemory used here.
+      History is RAG-based — retrieved turn pairs are passed in as
+      GenerationState["history"] (plain text) before graph invocation.
 """
 from __future__ import annotations
 import logging
 from langgraph.graph import StateGraph, END
 
 from .state import GenerationState
-from .nodes.build_prompt_node     import build_prompt
-from .nodes.generate_node         import generate_response
-from .nodes.parse_response_node   import parse_response
+from .nodes.build_prompt_node      import build_prompt
+from .nodes.generate_node          import generate_response
+from .nodes.parse_response_node    import parse_response
 from .nodes.extract_citations_node import extract_citations, handle_error
 
 logger = logging.getLogger(__name__)
 
 
-def _check_error(s: dict) -> str:
-    return "handle_error" if s.get("error") else "next"
-
-
 def build_generation_graph() -> StateGraph:
     wf = StateGraph(GenerationState)
 
-    wf.add_node("build_prompt",        build_prompt)
-    wf.add_node("generate_response",   generate_response)
-    wf.add_node("parse_response",      parse_response)
-    wf.add_node("extract_citations",   extract_citations)
-    wf.add_node("handle_error",        handle_error)
+    wf.add_node("build_prompt",      build_prompt)
+    wf.add_node("generate_response", generate_response)
+    wf.add_node("parse_response",    parse_response)
+    wf.add_node("extract_citations", extract_citations)
+    wf.add_node("handle_error",      handle_error)
 
     wf.set_entry_point("build_prompt")
 

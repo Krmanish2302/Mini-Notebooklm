@@ -2,14 +2,14 @@
 llm_registry.py
 
 Single source of truth for LLM construction.
-Uses LangChain-native chat models throughout — no custom wrappers.
+Uses LangChain-native chat models — no custom wrappers.
 
 Supported providers (set LLM_PROVIDER env var):
-  groq     — ChatGroq      (langchain-groq)
-  openai   — ChatOpenAI    (langchain-openai)
-  gemini   — ChatGoogleGenerativeAI (langchain-google-genai)
-  ollama   — ChatOllama    (langchain-community)
-  anthropic— ChatAnthropic (langchain-anthropic)
+  groq      — ChatGroq               (langchain-groq)
+  openai    — ChatOpenAI             (langchain-openai)
+  gemini    — ChatGoogleGenerativeAI (langchain-google-genai)
+  ollama    — ChatOllama             (langchain-community)
+  anthropic — ChatAnthropic          (langchain-anthropic)
 
 Usage:
     from src.generation.llm_registry import LLMRegistry
@@ -27,7 +27,6 @@ from langchain_core.language_models import BaseChatModel
 
 logger = logging.getLogger(__name__)
 
-# ── Defaults (configurable via env) ──────────────────────────────────────────
 DEFAULT_PROVIDER    = os.getenv("LLM_PROVIDER",     "groq")
 DEFAULT_MODEL       = os.getenv("LLM_MODEL",        "llama-3.1-70b-versatile")
 DEFAULT_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
@@ -120,7 +119,7 @@ class LLMRegistry:
         temperature: float = DEFAULT_TEMPERATURE,
         max_tokens:  int   = DEFAULT_MAX_TOKENS,
     ) -> BaseChatModel:
-        """Same as get() but streaming is enabled by construction."""
+        """Same as get() but streaming=True is set on construction."""
         return LLMRegistry.get(
             provider=provider,
             model=model,
