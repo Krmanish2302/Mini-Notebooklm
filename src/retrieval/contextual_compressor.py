@@ -1,23 +1,23 @@
 """
 contextual_compressor.py
 
-Wraps LangChain ContextualCompressionRetriever with LLMChainExtractor.
-Extracts only the relevant portions of each retrieved document.
+Wraps LangChain LLMChainExtractor to extract only the relevant portions
+of each retrieved document.
 
 Use sparingly — makes 1 LLM call per document.
 Set use_compression=False in RetrievalState to skip.
+
+BUG-RET-02: was hardcoded ChatOpenAI/gpt-4o-mini — now uses LLMRegistry
+so Groq/llama-3.1-70b is used consistently with the rest of the system.
 """
 from __future__ import annotations
 import logging
-import os
 from typing import List
 
 from langchain_core.documents import Document
 from langchain.retrievers.document_compressors import LLMChainExtractor
-from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
 
 logger = logging.getLogger(__name__)
-COMPRESSION_MODEL = os.getenv("COMPRESSION_MODEL", "gpt-4o-mini")
 
 
 class ContextualCompressor:
@@ -34,15 +34,15 @@ class ContextualCompressor:
         if not docs:
             return docs
         try:
-            from langchain_openai import ChatOpenAI
-            llm        = ChatOpenAI(model=COMPRESSION_MODEL, temperature=0)
+            from src.generation.llm_registry import LLMRegistry
+            llm        = LLMRegistry.get()
             compressor = LLMChainExtractor.from_llm(llm)
             compressed = compressor.compress_documents(docs, query)
             logger.info(
                 "[ContextualCompressor] Compressed %d → %d docs",
                 len(docs), len(compressed),
             )
-            return compressed or docs   # fallback to originals if compression removes everything
+            return compressed or docs   # fallback to originals if all filtered out
         except Exception as exc:
             logger.warning("[ContextualCompressor] Failed (%s) — returning original docs", exc)
             return docs

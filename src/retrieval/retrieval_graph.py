@@ -9,22 +9,20 @@ Flow:
        ▼
   retrieve_docs
        │
-       ├─(use_rerank=True)──► rerank_docs
-       │                            │
-       │(False)                     │
-       ▼                            │
-  compress_or_build ◄──────────────┘
-       │
-       ├─(use_compression=True)──► compress_docs
-       │                                 │
-       │(False)                          │
-       ▼                                 │
-  build_context ◄──────────────────────┘
-       │
-       ▼
-      END
+       ├─(use_rerank=True)──────────────────► rerank_docs
+       │                                           │
+       ├─(use_rerank=False,                        │
+       │  use_compression=True)──► compress_docs ◄─┘
+       │                                │
+       └─(both False)──► build_context ◄┘
+                              │
+                             END
 
-Any node failure → handle_error → END
+  Any node error → handle_error → END
+
+BUG-RET-03 fix: retrieve_docs now correctly routes to build_context
+directly when both use_rerank=False and use_compression=False.
+Removes the phantom 'compress_or_build' routing target.
 """
 from __future__ import annotations
 import logging
@@ -40,13 +38,16 @@ from .nodes.build_context_node import build_context, handle_error
 logger = logging.getLogger(__name__)
 
 
-def _should_rerank(s: dict) -> str:
-    if s.get("error"):           return "handle_error"
-    if s.get("use_rerank", True): return "rerank_docs"
-    return "compress_or_build"
+def _after_retrieve(s: dict) -> str:
+    """Route after retrieve_docs: rerank → compress → context, or short-circuit."""
+    if s.get("error"):                  return "handle_error"
+    if s.get("use_rerank", True):       return "rerank_docs"
+    if s.get("use_compression", False): return "compress_docs"
+    return "build_context"
 
 
-def _should_compress(s: dict) -> str:
+def _after_rerank(s: dict) -> str:
+    """Route after rerank_docs: compress if requested, else straight to context."""
     if s.get("error"):                  return "handle_error"
     if s.get("use_compression", False): return "compress_docs"
     return "build_context"
@@ -55,12 +56,12 @@ def _should_compress(s: dict) -> str:
 def build_retrieval_graph() -> StateGraph:
     wf = StateGraph(RetrievalState)
 
-    wf.add_node("expand_query",     expand_query)
-    wf.add_node("retrieve_docs",    retrieve_docs)
-    wf.add_node("rerank_docs",      rerank_docs)
-    wf.add_node("compress_docs",    compress_docs)
-    wf.add_node("build_context",    build_context)
-    wf.add_node("handle_error",     handle_error)
+    wf.add_node("expand_query",  expand_query)
+    wf.add_node("retrieve_docs", retrieve_docs)
+    wf.add_node("rerank_docs",   rerank_docs)
+    wf.add_node("compress_docs", compress_docs)
+    wf.add_node("build_context", build_context)
+    wf.add_node("handle_error",  handle_error)
 
     wf.set_entry_point("expand_query")
 
@@ -72,14 +73,23 @@ def build_retrieval_graph() -> StateGraph:
 
     wf.add_conditional_edges(
         "retrieve_docs",
-        _should_rerank,
-        {"rerank_docs": "rerank_docs", "compress_or_build": "compress_docs", "handle_error": "handle_error"},
+        _after_retrieve,
+        {
+            "rerank_docs":   "rerank_docs",
+            "compress_docs": "compress_docs",
+            "build_context": "build_context",
+            "handle_error":  "handle_error",
+        },
     )
 
     wf.add_conditional_edges(
         "rerank_docs",
-        _should_compress,
-        {"compress_docs": "compress_docs", "build_context": "build_context", "handle_error": "handle_error"},
+        _after_rerank,
+        {
+            "compress_docs": "compress_docs",
+            "build_context": "build_context",
+            "handle_error":  "handle_error",
+        },
     )
 
     wf.add_conditional_edges(

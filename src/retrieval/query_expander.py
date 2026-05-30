@@ -11,16 +11,13 @@ Both fall back to deterministic heuristic variants when no LLM is available.
 """
 from __future__ import annotations
 import logging
-import os
 import re
-from typing import List, Optional
+from typing import List
 
-from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 logger = logging.getLogger(__name__)
-LLM_MODEL = os.getenv("QUERY_EXPANSION_MODEL", "gpt-4o-mini")
 
 
 def _heuristic_variants(query: str, n: int = 3) -> List[str]:
@@ -40,8 +37,10 @@ def _heuristic_variants(query: str, n: int = 3) -> List[str]:
 
 
 def _get_llm():
-    from langchain_openai import ChatOpenAI
-    return ChatOpenAI(model=LLM_MODEL, temperature=0)
+    # BUG-RET-01: was hardcoded ChatOpenAI(gpt-4o-mini) — now uses LLMRegistry
+    # so Groq/llama-3.1-70b is used consistently with the rest of the system.
+    from src.generation.llm_registry import LLMRegistry
+    return LLMRegistry.get()
 
 
 class SubQueryDecomposer:

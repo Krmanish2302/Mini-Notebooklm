@@ -15,7 +15,8 @@ def expand_query(state: dict) -> dict:
         if not query:
             return {"error": "No query provided", "failed_node": "expand_query"}
 
-        if not state.get("expand_query", EXPAND_QUERIES):
+        # BUG-RET-06: state flag renamed do_expand (was expand_query)
+        if not state.get("do_expand", EXPAND_QUERIES):
             logger.info("[expand_query] Expansion disabled — using original query")
             return {"expanded_queries": [query]}
 

@@ -14,7 +14,7 @@ class RetrievalState(TypedDict, total=False):
     top_k:            int
     use_rerank:       bool
     use_compression:  bool
-    expand_query:     bool
+    do_expand:        bool   # renamed from expand_query (clashed with node fn)
 
     # ── intermediate ────────────────────────────────────────────────────
     expanded_queries: List[str]          # after expand_node
