@@ -5,21 +5,18 @@ Orchestrates:
   1. Source filtering (active source IDs)
   2. ChatGraph invocation (embed → retrieve → compress → rerank → prompt → generate)
   3. Response + citation assembly via ResponseGenerator
-  4. Chat history management via LangChain ConversationBufferWindowMemory
+  4. RAG-based history via RAGHistoryStore (no ConversationBufferWindowMemory)
 
-LangChain components used:
-  - ConversationBufferWindowMemory  (chat history)
-  - LLMRegistry                     (model factory)
-  - ChatGraph                       (LangGraph sub-graph)
-  - ResponseGenerator               (citation resolver)
+History strategy
+  - Every completed turn is embedded and stored in SQLite by RAGHistoryStore.
+  - On each query, the top-k semantically-similar past turns are retrieved
+    and injected into the prompt as plain text.
+  - No MemorySaver or ConversationBufferWindowMemory is used anywhere.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
-
-from langchain.memory import ConversationBufferWindowMemory
-from langchain_core.messages import AIMessage, HumanMessage
 
 from src.generation.llm_registry import LLMRegistry
 from src.generation.persona_config import PersonaConfig
@@ -28,6 +25,7 @@ from src.pipelines.chat_graph import ChatGraph
 from src.storage.faiss_store import MultiFAISSStore
 from src.storage.source_manager import SourceManager
 from src.storage.sqlite_manager import SQLiteManager
+from src.storage.rag_history_store import RAGHistoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +35,7 @@ class ChatPipeline:
     End-to-end chat pipeline.
 
     Usage:
-        pipe = ChatPipeline(faiss_store, sqlite, source_manager)
+        pipe = ChatPipeline(faiss_store, sqlite, source_manager, embedder)
         pipe.set_persona(PersonaConfig(persona="professor"))
         result = pipe.run("Explain osmosis", source_ids=["bio_101"])
         print(result["answer"])
@@ -49,32 +47,32 @@ class ChatPipeline:
         faiss_store:    MultiFAISSStore,
         sqlite:         SQLiteManager,
         source_manager: SourceManager,
+        embedder:       Any,            # any LangChain Embeddings (embed_query)
         compressor=None,
         reranker=None,
-        window_k:       int = 6,
+        history_top_k:  int = 4,        # past turns injected per query
+        session_id:     str = "default",
     ):
         self.source_manager = source_manager
         self.sqlite         = sqlite
-
-        # LangChain memory — retains last window_k human/AI turn pairs
-        self.memory = ConversationBufferWindowMemory(
-            k=window_k,
-            return_messages=True,
-            memory_key="chat_history",
-        )
-
         self._persona: PersonaConfig = PersonaConfig()
         self._llm: Optional[Any]     = None
+        self._history_top_k          = history_top_k
+
+        # RAG-based history store
+        self.history_store = RAGHistoryStore(sqlite, embedder)
 
         self.chat_graph = ChatGraph(
             faiss_store=faiss_store,
             sqlite=sqlite,
             source_manager=source_manager,
+            rag_history_store=self.history_store,
             compressor=compressor,
             reranker=reranker,
         )
+        self.chat_graph.set_session(session_id)
 
-    # ── Configuration ─────────────────────────────────────────────────────
+    # ── Configuration ─────────────────────────────────────────────────────────
 
     def set_persona(self, persona: PersonaConfig) -> None:
         self._persona = persona
@@ -83,17 +81,18 @@ class ChatPipeline:
         self._llm = llm
         self.chat_graph.set_llm(llm)
 
-    def set_thread(self, thread_id: str) -> None:
-        self.chat_graph.set_thread(thread_id)
+    def set_session(self, session_id: str) -> None:
+        """Switch to a different user/session context."""
+        self.chat_graph.set_session(session_id)
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # ── Public API ──────────────────────────────────────────────────────────────
 
     def run(
         self,
-        query:          str,
-        source_ids:     Optional[List[str]] = None,
-        top_k:          int                 = 8,
-        score_threshold: float              = 0.0,
+        query:           str,
+        source_ids:      Optional[List[str]] = None,
+        top_k:           int                 = 8,
+        score_threshold: float               = 0.0,
     ) -> Dict[str, Any]:
         """
         Run a single chat turn.
@@ -104,10 +103,6 @@ class ChatPipeline:
         llm = self._llm or LLMRegistry.get()
         self.chat_graph.set_llm(llm)
 
-        # Load LangChain memory as LangChain message history
-        mem_vars = self.memory.load_memory_variables({})
-        history  = mem_vars.get("chat_history", [])
-
         # Filter active sources if specified
         if source_ids:
             active = self.source_manager.get_active_source_ids(source_ids)
@@ -116,23 +111,22 @@ class ChatPipeline:
 
         logger.info("[ChatPipeline] query='%s' sources=%s top_k=%d", query, active, top_k)
 
+        # chat_graph handles RAG history retrieval + persistence internally
         result = self.chat_graph.chat(
             query=query,
-            history=history,
             top_k=top_k,
             score_threshold=score_threshold,
-        )
-
-        # Save to LangChain memory
-        self.memory.save_context(
-            {"input": query},
-            {"output": result.get("response", "")},
+            history_top_k=self._history_top_k,
         )
 
         # Assemble response + citations
         retrieved = result.get("retrieved", [])
-        chunks    = [
-            {"citation_label": f"S{i+1}", "content": c["content"], "source_id": c.get("id", "")}
+        chunks = [
+            {
+                "citation_label": f"S{i+1}",
+                "content":        c["content"],
+                "source_id":      c.get("id", ""),
+            }
             for i, c in enumerate(retrieved)
         ]
         generator = ResponseGenerator(context_chunks=chunks)
@@ -151,14 +145,9 @@ class ChatPipeline:
         }
 
     def clear_history(self) -> None:
-        self.memory.clear()
+        """Wipe the current session's turn history from SQLite."""
+        self.history_store.clear_session(self.chat_graph._session_id)
 
-    def get_history(self) -> List[Dict[str, str]]:
-        """Return history as list of {role, content} dicts."""
-        mem_vars = self.memory.load_memory_variables({})
-        messages = mem_vars.get("chat_history", [])
-        out = []
-        for m in messages:
-            role = "user" if isinstance(m, HumanMessage) else "assistant"
-            out.append({"role": role, "content": m.content})
-        return out
+    def get_history(self) -> List[Dict[str, Any]]:
+        """Return all turns for the current session as a list of dicts."""
+        return self.history_store.session_turns(self.chat_graph._session_id)
