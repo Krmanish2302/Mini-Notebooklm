@@ -1,57 +1,79 @@
 """
-Reranker  —  cross-encoder reranker for Deep Research Mode.
+reranker.py
 
-Bug fix (2026-05-10): rerank(query, chunks, top_k=5) had a fixed top_k default
-that silently truncated results when DeepResearchPipeline passed more chunks
-than 5.  Changed default to None (pass-through) so the caller decides.
+Cross-encoder reranker using LangChain's ContextualCompressionRetriever
+with a CohereRerank or FlashrankRerank compressor.
+
+Falls back to simple score-based reranking if no API key available.
+
+Usage:
+    from src.retrieval.reranker import Reranker
+    reranker = Reranker()
+    reranked = reranker.rerank(query="your query", docs=documents, top_n=5)
 """
-from typing import List, Dict, Any, Optional
+from __future__ import annotations
+import logging
+import os
+from typing import List
+
+from langchain_core.documents import Document
+
+logger = logging.getLogger(__name__)
+
+RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "flashrank")  # "cohere" | "flashrank" | "none"
+COHERE_API_KEY  = os.getenv("COHERE_API_KEY", "")
 
 
 class Reranker:
-    """Cross-encoder reranker for precise scoring.
+    """
+    Reranks retrieved documents by relevance to the query.
 
-    The CrossEncoder model is lazy-loaded: it is NOT downloaded at
-    __init__ time.  The first call to rerank() triggers the download.
-    This prevents blocking app startup for users who never use reranking.
+    Providers (set RERANK_PROVIDER env var):
+      flashrank  — local, free, no API key (default)
+      cohere     — Cohere Rerank API (requires COHERE_API_KEY)
+      none       — pass-through (no reranking)
     """
 
-    def __init__(self, model_name: str = "BAAI/bge-reranker-base"):
-        self.model_name = model_name
-        self._model = None  # lazy-loaded on first rerank() call
+    def rerank(self, query: str, docs: List[Document], top_n: int = 5) -> List[Document]:
+        if not docs:
+            return docs
 
-    def _load_model(self):
-        """Download and cache the CrossEncoder on first use."""
-        if self._model is None:
-            from sentence_transformers import CrossEncoder  # deferred import
-            self._model = CrossEncoder(self.model_name)
+        if RERANK_PROVIDER == "cohere" and COHERE_API_KEY:
+            return self._cohere_rerank(query, docs, top_n)
+        elif RERANK_PROVIDER == "flashrank":
+            return self._flashrank_rerank(query, docs, top_n)
+        else:
+            logger.info("[Reranker] provider='none' — returning docs as-is")
+            return docs[:top_n]
 
-    def rerank(
-        self,
-        query: str,
-        chunks: List[Dict[str, Any]],
-        top_k: Optional[int] = None,   # BUG FIX: was hard-coded default=5
-    ) -> List[Dict[str, Any]]:
-        """
-        Rerank chunks by query relevance using the cross-encoder.
+    def _cohere_rerank(self, query: str, docs: List[Document], top_n: int) -> List[Document]:
+        try:
+            from langchain_cohere import CohereRerank
+            from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+            compressor = CohereRerank(
+                cohere_api_key=COHERE_API_KEY,
+                top_n=top_n,
+                model="rerank-english-v3.0",
+            )
+            # Use directly as a compressor
+            compressed = compressor.compress_documents(docs, query)
+            logger.info("[Reranker] Cohere reranked %d → %d docs", len(docs), len(compressed))
+            return compressed
+        except Exception as exc:
+            logger.warning("[Reranker] Cohere failed (%s) — flashrank fallback", exc)
+            return self._flashrank_rerank(query, docs, top_n)
 
-        Parameters
-        ----------
-        top_k : int or None
-                If None, return ALL chunks re-scored and sorted (no truncation).
-                DeepResearchPipeline sets this to None so ContextBuilder
-                receives the full ranked set for its own token-budget pass.
-        """
-        if not chunks:
-            return []
-
-        self._load_model()  # no-op after first call
-
-        pairs = [(query, c["content"]) for c in chunks]
-        scores = self._model.predict(pairs)
-
-        for chunk, score in zip(chunks, scores):
-            chunk["rerank_score"] = float(score)
-
-        chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
-        return chunks if top_k is None else chunks[:top_k]  # BUG FIX
+    def _flashrank_rerank(self, query: str, docs: List[Document], top_n: int) -> List[Document]:
+        try:
+            from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
+            compressor = FlashrankRerank(top_n=top_n)
+            compressed = compressor.compress_documents(docs, query)
+            logger.info("[Reranker] Flashrank reranked %d → %d docs", len(docs), len(compressed))
+            return compressed
+        except Exception as exc:
+            logger.warning("[Reranker] Flashrank failed (%s) — score-sort fallback", exc)
+            return sorted(
+                docs,
+                key=lambda d: d.metadata.get("relevance_score", d.metadata.get("score", 0)),
+                reverse=True,
+            )[:top_n]

@@ -1,52 +1,31 @@
 """
-recursive_chunker.py — Recursive character-based text splitter.
-Compatible with LangChain v0.3+ (langchain_text_splitters package).
+recursive_chunker.py
+
+Wraps LangChain RecursiveCharacterTextSplitter.
+Used directly in chunking_node.py for the main pipeline.
+This class is available for standalone use outside the pipeline.
 """
 from __future__ import annotations
-
+import os
 from typing import List
-
-# LangChain v0.3+: text splitters moved to langchain_text_splitters
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except ImportError:
-    # Fallback for older installs
-    from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore
-
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from .base_chunker import BaseChunker
 
 
 class RecursiveChunker(BaseChunker):
-    """
-    Splits text recursively on paragraph, sentence, word, and character
-    boundaries until every chunk is within chunk_size tokens.
-    """
-
     def __init__(
         self,
-        chunk_size: int = 512,
-        chunk_overlap: int = 64,
-        separators: List[str] | None = None,
-    ) -> None:
-        self.chunk_size    = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.separators    = separators or ["\n\n", "\n", ". ", " ", ""]
+        chunk_size:    int       = int(os.getenv("CHUNK_SIZE",    "1000")),
+        chunk_overlap: int       = int(os.getenv("CHUNK_OVERLAP", "200")),
+        separators:    List[str] = None,
+    ):
         self._splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
-            separators=self.separators,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=separators or ["\n\n", "\n", ". ", " ", ""],
+            add_start_index=True,
         )
 
-    def chunk(self, text: str, source_id: str = "") -> List[dict]:
-        if not text or not text.strip():
-            return []
-        raw_chunks = self._splitter.split_text(text)
-        return [
-            {
-                "chunk_id":  f"{source_id}_rc_{i}",
-                "source_id": source_id,
-                "text":      chunk,
-                "index":     i,
-            }
-            for i, chunk in enumerate(raw_chunks)
-        ]
+    def chunk_documents(self, docs: List[Document]) -> List[Document]:
+        return self._splitter.split_documents(docs)

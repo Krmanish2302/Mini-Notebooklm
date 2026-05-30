@@ -1,22 +1,33 @@
-from .base_chunker import BaseChunker
-from typing import List, Dict, Any
+"""
+chapter_chunker.py
+
+Split documents on Markdown heading boundaries (# / ## / ###).
+Falls back to RecursiveCharacterTextSplitter if no headings found.
+"""
+from __future__ import annotations
 import re
+from typing import List
+from langchain_core.documents import Document
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from .base_chunker import BaseChunker
+
 
 class ChapterChunker(BaseChunker):
-    """Chunks based on Chapter markers."""
-    
-    def chunk(self, content: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        chapters = re.split(r'(?i)^Chapter\s+\d+.*$', content, flags=re.MULTILINE)
-        chunks = []
-        for i, chapter in enumerate(chapters):
-            if not chapter.strip(): continue
-            chunks.append({
-                "id": f"{metadata.get('source_id', 'unknown')}_chapter_{i}",
-                "content": chapter.strip(),
-                "metadata": {**(metadata or {}), "chapter_index": i},
-                "modality": metadata.get("modality", "text")
-            })
-        return chunks
-    
-    def get_strategy_name(self) -> str:
-        return "chapter"
+    _HEADERS = [("#", "h1"), ("##", "h2"), ("###", "h3")]
+    _FALLBACK = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=150)
+
+    def chunk_documents(self, docs: List[Document]) -> List[Document]:
+        splitter = MarkdownHeaderTextSplitter(headers_to_split_on=self._HEADERS)
+        result   = []
+        for doc in docs:
+            if re.search(r"^#{1,3}\s", doc.page_content, re.MULTILINE):
+                splits = splitter.split_text(doc.page_content)
+                for s in splits:
+                    s.metadata = {**doc.metadata, **s.metadata, "chunker": "chapter"}
+                result.extend(splits)
+            else:
+                fallback = self._FALLBACK.split_documents([doc])
+                for c in fallback:
+                    c.metadata["chunker"] = "chapter_fallback"
+                result.extend(fallback)
+        return result

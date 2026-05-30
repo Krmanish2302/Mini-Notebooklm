@@ -1,35 +1,40 @@
-from sentence_transformers import SentenceTransformer
+"""
+text_embedder.py
+
+LangChain-backed embedder. Supports OpenAI and HuggingFace.
+EMBEDDING_PROVIDER env var selects the provider.
+"""
+from __future__ import annotations
+import os
 import numpy as np
 from typing import List
+from .base_embedder import BaseEmbedder
+
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai")
 
 
-class TextEmbedder:
-    """Embedding with configurable models.
-
-    Fix (Bug 3): dimension is probed from the actual model output instead of
-    a stale hard-coded MODEL_DIMENSIONS dict, so any model — including ones
-    not in the old dict — always reports the correct dimensionality.
-    """
-
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+class TextEmbedder(BaseEmbedder):
+    def __init__(self, model_name: str = None):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
-        # Probe real dimension — never trust a stale registry dict
-        probe = self.model.encode(["probe"], convert_to_numpy=True, show_progress_bar=False)
-        self.dimension: int = int(np.atleast_2d(probe).shape[1])
+        self._lc_embedder = self._build()
+
+    def _build(self):
+        if EMBEDDING_PROVIDER == "huggingface":
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+            return HuggingFaceEmbeddings(
+                model_name=self.model_name or "all-MiniLM-L6-v2"
+            )
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings(model=self.model_name or "text-embedding-3-small")
 
     def embed(self, texts: List[str]) -> np.ndarray:
-        """Batch embed texts. Returns shape (N, dim)."""
-        if not texts:
-            return np.empty((0, self.dimension), dtype="float32")
-        return self.model.encode(
-            texts, convert_to_numpy=True, show_progress_bar=False
-        )
+        vecs = self._lc_embedder.embed_documents(texts)
+        return np.array(vecs, dtype="float32")
 
     def embed_single(self, text: str) -> np.ndarray:
-        """Embed a single text string. Returns 1-D array of shape (dim,)."""
-        result = self.embed([text])
-        return result[0]
+        vec = self._lc_embedder.embed_query(text)
+        return np.array(vec, dtype="float32")
 
-    def get_dimension(self) -> int:
-        return self.dimension
+    @property
+    def dimension(self) -> int:
+        return len(self.embed_single("ping"))

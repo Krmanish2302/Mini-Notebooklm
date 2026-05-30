@@ -1,117 +1,82 @@
-"""CitationExtractor — maps [SOURCE_X] markers to real chunk metadata.
+"""
+citation_extractor.py — Extract and validate inline citations from LLM answers.
 
-Phase 3 deliverable: correct interface + full wire-up.
-Phase 4 will extend inject() to embed clickable references in the UI.
+Uses LangChain output parsers + regex to extract structured citation metadata.
 """
 from __future__ import annotations
-
 import re
 from typing import Any, Dict, List, Optional
 
+from langchain_core.output_parsers import StrOutputParser
+
+_CITE_RE   = re.compile(r"\[S(\d{1,2})\]", re.IGNORECASE)
+_str_parser = StrOutputParser()
+
 
 class CitationExtractor:
-    """Resolves [SOURCE_X] markers in LLM responses to real chunk metadata.
+    """
+    Extracts citation references ([S1], [S2]…) from an LLM answer and
+    resolves them against the context chunks that were fed to the model.
 
-    Usage
-    -----
-    extractor = CitationExtractor()
-
-    # After ResponseGenerator.generate():
-    annotated = extractor.inject(response=text, documents=docs)
-
-    # Or extract citation metadata for API consumers:
-    cites = extractor.extract(response=text, documents=docs)
+    Usage:
+        extractor = CitationExtractor(context_chunks)
+        result    = extractor.extract(answer_text)
+        # result → List[{"label": "S1", "source_id": "...", "snippet": "..."}]
     """
 
-    _CITATION_RE = re.compile(r'\[SOURCE_(\d+)\]')
+    def __init__(self, context_chunks: Optional[List[Dict[str, Any]]] = None):
+        self.context_chunks = context_chunks or []
+        self._label_map: Dict[str, Dict] = {}
+        for i, chunk in enumerate(self.context_chunks, 1):
+            label = f"S{i}"
+            self._label_map[label] = chunk
 
-    def extract(
-        self,
-        response: str,
-        documents: List[Any],
-    ) -> List[Dict[str, Any]]:
-        """Return a list of resolved citation dicts.
-
-        Each dict has:
-            source_index : int  — 1-based index found in [SOURCE_X]
-            source_id    : str  — from chunk metadata (if available)
-            source_name  : str  — human-readable name / URL
-            chunk_excerpt: str  — first 200 chars of the cited chunk
-            confidence   : float — 1.0 (direct citation marker)
+    def extract(self, answer: str) -> List[Dict[str, Any]]:
         """
-        raw_indices = self._CITATION_RE.findall(response)
-        seen = set()
-        citations: List[Dict[str, Any]] = []
+        Extract all inline citations and resolve them to source metadata.
 
-        for idx_str in raw_indices:
-            idx = int(idx_str)          # 1-based
-            if idx in seen:
-                continue
-            seen.add(idx)
-
-            doc_idx = idx - 1           # 0-based list index
-            if 0 <= doc_idx < len(documents):
-                doc = documents[doc_idx]
-                if hasattr(doc, "page_content"):
-                    content = doc.page_content
-                    meta = doc.metadata or {}
-                else:
-                    content = doc.get("content", "")
-                    meta = {k: v for k, v in doc.items() if k != "content"}
-
-                citations.append({
-                    "source_index": idx,
-                    "source_id":    meta.get("source_id", meta.get("id", f"source_{idx}")),
-                    "source_name":  meta.get("source", meta.get("url", meta.get("file_path", ""))),
-                    "chunk_excerpt": content[:200],
-                    "confidence":   1.0,
-                })
+        Returns:
+            List of citation dicts: {label, source_id, source_name, snippet, page}
+        """
+        labels = list(dict.fromkeys(
+            m.group(1).upper() for m in _CITE_RE.finditer(answer)
+        ))
+        results = []
+        for label in labels:
+            chunk = self._label_map.get(label, {})
+            if hasattr(chunk, "page_content"):
+                content = chunk.page_content
+                meta    = chunk.metadata or {}
             else:
-                # Marker points to a document that wasn't retrieved — record it
-                # so callers can detect hallucinated citations.
-                citations.append({
-                    "source_index": idx,
-                    "source_id":    f"source_{idx}",
-                    "source_name":  "",
-                    "chunk_excerpt": "",
-                    "confidence":   0.0,  # unresolvable → low confidence
-                })
+                content = chunk.get("content", "")
+                meta    = {k: v for k, v in chunk.items() if k not in ("content",)}
 
-        return citations
+            results.append({
+                "label":       f"[S{label}]",
+                "source_id":   meta.get("source_id", ""),
+                "source_name": meta.get("source", meta.get("source_name", "")),
+                "page":        meta.get("page", ""),
+                "snippet":     content[:200],
+            })
+        return results
 
-    def inject(
-        self,
-        response: str,
-        documents: List[Any],
-        fmt: str = "inline",
-    ) -> str:
-        """Inject resolved citation labels into the response string.
-
-        fmt='inline'  : replace [SOURCE_X] with [X: source_name] or [X]
-        fmt='preserve': return response unchanged (citations kept as-is)
+    def validate(self, answer: str) -> Dict[str, List[str]]:
         """
-        if fmt == "preserve" or not documents:
-            return response
+        Check for hallucinated or missing citations.
 
-        citations = {c["source_index"]: c for c in self.extract(response, documents)}
-
-        def _replace(match: re.Match) -> str:
-            idx = int(match.group(1))
-            cite = citations.get(idx)
-            if cite and cite["source_name"]:
-                short = cite["source_name"].split("/")[-1][:40]  # last path segment
-                return f"[{idx}: {short}]"
-            return f"[{idx}]"
-
-        return self._CITATION_RE.sub(_replace, response)
-
-    def extract_unresolvable(
-        self, response: str, documents: List[Any]
-    ) -> List[int]:
-        """Return 1-based indices of [SOURCE_X] markers that have no matching
-        document — i.e., potential hallucinated citations."""
-        return [
-            c["source_index"]
-            for c in self.extract(response, documents)
-            if c["confidence"] < 1.0
-        ]
+        Returns:
+            {
+                "valid":        List[str],  # cited AND present in context
+                "hallucinated": List[str],  # cited but NOT in context
+                "uncited":      List[str],  # in context but NOT cited
+            }
+        """
+        cited_labels = {
+            m.group(1).upper() for m in _CITE_RE.finditer(answer)
+        }
+        all_labels   = set(self._label_map.keys())
+        return {
+            "valid":        sorted(cited_labels & all_labels),
+            "hallucinated": sorted(cited_labels - all_labels),
+            "uncited":      sorted(all_labels - cited_labels),
+        }

@@ -1,23 +1,16 @@
 """
-knowledge_graph.py  —  NetworkX knowledge graph over LangChain Documents
+knowledge_graph.py — NetworkX knowledge graph over LangChain Documents.
 
-Design
-------
-Nodes : chunk_id  (str)  — attributes mirror LangChain Document fields
-          content, metadata, source_id, modality
+Nodes : chunk_id (str) — attributes mirror LangChain Document fields:
+          page_content, metadata, source_id, modality
 Edges : (chunk_a, chunk_b, weight=cosine_similarity)
           Added when similarity >= edge_threshold (default 0.75)
-          Also added explicitly by StorageManager for cross-modal merges.
 
-Public API
-----------
-    add_chunk(chunk)           — add/upsert a node
-    add_edge(a, b, weight)     — add weighted edge
-    get_neighbors(chunk_id, n) — BFS up to depth n
-    find_path(src, dst)        — shortest path (Dijkstra, weight=1-w)
-    remove_node(chunk_id)      — delete node + incident edges
-    get_stats()                — node / edge counts
-    export_pyvis(path)         — HTML visualisation (optional)
+LangChain integration:
+    - add_document() accepts a LangChain Document directly.
+    - get_neighbors_as_documents() returns List[Document].
+    - All internal node attributes match Document field names
+      (page_content, metadata) for drop-in compatibility.
 """
 from __future__ import annotations
 
@@ -26,208 +19,178 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
+from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
 
 
 class KnowledgeGraph:
-    """Chunk-level knowledge graph backed by NetworkX."""
+    """Chunk-level semantic knowledge graph backed by NetworkX."""
 
     def __init__(self, edge_threshold: float = 0.75):
         self.graph: nx.Graph = nx.Graph()
-        self.edge_threshold = edge_threshold
+        self.edge_threshold  = edge_threshold
 
-    # ── nodes ─────────────────────────────────────────────────────────────────
+    # ── Node management ───────────────────────────────────────────────────────
+
+    def add_document(
+        self,
+        doc:        Document,
+        chunk_id:   str,
+        embedding:  Optional[List[float]] = None,
+        auto_link:  bool = False,
+    ) -> None:
+        """
+        Add a LangChain Document as a graph node.
+        If auto_link=True, compute cosine similarity against all existing nodes
+        and add edges where similarity >= edge_threshold.
+        """
+        self.graph.add_node(
+            chunk_id,
+            page_content = doc.page_content,
+            metadata     = doc.metadata,
+            source_id    = doc.metadata.get("source_id", ""),
+            modality     = doc.metadata.get("modality", "text"),
+            embedding    = embedding,
+        )
+        if auto_link and embedding:
+            self._auto_link(chunk_id, embedding)
 
     def add_chunk(
         self,
-        chunk: Dict[str, Any],
-        *,
+        chunk:     Dict[str, Any],
         auto_link: bool = False,
-        existing_embeddings: Optional[Dict[str, List[float]]] = None,
     ) -> None:
         """
-        Add or update a chunk node.
-
-        Parameters
-        ----------
-        chunk           : must have 'id'; 'content', 'metadata', 'source_id',
-                          'modality', and optionally 'embedding' are stored.
-        auto_link       : if True, compare against existing nodes and add
-                          edges where cosine similarity >= edge_threshold.
-        existing_embeddings: pre-loaded {chunk_id: embedding} dict; used when
-                          auto_link=True to avoid re-scanning node attributes.
+        Backward-compat: add a raw dict chunk as a node.
+        Converts to Document internally.
         """
-        cid = chunk.get("id")
-        if not cid:
-            logger.warning("KnowledgeGraph.add_chunk: chunk missing 'id', skipping")
-            return
-
-        self.graph.add_node(
-            cid,
-            content=chunk.get("content", ""),
-            metadata=chunk.get("metadata", {}),
-            source_id=chunk.get("source_id", ""),
-            modality=chunk.get("modality", "text"),
+        doc = Document(
+            page_content=chunk.get("content", ""),
+            metadata={
+                k: v for k, v in chunk.items()
+                if k not in ("content", "embedding")
+            },
+        )
+        self.add_document(
+            doc=doc,
+            chunk_id=chunk["id"],
             embedding=chunk.get("embedding"),
-            section=chunk.get("metadata", {}).get("section_heading", ""),
+            auto_link=auto_link,
         )
 
-        if auto_link and chunk.get("embedding") is not None:
-            self._auto_link(cid, chunk["embedding"], existing_embeddings or {})
+    def add_edge(self, chunk_a: str, chunk_b: str, weight: float = 1.0) -> None:
+        if self.graph.has_node(chunk_a) and self.graph.has_node(chunk_b):
+            self.graph.add_edge(chunk_a, chunk_b, weight=weight)
 
-    def _auto_link(
-        self,
-        new_id: str,
-        new_emb: List[float],
-        existing: Dict[str, List[float]],
-    ) -> None:
-        """Add edges to nodes whose cosine similarity meets the threshold."""
-        v = np.array(new_emb, dtype="float32")
-        norm_v = np.linalg.norm(v)
-        if norm_v == 0:
-            return
-        for nid, data in self.graph.nodes(data=True):
-            if nid == new_id:
-                continue
-            emb = existing.get(nid) or data.get("embedding")
-            if emb is None:
-                continue
-            u = np.array(emb, dtype="float32")
-            norm_u = np.linalg.norm(u)
-            if norm_u == 0:
-                continue
-            sim = float(np.dot(v, u) / (norm_v * norm_u))
-            if sim >= self.edge_threshold:
-                self.graph.add_edge(new_id, nid, weight=sim, relation="semantic")
+    def remove_node(self, chunk_id: str) -> None:
+        if self.graph.has_node(chunk_id):
+            self.graph.remove_node(chunk_id)
 
-    # ── edges ─────────────────────────────────────────────────────────────────
+    # ── Query API ─────────────────────────────────────────────────────────────
 
-    def add_edge(
-        self,
-        chunk_id_a: str,
-        chunk_id_b: str,
-        weight: float = 1.0,
-        relation: str = "related",
-    ) -> None:
-        """Add a weighted directed edge (stored as undirected)."""
-        if chunk_id_a not in self.graph or chunk_id_b not in self.graph:
-            logger.debug(
-                "KnowledgeGraph.add_edge: one or both nodes missing (%s, %s)",
-                chunk_id_a, chunk_id_b,
-            )
-            return
-        self.graph.add_edge(chunk_id_a, chunk_id_b, weight=weight, relation=relation)
-
-    # ── retrieval ─────────────────────────────────────────────────────────────
-
-    def get_neighbors(
-        self,
-        chunk_id: str,
-        depth: int = 1,
-        min_weight: float = 0.0,
-    ) -> List[Dict[str, Any]]:
-        """
-        BFS neighbourhood up to *depth* hops.
-
-        Returns list of node attribute dicts (with 'id' injected).
-        Edges below *min_weight* are ignored.
-        """
-        if chunk_id not in self.graph:
+    def get_neighbors(self, chunk_id: str, depth: int = 1) -> List[str]:
+        """BFS up to *depth* hops. Returns list of neighbour chunk_ids."""
+        if not self.graph.has_node(chunk_id):
             return []
-
-        visited: set = {chunk_id}
-        frontier: set = {chunk_id}
-        result: List[Dict[str, Any]] = []
-
+        visited  = {chunk_id}
+        frontier = {chunk_id}
         for _ in range(depth):
             next_frontier: set = set()
             for node in frontier:
-                for nbr, edata in self.graph[node].items():
-                    if nbr in visited:
-                        continue
-                    if edata.get("weight", 1.0) >= min_weight:
+                for nbr in self.graph.neighbors(node):
+                    if nbr not in visited:
+                        visited.add(nbr)
                         next_frontier.add(nbr)
-            for nbr in next_frontier:
-                attrs = dict(self.graph.nodes[nbr])
-                attrs["id"] = nbr
-                result.append(attrs)
-            visited |= next_frontier
             frontier = next_frontier
-            if not frontier:
-                break
+        visited.discard(chunk_id)
+        return list(visited)
 
-        return result
+    def get_neighbors_as_documents(
+        self,
+        chunk_id: str,
+        depth:    int = 1,
+    ) -> List[Document]:
+        """Return neighbours as LangChain Documents."""
+        nbr_ids = self.get_neighbors(chunk_id, depth)
+        docs = []
+        for nid in nbr_ids:
+            attrs = self.graph.nodes[nid]
+            docs.append(Document(
+                page_content=attrs.get("page_content", ""),
+                metadata=attrs.get("metadata", {"chunk_id": nid}),
+            ))
+        return docs
 
     def find_path(
         self,
-        source_id: str,
-        target_id: str,
-    ) -> List[str]:
-        """
-        Shortest path between two chunk nodes.
-        Uses Dijkstra with cost = 1 - weight (higher weight ⟹ shorter cost).
-        Returns [] if no path exists.
-        """
-        if source_id not in self.graph or target_id not in self.graph:
-            return []
+        src: str,
+        dst: str,
+    ) -> Optional[List[str]]:
+        """Shortest path (Dijkstra, weight=1-similarity). Returns None if unreachable."""
+        if not (self.graph.has_node(src) and self.graph.has_node(dst)):
+            return None
         try:
-            path = nx.shortest_path(
-                self.graph,
-                source=source_id,
-                target=target_id,
-                weight=lambda u, v, d: 1.0 - d.get("weight", 0.5),
+            return nx.shortest_path(
+                self.graph, src, dst,
+                weight=lambda u, v, d: 1.0 - d.get("weight", 0.0),
             )
-            return path
         except nx.NetworkXNoPath:
-            return []
+            return None
 
-    def get_chunks_by_source(self, source_id: str) -> List[str]:
-        """Return all chunk_ids belonging to a given source."""
-        return [
-            nid
-            for nid, data in self.graph.nodes(data=True)
-            if data.get("source_id") == source_id
-        ]
+    def get_subgraph_documents(
+        self,
+        chunk_ids: List[str],
+    ) -> List[Document]:
+        """Return LangChain Documents for a list of chunk_ids."""
+        docs = []
+        for cid in chunk_ids:
+            if self.graph.has_node(cid):
+                attrs = self.graph.nodes[cid]
+                docs.append(Document(
+                    page_content=attrs.get("page_content", ""),
+                    metadata=attrs.get("metadata", {"chunk_id": cid}),
+                ))
+        return docs
 
-    # ── mutation ──────────────────────────────────────────────────────────────
+    # ── Stats & export ────────────────────────────────────────────────────────
 
-    def remove_node(self, chunk_id: str) -> None:
-        if chunk_id in self.graph:
-            self.graph.remove_node(chunk_id)
-
-    def remove_source(self, source_id: str) -> int:
-        """Remove all nodes belonging to *source_id*. Returns count removed."""
-        to_remove = self.get_chunks_by_source(source_id)
-        for cid in to_remove:
-            self.graph.remove_node(cid)
-        return len(to_remove)
-
-    # ── stats / export ────────────────────────────────────────────────────────
-
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> Dict[str, int]:
         return {
             "nodes": self.graph.number_of_nodes(),
             "edges": self.graph.number_of_edges(),
-            "components": nx.number_connected_components(self.graph),
         }
 
-    def export_pyvis(self, output_path: str = "knowledge_graph.html") -> None:
-        """
-        Render an interactive Pyvis HTML visualisation.
-        Silently skips if pyvis is not installed.
-        """
+    def export_pyvis(self, output_path: str = "knowledge_graph.html") -> str:
+        """Export an interactive HTML visualisation (requires pyvis)."""
         try:
-            from pyvis.network import Network  # type: ignore
+            from pyvis.network import Network
+            net = Network(height="750px", width="100%", notebook=False)
+            for node, attrs in self.graph.nodes(data=True):
+                label = (attrs.get("page_content", node) or node)[:40]
+                net.add_node(node, label=label, title=label)
+            for u, v, data in self.graph.edges(data=True):
+                net.add_edge(u, v, value=data.get("weight", 1.0))
+            net.save_graph(output_path)
+            return output_path
         except ImportError:
-            logger.info("KnowledgeGraph.export_pyvis: pyvis not installed, skipping")
-            return
+            logger.warning("[KnowledgeGraph] pyvis not installed — export skipped.")
+            return ""
 
-        net = Network(height="750px", width="100%", bgcolor="#222222", font_color="white")
-        for nid, data in self.graph.nodes(data=True):
-            label = (data.get("content") or nid)[:40]
-            net.add_node(nid, label=label, title=data.get("content", "")[:200])
-        for u, v, edata in self.graph.edges(data=True):
-            net.add_edge(u, v, value=edata.get("weight", 0.5))
-        net.show(output_path, notebook=False)
-        logger.info("KnowledgeGraph: exported visualisation → %s", output_path)
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _cosine_similarity(self, a: List[float], b: List[float]) -> float:
+        va, vb = np.array(a, dtype="float32"), np.array(b, dtype="float32")
+        denom  = np.linalg.norm(va) * np.linalg.norm(vb)
+        return float(np.dot(va, vb) / denom) if denom > 1e-9 else 0.0
+
+    def _auto_link(self, new_id: str, embedding: List[float]) -> None:
+        for node, attrs in self.graph.nodes(data=True):
+            if node == new_id:
+                continue
+            emb = attrs.get("embedding")
+            if emb is None:
+                continue
+            sim = self._cosine_similarity(embedding, emb)
+            if sim >= self.edge_threshold:
+                self.graph.add_edge(new_id, node, weight=sim)

@@ -1,209 +1,185 @@
 """
-study_pipeline.py  —  Study mode pipeline.
+study_pipeline.py — Study mode pipeline.
 
-Produces a rich study package:
-  answer          : conceptual explanation (Sagan teacher persona)
-  quiz_cards      : list of {question, answer, difficulty} dicts
-  summary_bullets : 3-5 key takeaway bullets
-  learning_path   : ordered list of concept → concept graph steps
-  citations       : standard citation objects
-  follow_ups      : suggested deeper-dive questions
+Features:
+  - Concept-path guided retrieval (learning_path injects topic ordering)
+  - Socratic follow-up generation via a lightweight LLMChain
+  - ConversationBufferWindowMemory for session history
+  - LangGraph ChatGraph for retrieval + generation
+  - ResponseGenerator for citation assembly
 
-Flow
-----
-1. DeepResearchPipeline.run() → rich context + base answer
-2. Quiz generation   (LLM call on context_chunks)
-3. Summary extraction (LLM call or heuristic)
-4. Learning path     (GraphRetriever if available, else stub)
-5. ResponseGenerator : assemble full result dict
+LangChain components:
+  - ConversationBufferWindowMemory
+  - LLMChain (Socratic follow-up extractor)
+  - ChatGraph (LangGraph)
+  - ResponseGenerator
 """
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+from langchain.memory import ConversationBufferWindowMemory
+from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+from src.generation.llm_registry import LLMRegistry
+from src.generation.response_generator import ResponseGenerator
+from src.pipelines.chat_graph import ChatGraph
+from src.storage.faiss_store import MultiFAISSStore
+from src.storage.source_manager import SourceManager
+from src.storage.sqlite_manager import SQLiteManager
 
 logger = logging.getLogger(__name__)
 
-
-_QUIZ_PROMPT = """\
-Based ONLY on the following source passages, generate {n} quiz questions.
-For each question provide:
-  Q: <question>
-  A: <concise answer>
-  D: easy | medium | hard
-
-Return ONLY the Q/A/D blocks — no preamble.
-
-SOURCES:
-{sources}
-"""
-
-_SUMMARY_PROMPT = """\
-Based ONLY on the following source passages, write {n} concise bullet-point
-takeaways (one sentence each, no more than 20 words each).
-Return ONLY bullet lines starting with •.
-
-SOURCES:
-{sources}
-"""
+_SOCRATIC_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a Socratic tutor. "
+     "Given the answer below, generate 2-3 thought-provoking follow-up questions "
+     "that deepen understanding. "
+     "Return ONLY the questions as a bullet list — one per line."),
+    ("human", "ANSWER:\n{answer}\n\nCONCEPT: {concept}"),
+])
 
 
 class StudyPipeline:
     """
-    Parameters
-    ----------
-    deep_research_pipeline : DeepResearchPipeline  (handles retrieval + base answer)
-    graph_retriever        : GraphRetriever or None
-    graph_history          : GraphHistory or None
-    llm                    : callable (str) -> str
-    n_quiz_cards           : number of quiz cards to generate (default 5)
-    n_summary_bullets      : number of summary bullets (default 4)
+    Study mode pipeline — builds intuition, Socratic follow-ups, concept-path awareness.
+
+    Usage:
+        pipe = StudyPipeline(faiss_store, sqlite, source_manager)
+        result = pipe.run("What is entropy?", learning_path=["thermodynamics", "entropy", "heat death"])
+        print(result["answer"])
+        print(result["follow_ups"])
     """
 
     def __init__(
         self,
-        deep_research_pipeline,
-        graph_retriever=None,
-        graph_history=None,
-        llm: Optional[Callable[[str], str]] = None,
-        n_quiz_cards: int = 5,
-        n_summary_bullets: int = 4,
+        faiss_store:    MultiFAISSStore,
+        sqlite:         SQLiteManager,
+        source_manager: SourceManager,
+        compressor=None,
+        reranker=None,
+        window_k:       int   = 4,
+        top_k:          int   = 10,
+        score_threshold: float = 0.0,
     ):
-        self.research = deep_research_pipeline
-        self.graph_retriever = graph_retriever
-        self.graph_history   = graph_history
-        self.llm             = llm
-        self.n_quiz          = n_quiz_cards
-        self.n_summary       = n_summary_bullets
+        self.source_manager  = source_manager
+        self.sqlite          = sqlite
+        self.top_k           = top_k
+        self.score_threshold = score_threshold
+        self._llm: Optional[Any] = None
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Main entry point
-    # ─────────────────────────────────────────────────────────────────────
+        self.memory = ConversationBufferWindowMemory(
+            k=window_k,
+            return_messages=True,
+            memory_key="chat_history",
+        )
 
-    def run(self, query: str) -> Dict[str, Any]:
+        self.chat_graph = ChatGraph(
+            faiss_store=faiss_store,
+            sqlite=sqlite,
+            source_manager=source_manager,
+            mode="chat",
+            compressor=compressor,
+            reranker=reranker,
+        )
+
+    def set_llm(self, llm: Any) -> None:
+        self._llm = llm
+        self.chat_graph.set_llm(llm)
+
+    # ── Socratic follow-up generation ─────────────────────────────────────
+
+    def _socratic_followups(self, answer: str, concept: str) -> List[str]:
+        try:
+            llm   = self._llm or LLMRegistry.get()
+            chain = _SOCRATIC_PROMPT | llm | StrOutputParser()
+            raw   = chain.invoke({"answer": answer[:800], "concept": concept})
+            lines = [
+                re.sub(r"^[\-\*\d.)\s]+", "", l).strip()
+                for l in raw.splitlines()
+                if l.strip()
+            ]
+            return [l for l in lines if len(l) > 8][:3]
+        except Exception as exc:
+            logger.warning("[StudyPipeline:socratic] %s — skipping", exc)
+            return []
+
+    # ── Concept-path query enrichment ─────────────────────────────────────
+
+    @staticmethod
+    def _enrich_query(query: str, learning_path: Optional[List[str]]) -> str:
+        if not learning_path:
+            return query
+        path_str = " → ".join(learning_path[:4])
+        return f"{query} [concept path: {path_str}]"
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def run(
+        self,
+        query:          str,
+        learning_path:  Optional[List[str]] = None,
+        source_ids:     Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """
-        Run a full study session turn.
+        Run a study-mode turn.
 
-        Returns
-        -------
-        dict with: answer, citations, follow_ups, sources_used,
-                   quiz_cards, summary_bullets, learning_path,
-                   retrieved_chunks, sub_queries, tokens_estimate
+        Returns:
+            answer, citations, follow_ups (Socratic), sources_used, retrieved, error
         """
-        # 1. Get base research result (retrieval + base explanation + citations)
-        base = self.research.run(query)
+        llm = self._llm or LLMRegistry.get()
+        self.chat_graph.set_llm(llm)
 
-        # 2. Build source text block for quiz / summary generation
-        ctx_chunks   = base.get("context_chunks", base.get("chunks_used", []))
-        if not ctx_chunks:
-            ctx_chunks = base.get("retrieved_chunks", [])[:8]
-        sources_text = self._chunks_to_text(ctx_chunks)
+        # Load history
+        mem_vars = self.memory.load_memory_variables({})
+        history  = mem_vars.get("chat_history", [])
 
-        # 3. Generate quiz cards
-        quiz_cards = self._generate_quiz(sources_text)
+        enriched = self._enrich_query(query, learning_path)
+        logger.info("[StudyPipeline] query='%s' path=%s", query, learning_path)
 
-        # 4. Generate summary bullets
-        summary_bullets = self._generate_summary(sources_text)
+        result = self.chat_graph.chat(
+            query=enriched,
+            history=history,
+            top_k=self.top_k,
+            score_threshold=self.score_threshold,
+        )
 
-        # 5. Learning path from graph (best-effort)
-        learning_path = self._get_learning_path(query)
+        response = result.get("response", "")
 
-        # 6. Upgrade base answer to study tone if we have an LLM
-        answer = self._study_answer(query, sources_text) or base.get("answer", "")
+        # Save to memory (use original query, not enriched)
+        self.memory.save_context({"input": query}, {"output": response})
+
+        # Build citations
+        retrieved = result.get("retrieved", [])
+        chunks    = [
+            {
+                "citation_label": f"S{i+1}",
+                "content":        c["content"],
+                "source_id":      c.get("id", ""),
+            }
+            for i, c in enumerate(retrieved)
+        ]
+        generator = ResponseGenerator(context_chunks=chunks)
+        assembled = generator.assemble(raw_llm_output=response, query=query)
+
+        # Socratic follow-ups (override ResponseGenerator follow_ups)
+        concept    = (learning_path[-1] if learning_path else query)
+        followups  = self._socratic_followups(assembled["answer"], concept)
+        if not followups:
+            followups = assembled["follow_ups"]
 
         return {
-            **base,
-            "answer":           answer,
-            "quiz_cards":       quiz_cards,
-            "summary_bullets":  summary_bullets,
-            "learning_path":    learning_path,
+            "answer":       assembled["answer"],
+            "citations":    assembled["citations"],
+            "follow_ups":   followups,
+            "sources_used": assembled["sources_used"],
+            "retrieved":    retrieved,
+            "error":        result.get("error"),
         }
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Generation helpers
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _study_answer(self, query: str, sources_text: str) -> Optional[str]:
-        """Re-generate the explanation with the Sagan study persona."""
-        if not self.llm or not sources_text:
-            return None
-
-        from src.generation.prompt_builder import PromptBuilder
-        # Build a fresh study prompt from the pre-assembled source text
-        # We pass an ad-hoc document list with a single merged block
-        fake_doc = [{"content": sources_text, "source_id": "ctx", "citation_label": "S1"}]
-        prompt = PromptBuilder.build_study_prompt(query, fake_doc, rewrite=False)
-        try:
-            return self.llm(prompt)
-        except Exception as exc:
-            logger.warning("_study_answer LLM call failed: %s", exc)
-            return None
-
-    def _generate_quiz(self, sources_text: str) -> List[Dict[str, Any]]:
-        """Generate quiz cards from source text via LLM."""
-        if not self.llm or not sources_text.strip():
-            return []
-
-        prompt = _QUIZ_PROMPT.format(n=self.n_quiz, sources=sources_text[:4000])
-        try:
-            raw = self.llm(prompt)
-            return self._parse_quiz(raw)
-        except Exception as exc:
-            logger.warning("_generate_quiz failed: %s", exc)
-            return []
-
-    def _generate_summary(self, sources_text: str) -> List[str]:
-        """Generate summary bullets from source text via LLM."""
-        if not self.llm or not sources_text.strip():
-            return []
-
-        prompt = _SUMMARY_PROMPT.format(n=self.n_summary, sources=sources_text[:4000])
-        try:
-            raw = self.llm(prompt)
-            bullets = re.findall(r"^[•\-\*]\s*(.+)$", raw, re.MULTILINE)
-            return [b.strip() for b in bullets if b.strip()][: self.n_summary]
-        except Exception as exc:
-            logger.warning("_generate_summary failed: %s", exc)
-            return []
-
-    def _get_learning_path(self, query: str) -> List[Dict[str, str]]:
-        """Retrieve concept-to-concept path from KG, or return empty list."""
-        if not self.graph_retriever:
-            return []
-        try:
-            return self.graph_retriever.get_learning_path(query) or []
-        except Exception as exc:
-            logger.debug("_get_learning_path failed (non-fatal): %s", exc)
-            return []
-
-    # ─────────────────────────────────────────────────────────────────────
-    #  Parsing helpers
-    # ─────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _chunks_to_text(chunks: List[Dict]) -> str:
-        parts = []
-        for c in chunks:
-            text = c.get("content", "")
-            if text:
-                parts.append(text)
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def _parse_quiz(raw: str) -> List[Dict[str, Any]]:
-        """Parse Q: / A: / D: blocks from raw LLM output."""
-        cards: List[Dict] = []
-        # Split on blank-line-separated blocks
-        blocks = re.split(r"\n{2,}", raw.strip())
-        for block in blocks:
-            q_match = re.search(r"Q\s*:\s*(.+)", block, re.IGNORECASE)
-            a_match = re.search(r"A\s*:\s*(.+)", block, re.IGNORECASE)
-            d_match = re.search(r"D\s*:\s*(easy|medium|hard)", block, re.IGNORECASE)
-            if q_match and a_match:
-                cards.append({
-                    "question":   q_match.group(1).strip(),
-                    "answer":     a_match.group(1).strip(),
-                    "difficulty": d_match.group(1).lower() if d_match else "medium",
-                })
-        return cards
+    def clear_history(self) -> None:
+        self.memory.clear()

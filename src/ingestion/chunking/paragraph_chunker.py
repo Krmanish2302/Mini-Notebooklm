@@ -1,21 +1,18 @@
+"""paragraph_chunker.py — Split on double newline (paragraph boundary)."""
+from __future__ import annotations
+from typing import List
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from .base_chunker import BaseChunker
-from typing import List, Dict, Any
+
 
 class ParagraphChunker(BaseChunker):
-    """Chunks based on double newlines."""
-    
-    def chunk(self, content: str, metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        paragraphs = content.split('\n\n')
-        chunks = []
-        for i, p in enumerate(paragraphs):
-            if not p.strip(): continue
-            chunks.append({
-                "id": f"{metadata.get('source_id', 'unknown')}_para_{i}",
-                "content": p.strip(),
-                "metadata": {**(metadata or {}), "para_index": i},
-                "modality": metadata.get("modality", "text")
-            })
-        return chunks
-    
-    def get_strategy_name(self) -> str:
-        return "paragraph"
+    def __init__(self, max_chunk_size: int = 1500, overlap: int = 100):
+        self._splitter = RecursiveCharacterTextSplitter(
+            chunk_size=max_chunk_size,
+            chunk_overlap=overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+
+    def chunk_documents(self, docs: List[Document]) -> List[Document]:
+        return self._splitter.split_documents(docs)

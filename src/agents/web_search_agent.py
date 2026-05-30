@@ -1,156 +1,296 @@
-from typing import List, Dict, Any, Optional
-import os
-import requests
+"""
+web_search_agent.py — Web search powered by Tavily, wrapped as a LangChain tool.
 
+LangChain upgrade notes
+-----------------------
+* Search     : LangChain TavilySearchResults tool
+               (langchain-community >= 0.0.20 · pip install langchain-community tavily-python)
+               Direct REST calls replaced — Tavily client handles retries,
+               rate-limits, and response parsing.
+
+* Content    : LangChain WebBaseLoader (BeautifulSoup-based, zero extra deps).
+               Falls back to AsyncChromiumLoader for JS-heavy pages.
+               trafilatura kept as final safety net (unchanged).
+
+* Tool wrap  : web_search_tool() decorated with @tool so it's usable in
+               any LangGraph ToolNode or create_react_agent() call.
+
+* ToolNode   : build_search_node() returns a LangGraph ToolNode ready to
+               wire into a StateGraph as a drop-in node.
+
+Setup
+-----
+    pip install langchain-community tavily-python
+    export TAVILY_API_KEY="tvly-..."
+
+Result format (unchanged — UI expects these keys)
+-------------------------------------------------
+    id, title, url, snippet, score, source_type, selected
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+from typing import Any, Dict, List, Optional
+
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolNode
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_RESULTS  = 10
+_DEFAULT_SEARCH_DEPTH = "advanced"   # "basic" | "advanced"
+
+
+# ── WebSearchAgent ────────────────────────────────────────────────────────────
 
 class WebSearchAgent:
     """
-    Web search powered by Tavily API — purpose-built for RAG.
+    Web search + content fetcher backed by Tavily via LangChain.
 
-    Tavily returns clean, pre-extracted text (no raw HTML scraping needed),
-    supports diverse result types (web pages, Wikipedia, news, GitHub, docs)
-    and is free up to 1 000 searches / month.
-
-    Setup
-    -----
-    1.  Sign up at https://tavily.com and grab your API key.
-    2.  Set the environment variable::
-
-            export TAVILY_API_KEY="tvly-..."
-
-        Or pass it explicitly::
-
-            agent = WebSearchAgent(api_key="tvly-...")
-
-    Result format
-    -------------
-    Each result dict contains:
-        id        – stable hash-based id for the UI
-        title     – page title
-        url       – canonical URL
-        snippet   – clean extracted text snippet (ready for RAG)
-        score     – Tavily relevance score (0-1)
-        source_type – always "website" (so the pipeline routes it correctly)
+    Parameters
+    ----------
+    api_key         : Tavily API key (falls back to TAVILY_API_KEY env var)
+    max_results     : max search results to return  (default 10)
+    search_depth    : "basic" or "advanced"         (default "advanced")
+    include_domains : allowlist of domains
+    exclude_domains : blocklist of domains
     """
-
-    TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        max_results: int = 10,
-        search_depth: str = "advanced",   # "basic" or "advanced"
+        api_key:         Optional[str]       = None,
+        max_results:     int                 = _DEFAULT_MAX_RESULTS,
+        search_depth:    str                 = _DEFAULT_SEARCH_DEPTH,
         include_domains: Optional[List[str]] = None,
         exclude_domains: Optional[List[str]] = None,
-    ):
-        self.api_key = api_key or os.environ.get("TAVILY_API_KEY", "")
-        self.max_results = max_results
-        self.search_depth = search_depth
+    ) -> None:
+        key = api_key or os.environ.get("TAVILY_API_KEY", "")
+        if not key:
+            raise ValueError(
+                "Tavily API key not found. "
+                "Set the TAVILY_API_KEY environment variable or pass api_key='tvly-...'."
+            )
+        os.environ.setdefault("TAVILY_API_KEY", key)   # TavilySearchResults reads from env
+
+        self.max_results     = max_results
+        self.search_depth    = search_depth
         self.include_domains = include_domains or []
         self.exclude_domains = exclude_domains or []
 
-        if not self.api_key:
-            raise ValueError(
-                "Tavily API key not found. "
-                "Set the TAVILY_API_KEY environment variable or pass api_key=\"tvly-...\"."
-            )
+        # LangChain Tavily tool — handles auth, retries, response normalisation
+        self._tavily = TavilySearchResults(
+            max_results=max_results,
+            search_depth=search_depth,
+            include_domains=include_domains or [],
+            exclude_domains=exclude_domains or [],
+            include_answer=False,
+            include_raw_content=False,
+        )
+        logger.info(
+            "[WebSearchAgent] Ready — depth=%s max=%d",
+            search_depth, max_results,
+        )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def search(self, query: str) -> List[Dict[str, Any]]:
         """
-        Search the web and return formatted results ready for display in the UI.
+        Search the web and return results normalised for the UI.
 
-        Each result has the keys: id, title, url, snippet, score, source_type.
-        Returns an empty list (not an exception) on error so the UI degrades
+        Returns an empty list (never raises) on error so the UI degrades
         gracefully.
+
+        Each result: {id, title, url, snippet, score, source_type, selected}
         """
         if not query.strip():
             return []
-
-        payload = {
-            "api_key": self.api_key,
-            "query": query,
-            "max_results": self.max_results,
-            "search_depth": self.search_depth,
-            "include_answer": False,       # we only need result list
-            "include_raw_content": False,  # snippet is enough for preview
-        }
-        if self.include_domains:
-            payload["include_domains"] = self.include_domains
-        if self.exclude_domains:
-            payload["exclude_domains"] = self.exclude_domains
-
         try:
-            resp = requests.post(
-                self.TAVILY_SEARCH_URL,
-                json=payload,
-                timeout=20,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.exceptions.Timeout:
-            return [{"error": "Tavily search timed out. Please try again."}]
-        except requests.exceptions.HTTPError as e:
-            return [{"error": f"Tavily API error: {e.response.status_code} — {e.response.text}"}]
-        except Exception as e:
-            return [{"error": str(e)}]
-
-        return self._format_results(data.get("results", []))
+            # TavilySearchResults.invoke() returns List[dict] with
+            # keys: url, content, title, score
+            raw: List[Dict] = self._tavily.invoke({"query": query})
+            return self._format_results(raw)
+        except Exception as exc:
+            logger.warning("[WebSearchAgent] Search failed: %s", exc)
+            return [{"error": str(exc)}]
 
     def fetch_content(self, url: str) -> str:
         """
-        Fetch and extract clean text content from a URL.
-        Used when a user selects a search result and wants to ingest it.
-        Tavily's /extract endpoint is used when available; falls back to
-        trafilatura for direct scraping.
-        """
-        # Try Tavily extract first (returns clean text, no HTML parsing needed)
-        try:
-            resp = requests.post(
-                "https://api.tavily.com/extract",
-                json={"api_key": self.api_key, "urls": [url]},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-            if results and results[0].get("raw_content"):
-                return results[0]["raw_content"]
-        except Exception:
-            pass  # Fall through to trafilatura
+        Fetch and extract clean text from a URL.
 
-        # Fallback: direct HTTP + trafilatura
+        Layered strategy:
+          1. LangChain WebBaseLoader   — fast, BeautifulSoup-based, no extra deps
+          2. AsyncChromiumLoader       — JS-heavy pages (requires playwright)
+          3. trafilatura               — final fallback
+        """
+        # ── Layer 1: WebBaseLoader ────────────────────────────────────────────
         try:
-            import trafilatura
-            page = requests.get(
-                url,
-                timeout=30,
-                headers={"User-Agent": "Mozilla/5.0"},
+            loader = WebBaseLoader(web_paths=[url])
+            docs   = loader.load()
+            if docs and docs[0].page_content.strip():
+                logger.debug("[WebSearchAgent] WebBaseLoader success: %s", url)
+                return docs[0].page_content.strip()
+        except Exception as exc:
+            logger.debug("[WebSearchAgent] WebBaseLoader failed (%s): %s", url, exc)
+
+        # ── Layer 2: AsyncChromiumLoader (JS pages) ───────────────────────────
+        try:
+            from langchain_community.document_loaders import AsyncChromiumLoader
+            from langchain_community.document_transformers import BeautifulSoupTransformer
+            chromium_loader = AsyncChromiumLoader(urls=[url])
+            raw_docs        = chromium_loader.load()
+            bs_transformer  = BeautifulSoupTransformer()
+            clean_docs      = bs_transformer.transform_documents(
+                raw_docs, tags_to_extract=["p", "article", "section", "main"]
             )
+            if clean_docs and clean_docs[0].page_content.strip():
+                logger.debug("[WebSearchAgent] AsyncChromiumLoader success: %s", url)
+                return clean_docs[0].page_content.strip()
+        except Exception as exc:
+            logger.debug("[WebSearchAgent] AsyncChromiumLoader failed (%s): %s", url, exc)
+
+        # ── Layer 3: trafilatura ──────────────────────────────────────────────
+        try:
+            import requests
+            import trafilatura
+            page = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
             page.raise_for_status()
             content = trafilatura.extract(page.text)
-            return content or ""
-        except Exception as e:
-            return f"Error fetching content: {e}"
+            if content:
+                logger.debug("[WebSearchAgent] trafilatura success: %s", url)
+                return content
+        except Exception as exc:
+            logger.warning("[WebSearchAgent] All fetch layers failed (%s): %s", url, exc)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        return f"Error: could not extract content from {url}"
 
-    def _format_results(self, raw: List[Dict]) -> List[Dict[str, Any]]:
-        """Normalise Tavily result objects into the shape expected by the UI."""
-        formatted = []
+    # ── LangChain tool accessor ───────────────────────────────────────────────
+
+    @property
+    def lc_tool(self) -> TavilySearchResults:
+        """
+        The underlying LangChain TavilySearchResults tool.
+        Use this when you want to pass the tool directly to
+        create_react_agent() or bind_tools().
+        """
+        return self._tavily
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_results(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Normalise TavilySearchResults output into the shape the UI expects.
+        TavilySearchResults returns: {url, content, title, score}
+        Output shape:               {id, title, url, snippet, score,
+                                     source_type, selected}
+        """
+        formatted: List[Dict[str, Any]] = []
         for i, r in enumerate(raw):
-            title = r.get("title") or r.get("url", f"Result {i + 1}")
+            url   = r.get("url", "")
+            title = r.get("title") or url or f"Result {i + 1}"
+            uid   = f"web_{i}_{hashlib.md5(url.encode()).hexdigest()[:8]}"
             formatted.append({
-                "id": f"web_{i}_{abs(hash(r.get('url', str(i))))}",
-                "title": title,
-                "url": r.get("url", ""),
-                "snippet": r.get("content") or r.get("snippet", ""),
-                "score": round(r.get("score", 0.0), 3),
+                "id":          uid,
+                "title":       title,
+                "url":         url,
+                "snippet":     r.get("content") or r.get("snippet", ""),
+                "score":       round(float(r.get("score", 0.0)), 3),
                 "source_type": "website",
-                "selected": False,
+                "selected":    False,
             })
         return formatted
+
+
+# ── @tool — usable in LangGraph ToolNode ─────────────────────────────────────
+
+_default_agent: Optional[WebSearchAgent] = None
+
+
+def _get_default_agent() -> WebSearchAgent:
+    """Lazy singleton — only instantiated when the tool is first called."""
+    global _default_agent
+    if _default_agent is None:
+        _default_agent = WebSearchAgent()
+    return _default_agent
+
+
+@tool
+def web_search_tool(query: str) -> List[Dict[str, Any]]:
+    """
+    Search the web using Tavily and return structured results.
+
+    Use this tool when the user asks about current events, recent news,
+    or information that may not be in the ingested documents.
+
+    Args:
+        query: The search query string.
+
+    Returns:
+        List of result dicts with keys: id, title, url, snippet, score,
+        source_type, selected.
+    """
+    return _get_default_agent().search(query)
+
+
+@tool
+def fetch_url_tool(url: str) -> str:
+    """
+    Fetch and extract clean text content from a URL.
+
+    Use this tool when the user wants to ingest a specific web page
+    or when a search result needs its full content loaded.
+
+    Args:
+        url: The URL to fetch content from.
+
+    Returns:
+        Extracted text content of the page.
+    """
+    return _get_default_agent().fetch_content(url)
+
+
+# ── LangGraph ToolNode builder ────────────────────────────────────────────────
+
+def build_search_node(
+    api_key:         Optional[str]       = None,
+    max_results:     int                 = _DEFAULT_MAX_RESULTS,
+    search_depth:    str                 = _DEFAULT_SEARCH_DEPTH,
+    include_domains: Optional[List[str]] = None,
+    exclude_domains: Optional[List[str]] = None,
+) -> ToolNode:
+    """
+    Build a LangGraph ToolNode wrapping web_search_tool + fetch_url_tool.
+
+    Wire this directly into a StateGraph:
+
+        from src.agents import build_search_node
+        from langgraph.graph import StateGraph
+
+        graph = StateGraph(AgentState)
+        graph.add_node("web_search", build_search_node())
+        graph.add_edge("agent", "web_search")
+
+    The ToolNode automatically:
+      - Reads tool_calls from the last AIMessage in state["messages"]
+      - Dispatches to the correct tool
+      - Appends ToolMessages back to state["messages"]
+
+    Parameters
+    ----------
+    api_key, max_results, search_depth, include_domains, exclude_domains
+        Passed to WebSearchAgent — override env-var defaults here if needed.
+    """
+    # Configure the lazy singleton with explicit settings if provided
+    global _default_agent
+    _default_agent = WebSearchAgent(
+        api_key=api_key,
+        max_results=max_results,
+        search_depth=search_depth,
+        include_domains=include_domains,
+        exclude_domains=exclude_domains,
+    )
+    return ToolNode(tools=[web_search_tool, fetch_url_tool])

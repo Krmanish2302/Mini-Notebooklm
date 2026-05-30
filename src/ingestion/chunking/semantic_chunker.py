@@ -1,54 +1,40 @@
 """
-semantic_chunker.py — Embedding-based semantic chunker.
-Splits on semantic similarity breakpoints rather than character count.
-Compatible with LangChain v0.3+ (langchain_text_splitters package).
+semantic_chunker.py
+
+Wraps LangChain SemanticChunker (langchain-experimental).
+Splits on semantic similarity breakpoints using embeddings.
+Requires OPENAI_API_KEY or swap embeddings for HuggingFace.
 """
 from __future__ import annotations
-
+import os
 from typing import List
-
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except ImportError:
-    from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore
-
+from langchain_core.documents import Document
 from .base_chunker import BaseChunker
 
 
 class SemanticChunker(BaseChunker):
-    """
-    Falls back to RecursiveCharacterTextSplitter when a full semantic
-    clustering model is not available; produces sensible paragraph-sized
-    chunks that respect sentence boundaries.
-    """
-
     def __init__(
         self,
-        chunk_size: int = 512,
-        chunk_overlap: int = 64,
-        embedding_model: str = "all-MiniLM-L6-v2",
-        breakpoint_threshold_type: str = "percentile",
-    ) -> None:
-        self.chunk_size               = chunk_size
-        self.chunk_overlap            = chunk_overlap
-        self.embedding_model          = embedding_model
-        self.breakpoint_threshold_type = breakpoint_threshold_type
-        self._splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
-            separators=["\n\n", "\n", ". ", " ", ""],
-        )
+        breakpoint_threshold_type:   str = "percentile",
+        breakpoint_threshold_amount: int = 90,
+        embedding_provider:          str = os.getenv("EMBEDDING_PROVIDER", "openai"),
+    ):
+        self.threshold_type   = breakpoint_threshold_type
+        self.threshold_amount = breakpoint_threshold_amount
+        self.embedding_provider = embedding_provider
 
-    def chunk(self, text: str, source_id: str = "") -> List[dict]:
-        if not text or not text.strip():
-            return []
-        raw_chunks = self._splitter.split_text(text)
-        return [
-            {
-                "chunk_id":  f"{source_id}_sem_{i}",
-                "source_id": source_id,
-                "text":      chunk,
-                "index":     i,
-            }
-            for i, chunk in enumerate(raw_chunks)
-        ]
+    def _get_embeddings(self):
+        if self.embedding_provider == "huggingface":
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+            return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings(model="text-embedding-3-small")
+
+    def chunk_documents(self, docs: List[Document]) -> List[Document]:
+        from langchain_experimental.text_splitter import SemanticChunker as _SC
+        chunker = _SC(
+            self._get_embeddings(),
+            breakpoint_threshold_type=self.threshold_type,
+            breakpoint_threshold_amount=self.threshold_amount,
+        )
+        return chunker.split_documents(docs)

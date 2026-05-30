@@ -1,66 +1,62 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  Mini NotebookLM — Docker Compose
-#  Usage:
-#    cp .env.example .env          # fill in your API keys
-#    docker compose up --build
-# ─────────────────────────────────────────────────────────────────────────────
+version: "3.9"
 
 services:
 
-  # ── FastAPI backend ──────────────────────────────────────────────────────
+  # ── FastAPI backend ─────────────────────────────────────────────────────
   api:
     build:
       context: .
-      dockerfile: Dockerfile
       target: runtime
-    container_name: mini-notebooklm-api
+    container_name: mini_notebooklm_api
     restart: unless-stopped
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:8501,http://localhost:3000
       - PYTHONUNBUFFERED=1
-      - PYTHONDONTWRITEBYTECODE=1
-      - PYTHONPATH=/app
-      - FAISS_INDEX_PATH=/app/data/vector_store
-      - SQLITE_DB_PATH=/app/data/sources.db
-      - GRAPH_STORAGE_PATH=/app/data/graph
     volumes:
-      # Persist vector store, SQLite DB, and graph across container restarts
-      - notebooklm-data:/app/data
+      - ./data:/app/data          # persist vector store + uploads
+      - ./src:/app/src:ro         # hot-reload source without rebuild
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
-    networks:
-      - notebooklm-net
+      start_period: 20s
+    command: >
+      uvicorn api:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --reload-dir src
 
-  # ── Optional: Ollama (local LLM server) ─────────────────────────────────
-  # Uncomment this block if you want to run a local LLM via Ollama.
-  # Requires: docker run --gpus all  (NVIDIA GPU) or CPU-only (slow).
-  #
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   container_name: mini-notebooklm-ollama
-  #   restart: unless-stopped
-  #   ports:
-  #     - "11434:11434"
-  #   volumes:
-  #     - ollama-models:/root/.ollama
-  #   networks:
-  #     - notebooklm-net
-  #   # After starting, pull a model:
-  #   # docker exec mini-notebooklm-ollama ollama pull llama3.2
+  # ── Streamlit frontend ──────────────────────────────────────────────────
+  ui:
+    build:
+      context: .
+      target: runtime
+    container_name: mini_notebooklm_ui
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - STREAMLIT_API_URL=http://api:8000/api
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./src:/app/src:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    command: >
+      streamlit run streamlit_app.py
+        --server.port 8501
+        --server.address 0.0.0.0
+        --server.headless true
+        --browser.gatherUsageStats false
 
 volumes:
-  notebooklm-data:
-    driver: local
-  # ollama-models:
-  #   driver: local
-
-networks:
-  notebooklm-net:
-    driver: bridge
+  data:

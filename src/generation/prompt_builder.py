@@ -1,46 +1,43 @@
 """
-prompt_builder.py  —  Mode-specific prompt construction.
+prompt_builder.py — Mode-specific prompt construction using LangChain ChatPromptTemplates.
 
-Fixes applied
--------------
-BUG-R02  HyDE / keyword-expanded query was being injected into the LLM prompt
-         as the user's question.  The rewritten query is for retrieval embedding
-         only — the LLM always sees the original clean query.  Fixed by
-         separating `retrieval_query` (rewritten) from `prompt_query` (original)
-         in all three build_*_prompt methods.
-BUG-R04  HistoryCompressor._summarise_turns dropped all User: turns, leaving
-         the LLM with only assistant replies and no idea what was asked.  Now
-         includes paired User question + Assistant first-sentence in bullets.
-BUG-S01  sanitize_query() added — strips prompt-injection patterns and enforces
-         a max-length cap before the query reaches any LLM prompt.
-BUG-Q02  _HISTORY_CHAR_LIMIT and _HISTORY_KEEP_TURNS promoted to named module
-         constants.
-BUG-SYN1 Backslash inside f-string expression (line 232) — Python 3.11 raises
-         SyntaxError for this.  Fixed by pre-computing the conditional string
-         in a local variable before the f-string.
+Key rules (carried over from original fixes):
+  BUG-R02: retrieval_query (HyDE/expanded) is for the RETRIEVER only.
+           The LLM always sees the original clean query.
+  BUG-R04: HistoryCompressor includes User: turns in summary bullets.
+  BUG-S01: sanitize_query() strips prompt-injection patterns + length cap.
+  BUG-SYN1: No backslash inside f-string expressions.
 """
 from __future__ import annotations
-
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
 from src.generation.persona_config import PersonaConfig
 
+logger = logging.getLogger(__name__)
 
-# ── Module-level constants (BUG-Q02) ───────────────────────────────────────────────────
-HISTORY_CHAR_LIMIT  = 3_000
-HISTORY_KEEP_TURNS  = 4
-MAX_QUERY_LENGTH    = 1_200   # BUG-S01: hard cap on user query length
+# ── Constants ──────────────────────────────────────────────────────────────────
+HISTORY_CHAR_LIMIT = 3_000
+HISTORY_KEEP_TURNS = 4
+MAX_QUERY_LENGTH   = 1_200
+_EM_DASH           = "\u2014"
 
-# Keep old underscore aliases for any code that imported them directly
+# Backward-compat aliases
 _HISTORY_CHAR_LIMIT = HISTORY_CHAR_LIMIT
 _HISTORY_KEEP_TURNS = HISTORY_KEEP_TURNS
 
-# Em dash constant — avoids backslash-in-f-string (BUG-SYN1)
-_EM_DASH = "\u2014"
+_NO_SOURCES_BLOCK = (
+    "SOURCES: [none \u2014 the knowledge base returned no relevant chunks for this query]\n\n"
+    "INSTRUCTION: Politely tell the user you couldn\u2019t find anything relevant in the "
+    "ingested documents and suggest they (a) rephrase, (b) ingest more sources, "
+    "or (c) check their source filters.  Do NOT make up an answer."
+)
 
-
-# ── Hardcoded personas for Study / Research ────────────────────────────────────────────────
 _PERSONA_STUDY = (
     "You're Carl Sagan if he were a chill classmate in teacher mode. "
     "Build intuition, use analogies, show how ideas connect.  "
@@ -55,53 +52,27 @@ _PERSONA_RESEARCH = (
     "If it's not there, say: 'Not in my notes, bro.'"
 )
 
-_GROUNDING = (
-    "Rules: "
-    "(1) Use ONLY the sources.  "
-    "(2) Cite inline as [S1], [S2]\u2026  "
-    "(3) Never invent facts."
-)
 
-_NO_SOURCES_BLOCK = (
-    "SOURCES: [none \u2014 the knowledge base returned no relevant chunks for this query]\n\n"
-    "INSTRUCTION: Politely tell the user you couldn\u2019t find anything relevant in the "
-    "ingested documents and suggest they (a) rephrase, (b) ingest more sources, "
-    "or (c) check their source filters.  Do NOT make up an answer."
-)
-
-
-# ── BUG-S01: Input sanitisation ──────────────────────────────────────────────────────────────
+# ── BUG-S01: Input sanitization ────────────────────────────────────────────────
 
 def sanitize_query(query: str, max_len: int = MAX_QUERY_LENGTH) -> str:
-    """
-    Strip prompt-injection attempts and enforce a length cap.
-
-    Removes common jailbreak / system-override patterns before the query
-    reaches any LLM prompt.  This is a defence-in-depth measure — it does
-    NOT replace proper server-side input validation.
-    """
+    """Strip prompt-injection patterns and enforce a length cap."""
     q = query.strip()[:max_len]
-    # Remove common prompt-injection openers
     q = re.sub(
         r"(?i)(ignore|disregard|forget|override|bypass)\b.{0,50}\b"
         r"(instructions?|rules?|system\s*prompt|context|previous)",
-        "[sanitized]",
-        q,
+        "[sanitized]", q,
     )
-    # Remove explicit role-play injections
     q = re.sub(r"(?i)\bDAN\b|\bact as\b.{0,30}\bno restrictions\b", "[sanitized]", q)
     return q
 
 
-# ── QueryRewriter ──────────────────────────────────────────────────────────────────────────
+# ── QueryRewriter ──────────────────────────────────────────────────────────────
 
 class QueryRewriter:
     """
-    BUG-R02 note: the output of this class is for the RETRIEVAL step only.
-    It must NEVER be used as the query shown to the LLM in the final prompt.
-    PromptBuilder enforces this by keeping two separate variables:
-        retrieval_query = _maybe_rewrite(query, rewrite=True)  -> for embedder
-        prompt_query    = query                                 -> for LLM prompt
+    Rewrites queries for RETRIEVAL EMBEDDING only.
+    Output must NEVER be used in the LLM prompt (BUG-R02).
     """
 
     _STOP = frozenset(
@@ -120,43 +91,36 @@ class QueryRewriter:
         return f"{stub}\n{query}"
 
     def expand(self, query: str) -> str:
-        tokens = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_\-]{2,}\b", query)
+        tokens   = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_\-]{2,}\b", query)
         keywords = [t.lower() for t in tokens if t.lower() not in self._STOP]
         unique_kw = list(dict.fromkeys(keywords))
-        if not unique_kw:
-            return query
-        return f"{query} | keywords: {', '.join(unique_kw)}"
+        return f"{query} | keywords: {', '.join(unique_kw)}" if unique_kw else query
 
     def rewrite(self, query: str, strategy: str = "hyde") -> str:
-        if strategy == "hyde":
-            return self.hyde(query)
-        if strategy == "expand":
-            return self.expand(query)
-        if strategy == "both":
-            return self.expand(self.hyde(query))
+        if strategy == "hyde":   return self.hyde(query)
+        if strategy == "expand": return self.expand(query)
+        if strategy == "both":   return self.expand(self.hyde(query))
         return query
 
     @staticmethod
     def pick_strategy(query: str) -> str:
-        word_count = len(query.split())
-        is_question = query.strip().endswith("?") or query.split()[0].lower() in (
-            "what", "why", "how", "when", "where", "who", "explain", "describe",
-            "compare", "summarise", "summarize", "list", "define",
+        word_count  = len(query.split())
+        is_question = query.strip().endswith("?") or (
+            query.split()[0].lower() in
+            {"what","why","how","when","where","who","explain","describe",
+             "compare","summarise","summarize","list","define"}
         )
-        if word_count <= 4:
-            return "expand"
-        if is_question:
-            return "hyde"
+        if word_count <= 4:   return "expand"
+        if is_question:       return "hyde"
         return "both"
 
 
-# ── HistoryCompressor ──────────────────────────────────────────────────────────────────────
+# ── HistoryCompressor ──────────────────────────────────────────────────────────
 
 class HistoryCompressor:
     """
-    BUG-R04 fix: compress() now includes User: turns in the summary bullets
-    so the LLM has context about what was being asked, not just what was
-    answered.
+    BUG-R04 fix: compress() includes User: turns in bullets so the LLM
+    sees both sides of old exchanges.
     """
 
     @staticmethod
@@ -166,24 +130,16 @@ class HistoryCompressor:
 
     @staticmethod
     def _summarise_turns(turns: List[str]) -> str:
-        """
-        BUG-R04: produce paired (User question, Assistant first-sentence)
-        bullets so the LLM knows both sides of old exchanges.
-        """
         bullets: List[str] = []
-        i = 0
-        while i < len(turns):
-            turn = turns[i]
+        for turn in turns:
             if turn.startswith("User:"):
-                q = turn[5:].strip().split("\n")[0][:100]   # first line, capped
+                q = turn[5:].strip().split("\n")[0][:100]
                 bullets.append(f"\u2022 User asked: {q}")
             elif turn.startswith("Assistant:"):
                 reply = turn[len("Assistant:"):].strip()
                 first = re.split(r"(?<=[.!?])\s", reply)[0]
                 if first:
                     bullets.append(f"  \u2192 {first}")
-            i += 1
-
         if not bullets:
             return "[earlier conversation compressed \u2014 no key points extracted]"
         return "EARLIER CONTEXT (compressed):\n" + "\n".join(bullets)
@@ -191,7 +147,7 @@ class HistoryCompressor:
     @classmethod
     def compress(
         cls,
-        history: str,
+        history:    str,
         char_limit: int = HISTORY_CHAR_LIMIT,
         keep_turns: int = HISTORY_KEEP_TURNS,
     ) -> str:
@@ -207,112 +163,92 @@ class HistoryCompressor:
         return f"{summary}\n\nRECENT CONVERSATION:\n{recent_block}"
 
 
-# ── PromptBuilder ────────────────────────────────────────────────────────────────────────────
+# ── Context formatter ──────────────────────────────────────────────────────────
+
+def format_context(documents: List[Any]) -> str:
+    """Format List[Document | dict] into a numbered source block."""
+    if not documents:
+        return _NO_SOURCES_BLOCK
+    parts: List[str] = []
+    for i, doc in enumerate(documents, 1):
+        if hasattr(doc, "page_content"):
+            content = doc.page_content
+            meta    = doc.metadata or {}
+        else:
+            content = doc.get("content", "")
+            meta    = {k: v for k, v in doc.items() if k != "content"}
+
+        src = meta.get("source", meta.get("source_id", ""))
+        src_suffix = (" " + _EM_DASH + " " + src) if src else ""
+        header = f"[S{i}]{src_suffix}"
+        block  = f"{header}\n{content}"
+        if ctx := meta.get("context_window", ""):
+            block += f"\n[context] {ctx}"
+        parts.append(block)
+    return "\n\n".join(parts)
+
+
+# ── PromptBuilder ──────────────────────────────────────────────────────────────
+
 class PromptBuilder:
     """
-    BUG-R02 fix: every build_*_prompt method now distinguishes between:
-        retrieval_query  — HyDE/expanded, used ONLY for the embedding/retrieval call
-        prompt_query     — original user query, shown to the LLM
+    Builds LangChain ChatPromptTemplate-based prompts for each mode.
 
-    The *rewrite* parameter controls retrieval_query generation; it no longer
-    affects what the LLM sees.
+    BUG-R02: retrieval_query (rewritten) is NEVER passed to LLM prompts.
+             Use get_retrieval_query() for retrieval only.
+    BUG-S01: sanitize_query() applied before every prompt assembly.
     """
 
-    _rewriter = QueryRewriter()
+    _rewriter   = QueryRewriter()
+    _compressor = HistoryCompressor()
 
-    # ── Helpers ──────────────────────────────────────────────────────────────────────────
+    # ── Chat mode ────────────────────────────────────────────────────────
 
-    @staticmethod
-    def format_context(documents: List[Any]) -> str:
-        parts: List[str] = []
-        for i, doc in enumerate(documents, 1):
-            if hasattr(doc, "page_content"):
-                content = doc.page_content
-                meta    = doc.metadata or {}
-            else:
-                content = doc.get("content", "")
-                meta    = {k: v for k, v in doc.items() if k != "content"}
-
-            src = meta.get("source", meta.get("source_id", ""))
-
-            # BUG-SYN1 fix: pre-compute the conditional part before the f-string
-            # so no backslash appears inside the f-string expression.
-            src_suffix = (" " + _EM_DASH + " " + src) if src else ""
-            header = f"[S{i}]{src_suffix}"
-
-            block = f"{header}\n{content}"
-
-            ctx = meta.get("context_window", "")
-            if ctx:
-                block += f"\n[context] {ctx}"
-
-            parts.append(block)
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def _compress_history(history: str) -> str:
-        return HistoryCompressor.compress(history)
+    _CHAT_TEMPLATE = ChatPromptTemplate.from_messages([
+        ("system", "{system_prompt}"),
+        ("human",  "HISTORY:\n{history}\n\n{sources}\n\nQ: {query}\nA:"),
+    ])
 
     @classmethod
-    def _retrieval_query(cls, query: str, rewrite: bool) -> str:
-        """Return the rewritten query for retrieval embedding (not for LLM prompt)."""
-        if not rewrite:
-            return query
-        strategy = QueryRewriter.pick_strategy(query)
-        return cls._rewriter.rewrite(query, strategy=strategy)
-
-    @staticmethod
-    def _sources_block(documents: List[Any]) -> Tuple[bool, str]:
-        if not documents:
-            return False, _NO_SOURCES_BLOCK
-        ctx = PromptBuilder.format_context(documents)
-        return True, f"SOURCES:\n{ctx}"
-
-    # ── Chat Mode ─────────────────────────────────────────────────────────────────────
-
-    @staticmethod
     def build_chat_prompt(
-        query: str,
-        documents: List[Any],
-        history: str = "",
+        cls,
+        query:          str,
+        documents:      List[Any],
+        history:        str            = "",
         persona_config: Optional[PersonaConfig] = None,
-        rewrite: bool = True,
+        rewrite:        bool           = True,   # BUG-R02: only affects retrieval, not prompt
     ) -> str:
-        """
-        BUG-R02 fix: *rewrite* now only affects what is passed to the retriever
-        (via _retrieval_query).  The LLM always sees the original *query*.
-        BUG-S01: query is sanitized before it reaches the prompt.
-        """
-        cfg    = persona_config or PersonaConfig()
-        system = cfg.build_system_prompt()
-
+        cfg        = persona_config or PersonaConfig()
         safe_query = sanitize_query(query)
-
-        hist       = PromptBuilder._compress_history(history)
-        hist_block = f"HISTORY:\n{hist}\n\n" if hist else ""
-
-        has_src, src_block = PromptBuilder._sources_block(documents)
-
-        return (
-            f"{system}\n\n"
-            f"{hist_block}"
-            f"{src_block}\n\n"
-            f"Q: {safe_query}\nA:"
+        hist       = cls._compressor.compress(history)
+        sources    = format_context(documents)
+        return cls._CHAT_TEMPLATE.format(
+            system_prompt=cfg.build_system_prompt(),
+            history=hist,
+            sources=sources,
+            query=safe_query,
         )
 
-    # ── Study Mode ──────────────────────────────────────────────────────────────────────
+    # ── Study mode ────────────────────────────────────────────────────────
 
-    @staticmethod
+    _STUDY_TEMPLATE = ChatPromptTemplate.from_messages([
+        ("system", _PERSONA_STUDY),
+        ("human",  "{path_block}{history}{sources}\n\nTOPIC: {query}\nEXPLAIN:"),
+    ])
+
+    @classmethod
     def build_study_prompt(
-        query: str,
-        documents: List[Any],
-        history: str = "",
+        cls,
+        query:         str,
+        documents:     List[Any],
+        history:       str             = "",
         learning_path: Optional[List[Dict]] = None,
-        rewrite: bool = True,
+        rewrite:       bool            = True,
     ) -> str:
         safe_query = sanitize_query(query)
-        hist       = PromptBuilder._compress_history(history)
+        hist       = cls._compressor.compress(history)
         hist_block = f"HISTORY:\n{hist}\n\n" if hist else ""
+        sources    = format_context(documents)
 
         path_block = ""
         if learning_path:
@@ -322,64 +258,59 @@ class PromptBuilder:
             )
             path_block = f"CONCEPT PATH: {steps}\n\n"
 
-        has_src, src_block = PromptBuilder._sources_block(documents)
-
-        return (
-            f"{_PERSONA_STUDY}\n\n"
-            f"{path_block}"
-            f"{hist_block}"
-            f"{src_block}\n\n"
-            f"TOPIC: {safe_query}\nEXPLAIN:"
+        return cls._STUDY_TEMPLATE.format(
+            path_block=path_block,
+            history=hist_block,
+            sources=sources,
+            query=safe_query,
         )
 
-    # ── Deep Research Mode ────────────────────────────────────────────────────────────
+    # ── Deep Research mode ────────────────────────────────────────────────
 
-    @staticmethod
+    _RESEARCH_TEMPLATE = ChatPromptTemplate.from_messages([
+        ("system", _PERSONA_RESEARCH),
+        ("human",  "{history}{sources}\n\nRESEARCH Q: {query}\nDETAILED ANSWER:"),
+    ])
+
+    @classmethod
     def build_research_prompt(
-        query: str,
+        cls,
+        query:     str,
         documents: List[Any],
-        history: str = "",
-        rewrite: bool = True,
+        history:   str  = "",
+        rewrite:   bool = True,
     ) -> str:
         safe_query = sanitize_query(query)
-        hist       = PromptBuilder._compress_history(history)
+        hist       = cls._compressor.compress(history)
         hist_block = f"HISTORY:\n{hist}\n\n" if hist else ""
-
-        has_src, src_block = PromptBuilder._sources_block(documents)
-
-        return (
-            f"{_PERSONA_RESEARCH}\n\n"
-            f"{hist_block}"
-            f"{src_block}\n\n"
-            f"RESEARCH Q: {safe_query}\nDETAILED ANSWER:"
+        sources    = format_context(documents)
+        return cls._RESEARCH_TEMPLATE.format(
+            history=hist_block,
+            sources=sources,
+            query=safe_query,
         )
 
-    # ── Retrieval query helper (BUG-R02) ─────────────────────────────────────────────
+    # ── Retrieval query helper (BUG-R02) ──────────────────────────────────
 
     @classmethod
     def get_retrieval_query(cls, query: str, rewrite: bool = True) -> str:
         """
-        Public method for the retriever to call when it needs the rewritten
-        (HyDE / expanded) version of the query for embedding.
-
+        PUBLIC: return the rewritten (HyDE/expanded) query for the retriever.
         This is the ONLY place the rewritten query should be used.
-        Never pass its output to a build_*_prompt method.
+        Never pass its output to any build_*_prompt method.
         """
-        return cls._retrieval_query(query, rewrite)
+        if not rewrite:
+            return query
+        strategy = QueryRewriter.pick_strategy(query)
+        return cls._rewriter.rewrite(query, strategy=strategy)
 
-    # ── Backward-compat aliases ──────────────────────────────────────────────────────────
+    # ── Backward-compat aliases ────────────────────────────────────────────
 
-    @staticmethod
-    def build_deep_research_prompt(
-        query: str, documents: List[Any], history: str = ""
-    ) -> str:
-        return PromptBuilder.build_research_prompt(query, documents, history)
+    @classmethod
+    def build_deep_research_prompt(cls, query: str, documents: List[Any], history: str = "") -> str:
+        return cls.build_research_prompt(query, documents, history)
 
-    @staticmethod
-    def build_study_mode_prompt(
-        query: str,
-        documents: List[Any],
-        learning_path: Optional[List[Dict]] = None,
-        history: str = "",
-    ) -> str:
-        return PromptBuilder.build_study_prompt(query, documents, history, learning_path)
+    @classmethod
+    def build_study_mode_prompt(cls, query: str, documents: List[Any],
+                                 learning_path=None, history: str = "") -> str:
+        return cls.build_study_prompt(query, documents, history, learning_path)

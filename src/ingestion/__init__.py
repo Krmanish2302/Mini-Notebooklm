@@ -1,18 +1,26 @@
 """
 src/ingestion/__init__.py
 
-Public surface for the ingestion package.
+Public API for the ingestion package.
 
-Ingestion (write path):
-    from src.ingestion import ingestion_app, IngestionState
-    result = ingestion_app.invoke({"file_path": "doc.pdf", "source_id": "doc1"})
+Write path (ingest a file):
+    from src.ingestion import run_ingestion
+    result = run_ingestion("data/report.pdf", source_id="report_001")
 
-Retrieval (read path) — use after ingestion:
+Read path (load retriever after ingestion):
     from src.ingestion import load_parent_retriever
-    retriever = load_parent_retriever("data/vectorstores/doc1")
-    docs = retriever.invoke("your query here")
+    retriever = load_parent_retriever("data/vectorstores/report_001")
+    docs = retriever.invoke("What is the conclusion?")
 """
-from .ingestion_graph    import ingestion_app, IngestionState  # noqa: F401
-from .parent_retriever   import load_parent_retriever           # noqa: F401
 
-__all__ = ["ingestion_app", "IngestionState", "load_parent_retriever"]
+from .ingestion_runner import run_ingestion  # noqa: F401
+from .ingestion_graph import ingestion_app  # noqa: F401
+from .state import IngestionState  # noqa: F401
+from .parent_retriever import load_parent_retriever  # noqa: F401
+
+__all__ = [
+    "run_ingestion",
+    "ingestion_app",
+    "IngestionState",
+    "load_parent_retriever",
+]

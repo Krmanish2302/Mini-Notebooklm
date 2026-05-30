@@ -1,28 +1,19 @@
 """
-src/storage  —  public API
+src/storage — Public API for the storage layer.
 
-Import surface for the storage layer:
-    MultiFAISSStore  — multi-dimensional FAISS index (one per embedding dim)
-    SQLiteManager    — metadata + chunk + session/message store
-    KnowledgeGraph   — NetworkX chunk-level semantic graph
-    StorageManager   — orchestrator: keeps all three stores in sync
-
-Typical usage (from MasterPipeline.__init__):
-    from src.storage import MultiFAISSStore, SQLiteManager, KnowledgeGraph, StorageManager
-
-    faiss   = MultiFAISSStore(base_dir="./data/vector_store")
-    sqlite  = SQLiteManager(db_path="./data/metadata.db")
-    graph   = KnowledgeGraph(edge_threshold=0.75)
-    storage = StorageManager(faiss, sqlite, graph)
+Usage:
+    from src.storage import MultiFAISSStore, SQLiteManager, KnowledgeGraph, StorageManager, SourceManager
 """
-from .faiss_store      import MultiFAISSStore
-from .sqlite_manager   import SQLiteManager
-from .knowledge_graph  import KnowledgeGraph
-from .storage_manager  import StorageManager
+from .faiss_store     import MultiFAISSStore   # noqa: F401
+from .sqlite_manager  import SQLiteManager     # noqa: F401
+from .knowledge_graph import KnowledgeGraph    # noqa: F401
+from .storage_manager import StorageManager    # noqa: F401
+from .source_manager  import SourceManager     # noqa: F401
 
 __all__ = [
     "MultiFAISSStore",
     "SQLiteManager",
     "KnowledgeGraph",
     "StorageManager",
+    "SourceManager",
 ]

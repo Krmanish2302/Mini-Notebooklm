@@ -1,200 +1,192 @@
 """
-storage_manager.py  —  Single orchestration surface over all three stores
+storage_manager.py — Orchestrator: keeps MultiFAISSStore, SQLiteManager,
+                      KnowledgeGraph, and SourceManager in sync.
 
-Fixes applied
--------------
-BUG-C01  get_chunks_as_documents now delegates to sqlite.get_chunks_by_ids()
-         for a single batched query instead of N separate connections.
-BUG-C05  Removed direct access to faiss._indexes.id_map; replaced with the
-         public MultiFAISSStore.get_internal_id() method.
-BUG-R03  get_chunks_as_documents now includes source_id + metadata in the
-         Document object so PromptBuilder can render [S1] — filename headers.
-BUG-Q03  get_all_chunks_for_bm25 now issues a single SELECT instead of
-         one query per source (N+1 pattern).
+Responsibilities:
+  1. Ingest pipeline: accept List[Document] + embeddings → persist everywhere
+  2. Delete pipeline: remove from all three stores atomically
+  3. Graph construction: auto-link chunks in KnowledgeGraph post-ingest
+  4. LangChain callback support: fires on_ingest_start / on_ingest_end
+
+LangChain integration:
+    - All ingest/retrieval APIs use List[Document] as the canonical type.
+    - on_ingest callbacks use LangChain BaseCallbackHandler protocol.
+    - get_context_documents() returns List[Document] ready for ChatPromptTemplate.
 """
 from __future__ import annotations
 
-import json
 import logging
-from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
 
-from .faiss_store import MultiFAISSStore
-from .sqlite_manager import SQLiteManager
-from .knowledge_graph import KnowledgeGraph
+from src.storage.faiss_store    import MultiFAISSStore
+from src.storage.knowledge_graph import KnowledgeGraph
+from src.storage.source_manager  import SourceManager
+from src.storage.sqlite_manager  import SQLiteManager
 
 logger = logging.getLogger(__name__)
 
 
 class StorageManager:
     """
-    Thin orchestration layer — delegates to specialised stores.
-    Keeps all three stores in sync on every write/delete.
+    Top-level orchestrator for the storage layer.
+
+    Usage:
+        sm = StorageManager(faiss_store, sqlite, knowledge_graph)
+        result = sm.ingest(
+            documents=docs,
+            embeddings=vectors,
+            source_id="paper_01",
+            dim=768,
+        )
     """
 
     def __init__(
         self,
-        faiss_store: MultiFAISSStore,
-        sqlite_manager: SQLiteManager,
-        knowledge_graph: KnowledgeGraph,
+        faiss_store:     MultiFAISSStore,
+        sqlite:          SQLiteManager,
+        knowledge_graph: Optional[KnowledgeGraph] = None,
+        callbacks:       Optional[List[BaseCallbackHandler]] = None,
     ):
-        self.faiss = faiss_store
-        self.sqlite = sqlite_manager
-        self.graph = knowledge_graph
+        self.faiss_store     = faiss_store
+        self.sqlite          = sqlite
+        self.knowledge_graph = knowledge_graph or KnowledgeGraph()
+        self.callbacks       = callbacks or []
 
-        self._sources: Dict[str, Dict[str, Any]] = {
-            s["id"]: s for s in self.sqlite.get_sources()
-        }
-        logger.info(
-            "StorageManager: hydrated %d sources from SQLite on startup",
-            len(self._sources),
-        )
+        # SourceManager is built internally — single source of truth for chunk storage
+        self.source_manager = SourceManager(faiss_store=faiss_store, sqlite=sqlite)
 
-    # ── write ─────────────────────────────────────────────────────────────────
+    # ── Ingest ────────────────────────────────────────────────────────────────
 
-    def store(
+    def ingest(
         self,
-        source: Dict[str, Any],
-        chunks: List[Dict[str, Any]],
-        embedding_model: str,
-        dim: int,
-    ) -> str:
-        source_id = source.get("id") or __import__("uuid").uuid4().hex
-        source["id"] = source_id
+        documents:   List[Document],
+        embeddings:  List[List[float]],
+        source_id:   str,
+        dim:         int,
+        source_name: str                     = "",
+        source_type: str                     = "text",
+        metadata:    Optional[Dict[str, Any]] = None,
+        auto_link:   bool                    = False,
+    ) -> Dict[str, Any]:
+        """
+        Full ingest pipeline:
+          1. Register source in SQLite
+          2. Store chunks + embeddings (SQLite + FAISS) via SourceManager
+          3. Add chunks to KnowledgeGraph (optionally auto-link)
+          4. Fire LangChain callbacks
 
-        self.sqlite.add_source(source)
-        self._sources[source_id] = source
+        Returns:
+            {source_id, chunks_stored, chunk_ids}
+        """
+        self._fire("on_ingest_start", {"source_id": source_id, "n_docs": len(documents)})
 
-        try:
-            self.faiss.add_chunks(chunks, dim=dim)
-        except Exception as faiss_err:
-            logger.error(
-                "StorageManager.store: FAISS add_chunks failed for source %s — rolling back. Error: %s",
-                source_id, faiss_err,
+        # 1. Register source
+        self.source_manager.register_source(
+            source_id=source_id,
+            name=source_name or source_id,
+            source_type=source_type,
+            metadata=metadata,
+        )
+
+        # 2. Store chunks + embeddings
+        result = self.source_manager.store_chunks(
+            documents=documents,
+            embeddings=embeddings,
+            source_id=source_id,
+            dim=dim,
+            metadata=metadata,
+        )
+
+        # 3. Add to KnowledgeGraph
+        for doc, emb, cid in zip(documents, embeddings, result["chunk_ids"]):
+            self.knowledge_graph.add_document(
+                doc=doc,
+                chunk_id=cid,
+                embedding=emb,
+                auto_link=auto_link,
             )
-            try:
-                self.sqlite.delete_source(source_id)
-            except Exception:
-                pass
-            self._sources.pop(source_id, None)
-            raise
 
-        # BUG-C05: use public method instead of private _indexes.id_map
-        for chunk in chunks:
-            cid = chunk["id"]
-            fid = self.faiss.get_internal_id(cid, dim)
-            self.sqlite.add_chunk({
-                "id":                cid,
-                "source_id":         source_id,
-                "content":           chunk.get("content", ""),
-                "modality":          chunk.get("modality", "text"),
-                "metadata":          chunk.get("metadata", {}),
-                "embedding_model":   embedding_model,
-                "faiss_dim":         dim,
-                "faiss_internal_id": fid,
-            })
+        self._fire("on_ingest_end", result)
+        return result
 
-        if self.graph:
-            for chunk in chunks:
-                try:
-                    self.graph.add_chunk(chunk)
-                except Exception as kg_err:
-                    logger.warning(
-                        "StorageManager.store: KnowledgeGraph.add_chunk failed for %s: %s",
-                        chunk.get("id"), kg_err,
-                    )
+    # ── Delete ────────────────────────────────────────────────────────────────
 
-        logger.info(
-            "StorageManager: stored source %s — %d chunks (model=%s dim=%d)",
-            source_id, len(chunks), embedding_model, dim,
-        )
-        return source_id
-
-    # ── delete ────────────────────────────────────────────────────────────────
-
-    def delete_source(self, source_id: str) -> bool:
-        if source_id not in self._sources:
-            logger.warning("StorageManager.delete_source: unknown source %s", source_id)
-            return False
-
-        chunk_rows = self.sqlite.get_chunks_for_deletion(source_id)
-
-        by_dim: Dict[int, List[str]] = defaultdict(list)
-        for row in chunk_rows:
-            d = row.get("faiss_dim")
-            if d is not None:
-                by_dim[d].append(row["id"])
-
-        for dim, chunk_ids in by_dim.items():
-            self.faiss.delete_chunks(chunk_ids, dim=dim)
-
-        if self.graph:
-            for row in chunk_rows:
-                cid = row["id"]
-                try:
-                    self.graph.graph.remove_node(cid)
-                except Exception:
-                    pass
-
-        self.sqlite.delete_source(source_id)
-        del self._sources[source_id]
-
-        logger.info(
-            "StorageManager: removed source %s — %d chunks across %d FAISS indexes",
-            source_id, len(chunk_rows), len(by_dim),
-        )
-        return True
-
-    # ── read ──────────────────────────────────────────────────────────────────
-
-    def get_chunk_content(self, chunk_id: str) -> Optional[str]:
-        return self.sqlite.get_chunk_content(chunk_id)
-
-    def get_chunks_as_documents(self, chunk_ids: List[str]) -> List[Document]:
+    def delete_source(self, source_id: str, dim: int) -> Dict[str, Any]:
         """
-        Hydrate chunk_ids into LangChain Document objects.
-
-        BUG-C01 fix: single batched IN() query instead of N separate connections.
-        BUG-R03 fix: includes source_id + parsed metadata so PromptBuilder can
-                     render [S1] — filename attribution headers.
+        Remove a source from SQLite, FAISS, and KnowledgeGraph.
         """
-        if not chunk_ids:
-            return []
-        rows = self.sqlite.get_chunks_by_ids(chunk_ids)
-        id_to_row = {r["id"]: r for r in rows}
-        docs = []
+        # Remove from KnowledgeGraph first (needs chunk_ids from SQLite)
+        chunk_ids = self.sqlite.get_chunk_ids_by_source(source_id)
         for cid in chunk_ids:
-            row = id_to_row.get(cid)
-            if row is None:
-                continue
-            try:
-                meta_dict = json.loads(row.get("metadata") or "{}")
-            except (json.JSONDecodeError, TypeError):
-                meta_dict = {}
-            meta_dict["chunk_id"] = cid
-            meta_dict["source_id"] = row.get("source_id", "")
-            # Provide a 'source' key so PromptBuilder shows the filename
-            if "source" not in meta_dict and row.get("source_id"):
-                meta_dict["source"] = meta_dict.get("title", row["source_id"])
-            docs.append(Document(page_content=row["content"] or "", metadata=meta_dict))
+            self.knowledge_graph.remove_node(cid)
+
+        # Remove from SQLite + FAISS via SourceManager
+        result = self.source_manager.delete_source(source_id, dim)
+        logger.info("[StorageManager] Deleted source=%s", source_id)
+        return result
+
+    # ── Context retrieval ─────────────────────────────────────────────────────
+
+    def get_context_documents(
+        self,
+        chunk_ids: List[str],
+        include_graph_neighbors: bool = False,
+        graph_depth:             int  = 1,
+    ) -> List[Document]:
+        """
+        Resolve chunk_ids to LangChain Documents, optionally expanding
+        via KnowledgeGraph neighbours.
+
+        Use this to build the context block for ChatPromptTemplate.
+        """
+        # Resolve via SQLiteManager
+        docs: List[Document] = []
+        seen: set = set()
+        for cid in chunk_ids:
+            doc = self.sqlite.get_chunk_as_document(cid)
+            if doc and cid not in seen:
+                docs.append(doc)
+                seen.add(cid)
+
+        # Optionally expand via graph neighbours
+        if include_graph_neighbors:
+            extra_ids: list = []
+            for cid in chunk_ids:
+                extra_ids.extend(
+                    self.knowledge_graph.get_neighbors(cid, depth=graph_depth)
+                )
+            for eid in extra_ids:
+                if eid not in seen:
+                    doc = self.sqlite.get_chunk_as_document(eid)
+                    if doc:
+                        docs.append(doc)
+                        seen.add(eid)
+
         return docs
 
-    def get_all_chunks_for_bm25(self) -> List[Dict]:
-        """
-        Return all chunks as [{id, content}] for BM25 index rebuild.
+    # ── Stats ─────────────────────────────────────────────────────────────────
 
-        BUG-Q03 fix: single SELECT instead of one query per source (N+1).
-        """
-        import sqlite3 as _sqlite3
-        with _sqlite3.connect(self.sqlite.db_path, check_same_thread=False) as conn:
-            conn.row_factory = _sqlite3.Row
-            rows = conn.execute("SELECT id, content FROM chunks").fetchall()
-        return [{"id": r["id"], "content": r["content"] or ""} for r in rows]
-
-    def get_stats(self) -> Dict:
+    def get_stats(self) -> Dict[str, Any]:
         return {
-            "source_count": len(self._sources),
-            "faiss": self.faiss.get_stats(),
+            "faiss":  self.faiss_store.get_stats(),
+            "sqlite": self.sqlite.get_stats(),
+            "graph":  self.knowledge_graph.get_stats(),
         }
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+
+    def add_callback(self, handler: BaseCallbackHandler) -> None:
+        """Add a LangChain BaseCallbackHandler for observability."""
+        self.callbacks.append(handler)
+
+    def _fire(self, event: str, data: Dict[str, Any]) -> None:
+        for cb in self.callbacks:
+            fn: Optional[Callable] = getattr(cb, event, None)
+            if callable(fn):
+                try:
+                    fn(**data)
+                except Exception as exc:
+                    logger.warning("[StorageManager] Callback %s error: %s", event, exc)

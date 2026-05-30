@@ -1,79 +1,48 @@
 """
-ContextualCompressor  —  used in Deep Research Mode (Step 4).
+contextual_compressor.py
 
-Bug fix (2026-05-10): __init__ accepted `llm` as a REQUIRED positional arg.
-master_pipeline.py calls  `ContextualCompressor()`  with NO arguments
-(the llm is injected later via DeepResearchPipeline).  Changed llm to
-Optional with default None so the class can be constructed at startup
-without a live LLM, matching how master_pipeline uses it.
+Wraps LangChain ContextualCompressionRetriever with LLMChainExtractor.
+Extracts only the relevant portions of each retrieved document.
 
-For each retrieved chunk, asks the LLM to extract ONLY the sentences
-directly relevant to the query.  Chunks the LLM deems irrelevant are
-dropped entirely (return value: None).
+Use sparingly — makes 1 LLM call per document.
+Set use_compression=False in RetrievalState to skip.
 """
 from __future__ import annotations
-
 import logging
-from typing import Any, Callable, Dict, List, Optional
+import os
+from typing import List
+
+from langchain_core.documents import Document
+from langchain.retrievers.document_compressors import LLMChainExtractor
+from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
 
 logger = logging.getLogger(__name__)
-
-_IRRELEVANT_MARKER = "\u2205"
+COMPRESSION_MODEL = os.getenv("COMPRESSION_MODEL", "gpt-4o-mini")
 
 
 class ContextualCompressor:
     """
-    Parameters
-    ----------
-    llm        : optional callable(prompt: str) -> str
-                 If None the compressor passes every chunk through unchanged
-                 (safe no-op when LLM is not yet configured).
-    min_tokens : int   chunks below this word count pass through unchanged (default 30)
-    max_tokens : int   soft cap on output length (default 200 words)
+    Extracts the relevant snippet from each document using an LLM.
+    1 LLM call per document — use only when precision matters over cost.
     """
 
-    def __init__(
-        self,
-        llm: Optional[Callable[[str], str]] = None,   # BUG FIX: was required positional
-        min_tokens: int = 30,
-        max_tokens: int = 200,
-    ):
-        self.llm = llm
-        self.min_tokens = min_tokens
-        self.max_tokens = max_tokens
-
     def compress(
-        self, chunks: List[Dict[str, Any]], query: str
-    ) -> List[Dict[str, Any]]:
-        """Compress each chunk; drop irrelevant ones. Order preserved."""
-        if not self.llm:
-            # No LLM configured — pass-through (safe fallback)
-            return chunks
-        return [r for r in (self._compress_one(c, query) for c in chunks) if r is not None]
-
-    def _compress_one(
-        self, chunk: Dict[str, Any], query: str
-    ) -> Optional[Dict[str, Any]]:
-        content = chunk.get("content", "")
-        if len(content.split()) < self.min_tokens:
-            return chunk
-        prompt = (
-            f"Given the QUESTION below, extract from the PASSAGE the sentences "
-            f"that directly answer or are relevant to the question. "
-            f"Output ONLY those sentences (max {self.max_tokens} words). "
-            f"If NO sentence is relevant, output exactly: {_IRRELEVANT_MARKER}\n\n"
-            f"QUESTION: {query}\n\nPASSAGE:\n{content}\n\nRELEVANT SENTENCES:"
-        )
+        self,
+        query: str,
+        docs:  List[Document],
+    ) -> List[Document]:
+        if not docs:
+            return docs
         try:
-            compressed = self.llm(prompt).strip()  # type: ignore[misc]
+            from langchain_openai import ChatOpenAI
+            llm        = ChatOpenAI(model=COMPRESSION_MODEL, temperature=0)
+            compressor = LLMChainExtractor.from_llm(llm)
+            compressed = compressor.compress_documents(docs, query)
+            logger.info(
+                "[ContextualCompressor] Compressed %d → %d docs",
+                len(docs), len(compressed),
+            )
+            return compressed or docs   # fallback to originals if compression removes everything
         except Exception as exc:
-            logger.warning("ContextualCompressor LLM call failed: %s", exc)
-            return chunk
-        if compressed == _IRRELEVANT_MARKER or not compressed:
-            logger.debug("ContextualCompressor: dropped chunk %s", chunk.get("id"))
-            return None
-        result = dict(chunk)
-        result["content"] = compressed
-        result["_original_content"] = content
-        result["_compressed"] = True
-        return result
+            logger.warning("[ContextualCompressor] Failed (%s) — returning original docs", exc)
+            return docs

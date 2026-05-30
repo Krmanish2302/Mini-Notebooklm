@@ -1,87 +1,109 @@
-from typing import List, Dict, Any
+"""
+study_mode.py
+
+Study mode generates flashcards, quizzes, and summaries from retrieved docs
+using LangChain LCEL chains.
+
+Usage:
+    from src.retrieval.study_mode import StudyMode
+    from src.retrieval.advanced_retriever import AdvancedRetriever
+
+    retriever = AdvancedRetriever("data/vectorstores/rep_001")
+    result    = retriever.retrieve("machine learning basics")
+    sm        = StudyMode()
+
+    flashcards = sm.flashcards(result["documents"])
+    quiz       = sm.quiz(result["documents"])
+    summary    = sm.summary(result["documents"])
+"""
+from __future__ import annotations
+import logging
+import os
+from typing import Any, Dict, List
+
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+logger = logging.getLogger(__name__)
+STUDY_MODEL = os.getenv("STUDY_MODE_MODEL", "gpt-4o-mini")
 
 
-class StudyModeRetriever:
+def _get_llm():
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(model=STUDY_MODEL, temperature=0.3)
+
+
+def _docs_to_text(docs: List[Document], max_chars: int = 8000) -> str:
+    return "\n\n---\n\n".join(d.page_content.strip() for d in docs)[:max_chars]
+
+
+class StudyMode:
     """
-    Study Mode: Graph-Augmented Retrieval with Smart Fusion.
+    Generates study materials from retrieved documents using LCEL chains.
 
-    Combines:
-    - AdvancedRetriever  → broad, high-quality chunk retrieval
-    - GraphRetriever     → relationship-aware concept traversal
+    Methods:
+        flashcards(docs)  → List[{"front": str, "back": str}]
+        quiz(docs)        → List[{"question": str, "options": List[str], "answer": str}]
+        summary(docs)     → str
     """
 
-    def __init__(self, advanced_retriever, graph_retriever):
-        self.advanced = advanced_retriever
-        self.graph_retriever = graph_retriever
+    # ── Flashcards ─────────────────────────────────────────────────────────
 
-    def retrieve(self, query: str) -> Dict[str, Any]:
-        """
-        Returns
-        -------
-        {
-            "chunks":        List[Dict]  — merged & de-duplicated chunks,
-            "learning_path": List[Dict]  — concept relationship steps for UI
-        }
-        """
-        # Step 1: Broad retrieval (AdvancedRetriever handles embedding internally)
-        broad_results = self.advanced.retrieve(query)
+    _FLASHCARD_PROMPT = ChatPromptTemplate.from_messages([
+        ("system",
+         "Create 5 study flashcards from the context below. "
+         "Format EXACTLY as:\nFRONT: <question>\nBACK: <answer>\n\n"
+         "One flashcard per block, separated by blank lines."),
+        ("human", "Context:\n{context}"),
+    ])
 
-        # Step 2: Graph retrieval (concept BFS traversal)
-        graph_results = self.graph_retriever.retrieve(query)
+    def flashcards(self, docs: List[Document]) -> List[Dict[str, str]]:
+        chain = self._FLASHCARD_PROMPT | _get_llm() | StrOutputParser()
+        raw   = chain.invoke({"context": _docs_to_text(docs)})
+        cards = []
+        for block in raw.strip().split("\n\n"):
+            lines = [l.strip() for l in block.splitlines() if l.strip()]
+            front = next((l.replace("FRONT:", "").strip() for l in lines if l.startswith("FRONT:")), "")
+            back  = next((l.replace("BACK:",  "").strip() for l in lines if l.startswith("BACK:")),  "")
+            if front and back:
+                cards.append({"front": front, "back": back})
+        return cards
 
-        # Step 3: Smart fusion — quality first, relationships second
-        final_chunks = self._smart_fusion(broad_results, graph_results)
+    # ── Quiz ────────────────────────────────────────────────────────────────
 
-        # Step 4: Extract learning path from graph results
-        learning_path = self._extract_learning_path(graph_results)
+    _QUIZ_PROMPT = ChatPromptTemplate.from_messages([
+        ("system",
+         "Create 5 multiple-choice quiz questions from the context below. "
+         "Format EXACTLY as:\n"
+         "Q: <question>\nA) <option1>\nB) <option2>\nC) <option3>\nD) <option4>\nANSWER: <A|B|C|D>\n\n"
+         "One question per block, separated by blank lines."),
+        ("human", "Context:\n{context}"),
+    ])
 
-        return {
-            "chunks": final_chunks,
-            "learning_path": learning_path,
-        }
+    def quiz(self, docs: List[Document]) -> List[Dict[str, Any]]:
+        chain     = self._QUIZ_PROMPT | _get_llm() | StrOutputParser()
+        raw       = chain.invoke({"context": _docs_to_text(docs)})
+        questions = []
+        for block in raw.strip().split("\n\n"):
+            lines   = [l.strip() for l in block.splitlines() if l.strip()]
+            q       = next((l.replace("Q:", "").strip() for l in lines if l.startswith("Q:")), "")
+            options = [l for l in lines if l.startswith(("A)", "B)", "C)", "D)"))]
+            answer  = next((l.replace("ANSWER:", "").strip() for l in lines if l.startswith("ANSWER:")), "")
+            if q and options:
+                questions.append({"question": q, "options": options, "answer": answer})
+        return questions
 
-    # ------------------------------------------------------------------
-    # Fusion helpers
-    # ------------------------------------------------------------------
+    # ── Summary ─────────────────────────────────────────────────────────────
 
-    def _smart_fusion(
-        self,
-        broad: List[Dict],
-        graph: List[Dict],
-        max_chunks: int = 8,
-    ) -> List[Dict]:
-        """
-        Keep top-6 broad results (quality), then fill remaining slots with
-        unique graph results (relationships) up to max_chunks.
-        """
-        seen: set = set()
-        final: List[Dict] = []
+    _SUMMARY_PROMPT = ChatPromptTemplate.from_messages([
+        ("system",
+         "Write a clear, concise summary of the following context. "
+         "Preserve all key facts, figures, and concepts. "
+         "Use bullet points for key takeaways at the end."),
+        ("human", "Context:\n{context}"),
+    ])
 
-        for chunk in broad[:6]:
-            cid = chunk.get("id")
-            if cid and cid not in seen:
-                seen.add(cid)
-                chunk["source"] = "broad"
-                final.append(chunk)
-
-        for chunk in graph:
-            cid = chunk.get("id")
-            if cid and cid not in seen and len(final) < max_chunks:
-                seen.add(cid)
-                chunk["source"] = "graph"
-                final.append(chunk)
-
-        return final
-
-    def _extract_learning_path(self, graph_results: List[Dict]) -> List[Dict]:
-        """Extract concept hop sequences for the learning-path UI panel."""
-        paths = []
-        for result in graph_results:
-            if "path" in result and len(result["path"]) >= 2:
-                paths.append({
-                    "from": result["path"][0],
-                    "to": result["path"][-1],
-                    "steps": result["path"],
-                    "relationship": result.get("relation", "related"),
-                })
-        return paths
+    def summary(self, docs: List[Document]) -> str:
+        chain = self._SUMMARY_PROMPT | _get_llm() | StrOutputParser()
+        return chain.invoke({"context": _docs_to_text(docs)})

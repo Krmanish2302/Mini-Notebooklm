@@ -1,17 +1,35 @@
 """
-video_audio_pipeline.py  —  REMOVED
+video_audio_pipeline.py
 
-Video/audio ingestion via Whisper has been removed.
-Use YouTubePipeline for YouTube URLs (transcript API, no download needed).
-For local audio/video files, add a future pipeline here.
+Transcribes audio/video files using OpenAI Whisper via LangChain.
+Requires: pip install openai-whisper
 """
+from __future__ import annotations
+import logging
+from typing import List
+from langchain_core.documents import Document
+
+logger = logging.getLogger(__name__)
+
 
 class VideoAudioPipeline:
-    """Placeholder — video/audio pipeline removed. Not used in production."""
-
     @staticmethod
-    def process(*args, **kwargs):
-        raise NotImplementedError(
-            "VideoAudioPipeline has been removed. "
-            "Use YouTubePipeline for YouTube URLs, or add a local audio pipeline here."
-        )
+    def process(file_path: str, source_id: str) -> List[Document]:
+        try:
+            import whisper
+        except ImportError:
+            logger.error("[VideoAudioPipeline] whisper not installed. pip install openai-whisper")
+            return []
+
+        model  = whisper.load_model("base")
+        result = model.transcribe(file_path)
+        text   = result.get("text", "").strip()
+
+        if not text:
+            logger.warning("[VideoAudioPipeline] No transcript for '%s'", file_path)
+            return []
+
+        return [Document(
+            page_content=text,
+            metadata={"source_id": source_id, "source_type": "audio", "source": file_path},
+        )]

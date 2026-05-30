@@ -1,195 +1,83 @@
 """
-context_builder.py  —  Assembles ranked retrieval results into a structured
-context window ready for prompt injection.
+context_builder.py
 
-Bug fixes applied (2026-05-10 audit):
-  BUG-011: Token counting now uses tiktoken cl100k_base instead of
-           word-count (which undercounted code/special chars by 30-40%).
-           Falls back to the conservative chars-per-token estimate if
-           tiktoken is not installed.
+Formats a List[Document] into a clean context string for the LLM.
 
-Responsibilities
-----------------
-1. Deduplication   — remove near-duplicate chunks (Jaccard similarity)
-2. Token budgeting — truncate chunks so total context stays within a limit
-3. Source ranking  — order by RRF score desc; break ties by recency
-4. Attribution     — attach source labels ([S1], [S2]…) for citation
-5. Metadata strip  — emit clean dicts with only the fields the prompt needs
+Strategies:
+  "numbered"   — [1] source | content (default)
+  "markdown"   — ## Source\ncontent
+  "plain"      — just content blocks separated by ---
+  "cited"      — content with inline [source_id:page] citations
+
+Usage:
+    from src.retrieval.context_builder import ContextBuilder
+    ctx = ContextBuilder().build(docs, query="What is X?")
 """
 from __future__ import annotations
+import os
+from typing import List
 
-import logging
-import re
-from typing import Any, Dict, List, Optional, Tuple
+from langchain_core.documents import Document
 
-logger = logging.getLogger(__name__)
-
-# BUG-011: use tiktoken for accurate token counting; fall back to char estimate
-try:
-    import tiktoken as _tiktoken
-    _enc = _tiktoken.get_encoding("cl100k_base")
-    def _count_tokens(text: str) -> int:
-        return len(_enc.encode(text))
-except ImportError:
-    _CHARS_PER_TOKEN: float = 3.5
-    def _count_tokens(text: str) -> int:   # type: ignore[misc]
-        return max(1, int(len(text) / _CHARS_PER_TOKEN))
-    logger.warning(
-        "tiktoken not installed — using char/token estimate. "
-        "Install with: pip install tiktoken"
-    )
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "12000"))
+CONTEXT_STRATEGY  = os.getenv("CONTEXT_STRATEGY", "numbered")
 
 
 class ContextBuilder:
     """
-    Parameters
-    ----------
-    max_tokens   : int   — total token budget for the context block (default 3000)
-    sim_threshold: float — Jaccard similarity above which a chunk is a duplicate (default 0.82)
+    Builds a formatted context string from retrieved Documents.
+
+    Args:
+        strategy:          "numbered" | "markdown" | "plain" | "cited"
+        max_context_chars: Hard truncation limit for total context string.
     """
 
     def __init__(
         self,
-        max_tokens:    int   = 3000,
-        sim_threshold: float = 0.82,
+        strategy:          str = CONTEXT_STRATEGY,
+        max_context_chars: int = MAX_CONTEXT_CHARS,
     ):
-        self.max_tokens    = max_tokens
-        self.sim_threshold = sim_threshold
+        self.strategy          = strategy
+        self.max_context_chars = max_context_chars
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Public API
-    # ─────────────────────────────────────────────────────────────────────
+    def build(self, docs: List[Document], query: str = "") -> str:
+        if not docs:
+            return "No relevant context found."
 
-    def build(
-        self,
-        chunks: List[Dict[str, Any]],
-        query:  Optional[str] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[str]]:
-        if not chunks:
-            return [], []
+        builders = {
+            "numbered": self._numbered,
+            "markdown":  self._markdown,
+            "plain":     self._plain,
+            "cited":     self._cited,
+        }
+        fn  = builders.get(self.strategy, self._numbered)
+        ctx = fn(docs)
+        return ctx[:self.max_context_chars]
 
-        ranked  = sorted(chunks, key=lambda c: float(c.get("rrf_score", 0.0)), reverse=True)
-        deduped = self._deduplicate(ranked)
-        budgeted = self._apply_budget(deduped)
-        context, sources = self._annotate(budgeted)
+    def _numbered(self, docs: List[Document]) -> str:
+        parts = []
+        for i, doc in enumerate(docs, 1):
+            source  = doc.metadata.get("source_id", "unknown")
+            page    = doc.metadata.get("page", "")
+            loc     = f"{source}" + (f" p.{page}" if page else "")
+            parts.append(f"[{i}] {loc}\n{doc.page_content.strip()}")
+        return "\n\n".join(parts)
 
-        logger.debug(
-            "ContextBuilder: %d → dedup %d → budget %d → final %d chunks",
-            len(chunks), len(deduped), len(budgeted), len(context),
-        )
-        return context, sources
+    def _markdown(self, docs: List[Document]) -> str:
+        parts = []
+        for doc in docs:
+            source = doc.metadata.get("source_id", "unknown")
+            parts.append(f"## {source}\n{doc.page_content.strip()}")
+        return "\n\n".join(parts)
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Private helpers
-    # ─────────────────────────────────────────────────────────────────────
+    def _plain(self, docs: List[Document]) -> str:
+        return "\n\n---\n\n".join(d.page_content.strip() for d in docs)
 
-    def _deduplicate(self, chunks: List[Dict]) -> List[Dict]:
-        kept: List[Dict]     = []
-        kept_sets: List[set] = []
-
-        for chunk in chunks:
-            text   = chunk.get("content", "")
-            tokens = self._tokenize(text)
-            if not tokens:
-                continue
-            is_dup = any(
-                self._jaccard(tokens, es) >= self.sim_threshold
-                for es in kept_sets
-            )
-            if not is_dup:
-                kept.append(chunk)
-                kept_sets.append(tokens)
-        return kept
-
-    def _apply_budget(self, chunks: List[Dict]) -> List[Dict]:
-        """
-        BUG-011: uses _count_tokens() (tiktoken) instead of word count.
-        Keep chunks in ranked order until the token budget is exhausted.
-        """
-        result:    List[Dict] = []
-        remaining: int        = self.max_tokens
-
-        for chunk in chunks:
-            text = chunk.get("content", "")
-            if not text:
-                continue
-
-            tok = _count_tokens(text)
-            if tok <= remaining:
-                result.append(chunk)
-                remaining -= tok
-            else:
-                # Truncate at sentence boundary to fit remaining budget
-                truncated = self._truncate_to_tokens(text, remaining)
-                if truncated:
-                    c = dict(chunk)
-                    c["content"]   = truncated
-                    c["truncated"] = True
-                    result.append(c)
-                break
-
-            if remaining <= 0:
-                break
-
-        return result
-
-    def _annotate(
-        self, chunks: List[Dict]
-    ) -> Tuple[List[Dict], List[str]]:
-        source_map:  Dict[str, str] = {}
-        label_count: int            = 0
-        result:      List[Dict]     = []
-        sources:     List[str]      = []
-
-        for chunk in chunks:
-            src_key = (
-                chunk.get("source_id")
-                or chunk.get("source")
-                or chunk.get("source_name")
-                or ""
-            )
-            if src_key not in source_map:
-                label_count += 1
-                label = f"S{label_count}"
-                source_map[src_key] = label
-                sources.append(label)
-
-            annotated = dict(chunk)
-            annotated["citation_label"] = source_map[src_key]
-            result.append(annotated)
-
-        return result, sources
-
-    # ─────────────────────────────────────────────────────────────────────
-    #  Utilities
-    # ─────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _tokenize(text: str) -> set:
-        return set(re.findall(r"\b\w+\b", text.lower()))
-
-    @staticmethod
-    def _jaccard(a: set, b: set) -> float:
-        if not a or not b:
-            return 0.0
-        return len(a & b) / len(a | b)
-
-    @staticmethod
-    def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-        """Truncate text so it fits within max_tokens, at sentence boundary."""
-        if max_tokens <= 0:
-            return ""
-        # Binary-search-friendly: start with proportional char estimate
-        approx_chars = max_tokens * 4   # conservative 4 chars/token upper bound
-        snippet = text[:approx_chars]
-        # Shrink until it fits
-        while _count_tokens(snippet) > max_tokens and len(snippet) > 10:
-            snippet = snippet[:int(len(snippet) * 0.85)]
-        # Walk back to sentence boundary
-        match = re.search(r"[.!?](?=[^.!?]*$)", snippet)
-        if match:
-            return snippet[: match.end()].strip()
-        last_space = snippet.rfind(" ")
-        if last_space > len(snippet) * 0.5:
-            return snippet[:last_space].strip() + "…"
-        return snippet.strip()
+    def _cited(self, docs: List[Document]) -> str:
+        parts = []
+        for doc in docs:
+            source = doc.metadata.get("source_id", "unknown")
+            page   = doc.metadata.get("page", "")
+            tag    = f"[{source}:{page}]" if page else f"[{source}]"
+            parts.append(f"{doc.page_content.strip()} {tag}")
+        return "\n\n".join(parts)

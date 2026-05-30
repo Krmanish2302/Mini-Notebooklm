@@ -8,71 +8,64 @@ build/
 dist/
 *.egg-info/
 .eggs/
+*.egg
+pip-wheel-metadata/
+.installed.cfg
 
-# Virtual environments
-venv/
-.venv/
-env/
+# Virtual envs
 .env
+.venv/
+venv/
+ENV/
+env/
 
-# Environment / secrets
-*.env
-.env.*
-config.yaml
+# Secrets — never commit
+.env.local
+.env.*.local
+secrets/
 
-# Data & model artefacts  (never commit these)
-data/
+# Data & uploads
+data/uploads/
+data/chroma/
+data/logs/
+data/model_cache/
 *.db
 *.sqlite
-*.sqlite3
-*.faiss
-*.index
-*.pkl
-*.pickle
-
-# Temp media files (the Rick Astley incident)
-*.webm
-*.mp4
-*.mp3
-*.wav
-*.m4a
-tmp_*
-temp_*
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-.DS_Store
-Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
 
-# Logs
-*.log
-logs/
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
 
-# Coverage / test artefacts
+# Testing
+.pytest_cache/
 .coverage
 htmlcov/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+.tox/
 
-# Dev / scratch scripts at repo root (move to scripts/ if needed)
-extract_and_save.py
-extract_missed.py
-extract_missed_v2.py
-exhaustive_extract.py
-text.txt
-cross_check.py
-check_db.py
-add_init.py
-test_reg.db
+# Distribution
+*.tar.gz
+*.whl
 
-# Frontend build artefacts
-frontend/node_modules/
-frontend/dist/
+# Node (React frontend)
+node_modules/
+dist/
+.next/
+.nuxt/
+
+# Docs build
+docs/_build/
+site/
+
+# Temp
+tmp/
+temp/
+*.tmp
+*.bak

@@ -1,233 +1,360 @@
 """
-sqlite_manager.py  —  Metadata + chat history store
+sqlite_manager.py — SQLite store for chunks, sources, and chat sessions.
 
-Fixes applied
--------------
-BUG-C02  Thread safety: WAL journal mode + threading.Lock on every write.
-         check_same_thread=False so the same SQLiteManager instance can be
-         shared across the FastAPI request thread and the background ingest
-         thread without OperationalError: database is locked.
-BUG-C01  N+1 query pattern: get_chunks_as_documents now uses a single
-         batched IN() query instead of one SELECT per chunk_id.
-BUG-R03  Missing source metadata: get_chunks_by_ids() returns full rows
-         (including source_id, metadata) so PromptBuilder gets source names.
-BUG-Q05  Schema migration: allowlist assertion before ALTER TABLE to prevent
-         accidental SQL injection if the column list is ever extended.
+Stores:
+    chunks   — chunk_id, source_id, content, metadata (JSON), embedding_dim
+    sources  — source_id, name, type, metadata, created_at, active flag
+    sessions — session_id, created_at
+    messages — message_id, session_id, role, content, created_at
+
+LangChain integration:
+    - Chunks are returned as List[Document] via get_documents_by_source().
+    - get_chunk_as_document() returns a single Document for citation assembly.
+    - Chat message history stored here; retrieved as List[BaseMessage] via
+      get_session_messages_as_lc() for ConversationBufferWindowMemory hydration.
 """
-import sqlite3
+from __future__ import annotations
+
 import json
 import logging
-import threading
-from typing import List, Dict, Any, Optional
+import sqlite3
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, Generator, List, Optional
+
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_DB = "./data/metadata.db"
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS chunks (
+    chunk_id      TEXT PRIMARY KEY,
+    source_id     TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    embedding_dim INTEGER,
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sources (
+    source_id     TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    source_type   TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at    TEXT NOT NULL,
+    active        INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    message_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_source    ON chunks(source_id);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+"""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 class SQLiteManager:
-    """SQLite metadata store — sources, chunks, sessions, messages."""
+    """
+    SQLite-backed store for chunks, sources, and chat sessions.
 
-    def __init__(self, db_path: str = "./data/metadata.db"):
+    All chunk retrieval methods return LangChain Documents.
+    All message retrieval methods return List[BaseMessage].
+    """
+
+    def __init__(self, db_path: str = _DEFAULT_DB):
         self.db_path = db_path
-        import os
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        # BUG-C02: single lock serialises all writes across threads
-        self._lock = threading.Lock()
-        # Enable WAL mode once at startup for concurrent read+write
-        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-        self._init_tables()
+        self._init_db()
 
-    def _conn(self) -> sqlite3.Connection:
-        """Return a new connection with check_same_thread=False."""
+    # ── Connection context manager ────────────────────────────────────────────
+
+    @contextmanager
+    def _conn(self) -> Generator[sqlite3.Connection, None, None]:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
-    # ── schema ────────────────────────────────────────────────────────────────
-
-    def _init_tables(self) -> None:
-        with self._lock:
-            with self._conn() as conn:
-                conn.executescript("""
-                    CREATE TABLE IF NOT EXISTS sources (
-                        id          TEXT PRIMARY KEY,
-                        title       TEXT,
-                        source_type TEXT,
-                        file_path   TEXT,
-                        url         TEXT,
-                        metadata    TEXT,
-                        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        status      TEXT DEFAULT 'processing'
-                    );
-
-                    CREATE TABLE IF NOT EXISTS chunks (
-                        id               TEXT PRIMARY KEY,
-                        source_id        TEXT,
-                        content          TEXT,
-                        modality         TEXT,
-                        metadata         TEXT,
-                        embedding_model  TEXT,
-                        faiss_dim        INTEGER,
-                        faiss_internal_id INTEGER,
-                        FOREIGN KEY (source_id) REFERENCES sources(id)
-                    );
-
-                    CREATE TABLE IF NOT EXISTS sessions (
-                        id         TEXT PRIMARY KEY,
-                        mode       TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-
-                    CREATE TABLE IF NOT EXISTS messages (
-                        id           TEXT PRIMARY KEY,
-                        session_id   TEXT,
-                        role         TEXT,
-                        content      TEXT,
-                        sources_used TEXT,
-                        timestamp    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (session_id) REFERENCES sessions(id)
-                    );
-
-                    CREATE TABLE IF NOT EXISTS chat_history_graph (
-                        id            TEXT PRIMARY KEY,
-                        session_id    TEXT,
-                        node_type     TEXT,
-                        content       TEXT,
-                        related_nodes TEXT,
-                        timestamp     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """)
-                self._migrate(conn)
-
-    def _migrate(self, conn: sqlite3.Connection) -> None:
-        """Add new columns to existing tables without breaking existing data."""
-        # BUG-Q05: allowlist prevents accidental SQL injection
-        _ALLOWED_COLS = {
-            "embedding_model": "TEXT",
-            "faiss_dim": "INTEGER",
-            "faiss_internal_id": "INTEGER",
-        }
-        existing = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
-        for col, typedef in _ALLOWED_COLS.items():
-            assert col in _ALLOWED_COLS, f"Unexpected column attempted: {col}"
-            assert typedef in ("TEXT", "INTEGER"), f"Unexpected type: {typedef}"
-            if col not in existing:
-                conn.execute(f"ALTER TABLE chunks ADD COLUMN {col} {typedef}")
-                logger.info("SQLiteManager: migrated chunks.%s", col)
-
-    # ── sources ───────────────────────────────────────────────────────────────
-
-    def add_source(self, source: Dict[str, Any]) -> None:
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO sources
-                        (id, title, source_type, file_path, url, metadata, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    source["id"],
-                    source.get("title", source.get("name", "")),
-                    source.get("source_type", source.get("type", "unknown")),
-                    source.get("file_path"),
-                    source.get("url"),
-                    json.dumps(source.get("metadata", {})),
-                    source.get("status", "ready"),
-                ))
-
-    def get_sources(self) -> List[Dict[str, Any]]:
+    def _init_db(self) -> None:
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM sources WHERE status = 'ready'"
-            ).fetchall()
-            return [dict(r) for r in rows]
+            conn.executescript(_DDL)
+        logger.info("[SQLiteManager] Initialized db: %s", self.db_path)
 
-    def delete_source(self, source_id: str) -> None:
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("DELETE FROM chunks  WHERE source_id = ?", (source_id,))
-                conn.execute("DELETE FROM sources WHERE id         = ?", (source_id,))
+    # ── Chunk API ─────────────────────────────────────────────────────────────
 
-    # ── chunks ────────────────────────────────────────────────────────────────
-
-    def add_chunk(self, chunk: Dict[str, Any]) -> None:
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO chunks
-                        (id, source_id, content, modality, metadata,
-                         embedding_model, faiss_dim, faiss_internal_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    chunk["id"],
-                    chunk.get("source_id", ""),
-                    chunk.get("content", ""),
-                    chunk.get("modality", "text"),
-                    json.dumps(chunk.get("metadata", {})),
-                    chunk.get("embedding_model"),
-                    chunk.get("faiss_dim"),
-                    chunk.get("faiss_internal_id"),
-                ))
-
-    def get_chunks_by_source(self, source_id: str) -> List[Dict[str, Any]]:
+    def save_chunk(
+        self,
+        chunk_id:      str,
+        source_id:     str,
+        content:       str,
+        metadata:      Optional[Dict[str, Any]] = None,
+        embedding_dim: Optional[int]            = None,
+    ) -> None:
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM chunks WHERE source_id = ?", (source_id,)
-            ).fetchall()
-            return [dict(r) for r in rows]
+            conn.execute(
+                """
+                INSERT INTO chunks (chunk_id, source_id, content, metadata_json, embedding_dim, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chunk_id) DO UPDATE SET
+                    content       = excluded.content,
+                    metadata_json = excluded.metadata_json,
+                    embedding_dim = excluded.embedding_dim
+                """,
+                (
+                    chunk_id, source_id, content,
+                    json.dumps(metadata or {}),
+                    embedding_dim,
+                    _now(),
+                ),
+            )
 
-    def get_chunks_for_deletion(self, source_id: str) -> List[Dict[str, Any]]:
-        """Return (chunk_id, faiss_dim, faiss_internal_id) rows for deletion."""
+    def save_chunks_batch(self, chunks: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-insert chunks. Each dict: {chunk_id, source_id, content, metadata?, embedding_dim?}
+        Returns number of rows inserted/updated.
+        """
+        rows = [
+            (
+                c["chunk_id"], c["source_id"], c["content"],
+                json.dumps(c.get("metadata") or {}),
+                c.get("embedding_dim"),
+                _now(),
+            )
+            for c in chunks
+        ]
         with self._conn() as conn:
-            rows = conn.execute("""
-                SELECT id, faiss_dim, faiss_internal_id
-                FROM chunks WHERE source_id = ?
-            """, (source_id,)).fetchall()
-            return [dict(r) for r in rows]
+            conn.executemany(
+                """
+                INSERT INTO chunks (chunk_id, source_id, content, metadata_json, embedding_dim, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chunk_id) DO UPDATE SET
+                    content       = excluded.content,
+                    metadata_json = excluded.metadata_json,
+                    embedding_dim = excluded.embedding_dim
+                """,
+                rows,
+            )
+        return len(rows)
 
     def get_chunk_content(self, chunk_id: str) -> Optional[str]:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT content FROM chunks WHERE id = ?", (chunk_id,)
+                "SELECT content FROM chunks WHERE chunk_id = ?", (chunk_id,)
             ).fetchone()
-            return row["content"] if row else None
+        return row["content"] if row else None
 
-    # BUG-R03 / BUG-C01: batch fetch full rows by list of IDs
-    def get_chunks_by_ids(self, chunk_ids: List[str]) -> List[Dict[str, Any]]:
-        """
-        Fetch full chunk rows for a list of IDs in ONE query.
-        Fixes the N+1 pattern in StorageManager.get_chunks_as_documents().
-        Also returns source_id + metadata so PromptBuilder gets source names.
-        """
-        if not chunk_ids:
-            return []
-        placeholders = ",".join("?" * len(chunk_ids))
+    def get_chunk_as_document(self, chunk_id: str) -> Optional[Document]:
+        """Return a LangChain Document for a single chunk."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM chunks WHERE chunk_id = ?", (chunk_id,)
+            ).fetchone()
+        if not row:
+            return None
+        meta = json.loads(row["metadata_json"] or "{}")
+        meta.update({
+            "chunk_id":     row["chunk_id"],
+            "source_id":    row["source_id"],
+            "embedding_dim": row["embedding_dim"],
+        })
+        return Document(page_content=row["content"], metadata=meta)
+
+    def get_documents_by_source(self, source_id: str) -> List[Document]:
+        """Return all chunks for a source as LangChain Documents."""
         with self._conn() as conn:
             rows = conn.execute(
-                f"SELECT id, source_id, content, metadata FROM chunks WHERE id IN ({placeholders})",
-                chunk_ids,
+                "SELECT * FROM chunks WHERE source_id = ? ORDER BY created_at",
+                (source_id,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        docs = []
+        for row in rows:
+            meta = json.loads(row["metadata_json"] or "{}")
+            meta.update({
+                "chunk_id":      row["chunk_id"],
+                "source_id":     row["source_id"],
+                "embedding_dim": row["embedding_dim"],
+            })
+            docs.append(Document(page_content=row["content"], metadata=meta))
+        return docs
 
-    # ── sessions / messages ───────────────────────────────────────────────────
-
-    def add_message(self, message: Dict[str, Any]) -> None:
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
-                    INSERT INTO messages (id, session_id, role, content, sources_used)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (
-                    message["id"],
-                    message["session_id"],
-                    message["role"],
-                    message["content"],
-                    json.dumps(message.get("sources_used", [])),
-                ))
-
-    def get_session_messages(self, session_id: str) -> List[Dict[str, Any]]:
+    def get_chunk_ids_by_source(self, source_id: str) -> List[str]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp",
+                "SELECT chunk_id FROM chunks WHERE source_id = ?", (source_id,)
+            ).fetchall()
+        return [r["chunk_id"] for r in rows]
+
+    def delete_chunks_by_source(self, source_id: str) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM chunks WHERE source_id = ?", (source_id,)
+            )
+        return cur.rowcount
+
+    # ── Source API ────────────────────────────────────────────────────────────
+
+    def save_source(
+        self,
+        source_id:   str,
+        name:        str,
+        source_type: str,
+        metadata:    Optional[Dict[str, Any]] = None,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO sources (source_id, name, source_type, metadata_json, created_at, active)
+                VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    name          = excluded.name,
+                    source_type   = excluded.source_type,
+                    metadata_json = excluded.metadata_json
+                """,
+                (source_id, name, source_type, json.dumps(metadata or {}), _now()),
+            )
+
+    def get_source(self, source_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM sources WHERE source_id = ?", (source_id,)
+            ).fetchone()
+        if not row:
+            return None
+        meta = json.loads(row["metadata_json"] or "{}")
+        return {
+            "source_id":   row["source_id"],
+            "name":        row["name"],
+            "source_type": row["source_type"],
+            "metadata":    meta,
+            "created_at":  row["created_at"],
+            "active":      bool(row["active"]),
+        }
+
+    def list_sources(self, active_only: bool = False) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM sources"
+        if active_only:
+            query += " WHERE active = 1"
+        query += " ORDER BY created_at DESC"
+        with self._conn() as conn:
+            rows = conn.execute(query).fetchall()
+        return [
+            {
+                "source_id":   r["source_id"],
+                "name":        r["name"],
+                "source_type": r["source_type"],
+                "metadata":    json.loads(r["metadata_json"] or "{}"),
+                "created_at":  r["created_at"],
+                "active":      bool(r["active"]),
+            }
+            for r in rows
+        ]
+
+    def set_source_active(self, source_id: str, active: bool) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sources SET active = ? WHERE source_id = ?",
+                (int(active), source_id),
+            )
+
+    def delete_source(self, source_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM sources WHERE source_id = ?", (source_id,))
+
+    # ── Session / Message API (LangChain message types) ───────────────────────
+
+    def create_session(self, session_id: Optional[str] = None) -> str:
+        sid = session_id or str(uuid.uuid4())
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions (session_id, created_at) VALUES (?, ?)",
+                (sid, _now()),
+            )
+        return sid
+
+    def save_message(
+        self,
+        session_id: str,
+        role:       str,
+        content:    str,
+    ) -> str:
+        """role: 'human' | 'ai' | 'system'"""
+        mid = str(uuid.uuid4())
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO messages (message_id, session_id, role, content, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (mid, session_id, role, content, _now()),
+            )
+        return mid
+
+    def get_session_messages(self, session_id: str) -> List[Dict[str, str]]:
+        """Return raw dicts: [{role, content, created_at}]."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT role, content, created_at FROM messages "
+                "WHERE session_id = ? ORDER BY created_at",
                 (session_id,),
             ).fetchall()
-            return [dict(r) for r in rows]
+        return [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]}
+                for r in rows]
+
+    def get_session_messages_as_lc(self, session_id: str) -> List[BaseMessage]:
+        """
+        Return session messages as LangChain BaseMessage objects.
+        Use this to hydrate ConversationBufferWindowMemory.
+        """
+        rows = self.get_session_messages(session_id)
+        messages: List[BaseMessage] = []
+        for r in rows:
+            role = r["role"].lower()
+            if role == "human":
+                messages.append(HumanMessage(content=r["content"]))
+            elif role == "ai":
+                messages.append(AIMessage(content=r["content"]))
+            elif role == "system":
+                messages.append(SystemMessage(content=r["content"]))
+        return messages
+
+    def delete_session(self, session_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
+
+    def get_stats(self) -> Dict[str, int]:
+        with self._conn() as conn:
+            chunks   = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            sources  = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+            sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        return {
+            "chunks":   chunks,
+            "sources":  sources,
+            "sessions": sessions,
+            "messages": messages,
+        }

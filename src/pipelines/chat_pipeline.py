@@ -1,172 +1,164 @@
 """
-chat_pipeline.py  —  Chat mode pipeline.
+chat_pipeline.py — High-level Chat pipeline.
 
-Bug fixes applied (2026-05-10 audit):
-  BUG-004: stream() no longer iterates self.llm (invoke callable) char-by-char.
-           Constructor now accepts a separate llm_stream callable.
-           Falls back to splitting the invoke() result by words if no stream
-           callable is provided (backward compat).
+Orchestrates:
+  1. Source filtering (active source IDs)
+  2. ChatGraph invocation (embed → retrieve → compress → rerank → prompt → generate)
+  3. Response + citation assembly via ResponseGenerator
+  4. Chat history management via LangChain ConversationBufferWindowMemory
 
-Flow
-----
-1. QueryRewriter   : HyDE / expand / both based on query shape
-2. HybridRetriever : BM25 + FAISS RRF fusion
-3. ContextBuilder  : dedup + token budget + citation labels
-4. PromptBuilder   : assembles system + history + sources + query
-5. LLM call        : invoke / stream
-6. ResponseGenerator: structured output with citations + follow-ups
-7. RAGChatHistory  : persist user + assistant turns
+LangChain components used:
+  - ConversationBufferWindowMemory  (chat history)
+  - LLMRegistry                     (model factory)
+  - ChatGraph                       (LangGraph sub-graph)
+  - ResponseGenerator               (citation resolver)
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Dict, List, Optional
 
-from src.generation.prompt_builder import PromptBuilder, QueryRewriter
+from langchain.memory import ConversationBufferWindowMemory
+from langchain_core.messages import AIMessage, HumanMessage
+
+from src.generation.llm_registry import LLMRegistry
+from src.generation.persona_config import PersonaConfig
 from src.generation.response_generator import ResponseGenerator
-from src.retrieval.context_builder import ContextBuilder
-from src.chat_history.rag_history import RAGChatHistory
+from src.pipelines.chat_graph import ChatGraph
+from src.storage.faiss_store import MultiFAISSStore
+from src.storage.source_manager import SourceManager
+from src.storage.sqlite_manager import SQLiteManager
 
 logger = logging.getLogger(__name__)
 
 
 class ChatPipeline:
     """
-    Parameters
-    ----------
-    hybrid_retriever : HybridRetriever
-    rag_history      : RAGChatHistory
-    llm              : callable (str) -> str    (invoke, NOT the LLMClient object)
-    llm_stream       : callable (str) -> Iterator[str]  (streaming tokens)
-                       If None, stream() falls back to word-splitting invoke().
-    top_k            : int   chunks to retrieve
-    history_k        : int   recent turns to include in prompt
-    max_ctx_tokens   : int   token budget for context block
+    End-to-end chat pipeline.
+
+    Usage:
+        pipe = ChatPipeline(faiss_store, sqlite, source_manager)
+        pipe.set_persona(PersonaConfig(persona="professor"))
+        result = pipe.run("Explain osmosis", source_ids=["bio_101"])
+        print(result["answer"])
+        print(result["citations"])
     """
 
     def __init__(
         self,
-        hybrid_retriever,
-        rag_history: RAGChatHistory,
-        llm: Callable[[str], str],
-        llm_stream: Optional[Callable[[str], Iterator[str]]] = None,  # BUG-004
-        top_k: int = 5,
-        history_k: int = 3,
-        max_ctx_tokens: int = 3000,
+        faiss_store:    MultiFAISSStore,
+        sqlite:         SQLiteManager,
+        source_manager: SourceManager,
+        compressor=None,
+        reranker=None,
+        window_k:       int = 6,
     ):
-        self.retriever    = hybrid_retriever
-        self.history      = rag_history
-        self.llm          = llm
-        self.llm_stream   = llm_stream          # BUG-004
-        self.top_k        = top_k
-        self.history_k    = history_k
-        self._ctx_builder = ContextBuilder(max_tokens=max_ctx_tokens)
-        self._rewriter    = QueryRewriter()
+        self.source_manager = source_manager
+        self.sqlite         = sqlite
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Non-streaming run
-    # ─────────────────────────────────────────────────────────────────────
+        # LangChain memory — retains last window_k human/AI turn pairs
+        self.memory = ConversationBufferWindowMemory(
+            k=window_k,
+            return_messages=True,
+            memory_key="chat_history",
+        )
+
+        self._persona: PersonaConfig = PersonaConfig()
+        self._llm: Optional[Any]     = None
+
+        self.chat_graph = ChatGraph(
+            faiss_store=faiss_store,
+            sqlite=sqlite,
+            source_manager=source_manager,
+            compressor=compressor,
+            reranker=reranker,
+        )
+
+    # ── Configuration ─────────────────────────────────────────────────────
+
+    def set_persona(self, persona: PersonaConfig) -> None:
+        self._persona = persona
+
+    def set_llm(self, llm: Any) -> None:
+        self._llm = llm
+        self.chat_graph.set_llm(llm)
+
+    def set_thread(self, thread_id: str) -> None:
+        self.chat_graph.set_thread(thread_id)
+
+    # ── Public API ────────────────────────────────────────────────────────
 
     def run(
         self,
-        query: str,
-        persona_config=None,
+        query:          str,
+        source_ids:     Optional[List[str]] = None,
+        top_k:          int                 = 8,
+        score_threshold: float              = 0.0,
     ) -> Dict[str, Any]:
-        raw_chunks = self._retrieve(query)
-        context_chunks, _sources = self._ctx_builder.build(raw_chunks, query=query)
-        history_str = self.history.format_for_prompt(query, k=self.history_k)
-        prompt = PromptBuilder.build_chat_prompt(
-            query, context_chunks,
-            history=history_str, persona_config=persona_config, rewrite=True,
-        )
-        raw_output = self.llm(prompt)
-        gen = ResponseGenerator(context_chunks=context_chunks)
-        result = gen.assemble(raw_output, query=query, generate_follow_ups=True)
-        result["retrieved_chunks"] = raw_chunks
-        result["context_chunks"]   = context_chunks   # BUG-007 fix: always set
-        self.history.add_message("user", query)
-        self.history.add_message("assistant", result["answer"])
-        return result
-
-    # ─────────────────────────────────────────────────────────────────────
-    #  Internal prompt builder (used by master_pipeline streaming path)
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _build_prompt(
-        self,
-        query: str,
-        raw_chunks: List[Dict],
-        history_context: str,
-        persona_config=None,
-    ) -> str:
-        context_chunks, _ = self._ctx_builder.build(raw_chunks, query=query)
-        return PromptBuilder.build_chat_prompt(
-            query, context_chunks,
-            history=history_context, persona_config=persona_config, rewrite=True,
-        )
-
-    # ─────────────────────────────────────────────────────────────────────
-    #  Streaming  (BUG-004)
-    # ─────────────────────────────────────────────────────────────────────
-
-    def stream(
-        self,
-        query: str,
-        persona_config=None,
-        llm_stream_fn: Optional[Callable[[str], Iterator[str]]] = None,
-    ) -> Iterator[str]:
         """
-        Streaming variant.  Yields tokens from the LLM.
+        Run a single chat turn.
 
-        BUG-004 fix: uses self.llm_stream (a proper token-streaming callable)
-        instead of self.llm (invoke, returns full str).  Iterating a str
-        yields individual characters, not semantic tokens.
-
-        Priority order for stream callable:
-          1. llm_stream_fn argument (caller override)
-          2. self.llm_stream (set at construction by master_pipeline)
-          3. word-split fallback on self.llm (no-op graceful degradation)
+        Returns:
+            answer, citations, follow_ups, sources_used, retrieved, error
         """
-        raw_chunks = self._retrieve(query)
-        context_chunks, _ = self._ctx_builder.build(raw_chunks, query=query)
-        history_str = self.history.format_for_prompt(query, k=self.history_k)
-        prompt = PromptBuilder.build_chat_prompt(
-            query, context_chunks,
-            history=history_str, persona_config=persona_config, rewrite=True,
-        )
+        llm = self._llm or LLMRegistry.get()
+        self.chat_graph.set_llm(llm)
 
-        # BUG-004: resolve the streaming callable with fallback chain
-        _stream_fn = llm_stream_fn or self.llm_stream
+        # Load LangChain memory as LangChain message history
+        mem_vars = self.memory.load_memory_variables({})
+        history  = mem_vars.get("chat_history", [])
 
-        full_response = ""
-
-        if _stream_fn is not None:
-            # True token streaming
-            for token in _stream_fn(prompt):
-                full_response += token
-                yield token
+        # Filter active sources if specified
+        if source_ids:
+            active = self.source_manager.get_active_source_ids(source_ids)
         else:
-            # Graceful fallback: call invoke() and word-split
-            logger.warning(
-                "ChatPipeline.stream(): no llm_stream callable — "
-                "falling back to word-split of invoke() result"
-            )
-            response = self.llm(prompt)
-            for word in response.split(" "):
-                token = word + " "
-                full_response += token
-                yield token
+            active = self.source_manager.get_all_active_source_ids()
 
-        self.history.add_message("user", query)
-        self.history.add_message("assistant", full_response.strip())
+        logger.info("[ChatPipeline] query='%s' sources=%s top_k=%d", query, active, top_k)
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Retrieval helper
-    # ─────────────────────────────────────────────────────────────────────
+        result = self.chat_graph.chat(
+            query=query,
+            history=history,
+            top_k=top_k,
+            score_threshold=score_threshold,
+        )
 
-    def _retrieve(self, query: str) -> List[Dict]:
-        try:
-            return self.retriever.retrieve(query, top_k=self.top_k)
-        except Exception as exc:
-            logger.warning("ChatPipeline._retrieve failed: %s", exc)
-            return []
+        # Save to LangChain memory
+        self.memory.save_context(
+            {"input": query},
+            {"output": result.get("response", "")},
+        )
+
+        # Assemble response + citations
+        retrieved = result.get("retrieved", [])
+        chunks    = [
+            {"citation_label": f"S{i+1}", "content": c["content"], "source_id": c.get("id", "")}
+            for i, c in enumerate(retrieved)
+        ]
+        generator = ResponseGenerator(context_chunks=chunks)
+        assembled = generator.assemble(
+            raw_llm_output=result.get("response", ""),
+            query=query,
+        )
+
+        return {
+            "answer":       assembled["answer"],
+            "citations":    assembled["citations"],
+            "follow_ups":   assembled["follow_ups"],
+            "sources_used": assembled["sources_used"],
+            "retrieved":    retrieved,
+            "error":        result.get("error"),
+        }
+
+    def clear_history(self) -> None:
+        self.memory.clear()
+
+    def get_history(self) -> List[Dict[str, str]]:
+        """Return history as list of {role, content} dicts."""
+        mem_vars = self.memory.load_memory_variables({})
+        messages = mem_vars.get("chat_history", [])
+        out = []
+        for m in messages:
+            role = "user" if isinstance(m, HumanMessage) else "assistant"
+            out.append({"role": role, "content": m.content})
+        return out
