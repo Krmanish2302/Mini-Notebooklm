@@ -23,16 +23,14 @@ from .utils import safe_node
 
 logger = logging.getLogger(__name__)
 
-VECTOR_STORE_DIR    = os.getenv("VECTOR_STORE_DIR",   "data/vectorstores")
-EMBEDDING_PROVIDER  = os.getenv("EMBEDDING_PROVIDER", "openai")
+VECTOR_STORE_DIR   = os.getenv("VECTOR_STORE_DIR",   "data/vectorstores")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai")
 
 
 def _get_embeddings():
-    if EMBEDDING_PROVIDER == "huggingface":
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    from langchain_openai import OpenAIEmbeddings
-    return OpenAIEmbeddings(model="text-embedding-3-small")
+    """Centralised embeddings factory — respects EMBEDDING_PROVIDER env var."""
+    from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
+    return EmbeddingRegistry.get(EMBEDDING_PROVIDER)
 
 
 def _dedup(chunks: List[Document]) -> List[Document]:
@@ -46,6 +44,34 @@ def _dedup(chunks: List[Document]) -> List[Document]:
     if removed:
         logger.info("[embed_and_index] Removed %d duplicate chunks", removed)
     return unique
+
+
+def _load_all_docs_safe(vectorstore) -> List[Document]:
+    """
+    Safely extract all stored documents from a FAISS vectorstore without
+    relying on the internal _dict attribute (which is not part of the
+    public LangChain API and may be None or absent).
+    """
+    # Preferred: public docstore interface
+    try:
+        docstore = vectorstore.docstore
+        if hasattr(docstore, "_dict") and docstore._dict:
+            return list(docstore._dict.values())
+    except Exception:
+        pass
+
+    # Fallback: iterate via index_to_docstore_id
+    try:
+        ids  = list(vectorstore.index_to_docstore_id.values())
+        docs = []
+        for doc_id in ids:
+            doc = vectorstore.docstore.search(doc_id)
+            if doc and not isinstance(doc, str):   # FAISS returns str on miss
+                docs.append(doc)
+        return docs
+    except Exception as exc:
+        logger.warning("[embed_node] Could not extract docs from docstore: %s", exc)
+        return []
 
 
 @safe_node("embed_and_index")

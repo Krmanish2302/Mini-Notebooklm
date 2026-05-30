@@ -19,9 +19,10 @@ from .utils import safe_node
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE        = int(os.getenv("CHUNK_SIZE",    "1000"))
-CHUNK_OVERLAP     = int(os.getenv("CHUNK_OVERLAP", "200"))
-SEMANTIC_CHUNKING = os.getenv("SEMANTIC_CHUNKING_ENABLED", "false").lower() == "true"
+CHUNK_SIZE         = int(os.getenv("CHUNK_SIZE",    "1000"))
+CHUNK_OVERLAP      = int(os.getenv("CHUNK_OVERLAP", "200"))
+SEMANTIC_CHUNKING  = os.getenv("SEMANTIC_CHUNKING_ENABLED", "false").lower() == "true"
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai")
 
 
 def _tag(chunks: List[Document], source_id: str, chunker: str) -> List[Document]:
@@ -30,6 +31,28 @@ def _tag(chunks: List[Document], source_id: str, chunker: str) -> List[Document]
         c.metadata["chunk_index"] = i
         c.metadata["chunker"]     = chunker
     return chunks
+
+
+def _get_semantic_embeddings():
+    """
+    Returns the correct embeddings object for SemanticChunker based on
+    EMBEDDING_PROVIDER env var.  Falls back to HuggingFace so the node
+    never crashes when OPENAI_API_KEY is absent.
+    """
+    if EMBEDDING_PROVIDER == "huggingface":
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    try:
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings(model="text-embedding-3-small")
+    except Exception:
+        # Graceful fallback: no OpenAI key available
+        logger.warning(
+            "[semantic_chunk] OpenAI embeddings unavailable — "
+            "falling back to HuggingFace all-MiniLM-L6-v2"
+        )
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
 def choose_chunker(state: dict) -> str:
@@ -41,7 +64,7 @@ def choose_chunker(state: dict) -> str:
 @safe_node("recursive_chunk")
 def recursive_chunk(state: dict) -> dict:
     """
-    Uses RecursiveCharacterTextSplitter — zero LLM calls.
+    Uses RecursiveCharacterTextSplitter — zero LLM calls, zero embedding calls.
     Reads:  state["cleaned_documents"], state["source_id"]
     Writes: state["chunks"]
     """
@@ -65,18 +88,18 @@ def recursive_chunk(state: dict) -> dict:
 def semantic_chunk(state: dict) -> dict:
     """
     Uses SemanticChunker — 1 embedding call per chunk, no LLM.
-    Requires OPENAI_API_KEY (or swap embeddings for HuggingFace).
+    Respects EMBEDDING_PROVIDER env var (openai | huggingface).
     Reads:  state["cleaned_documents"], state["source_id"]
     Writes: state["chunks"]
     """
     from langchain_experimental.text_splitter import SemanticChunker
-    from langchain_openai import OpenAIEmbeddings
 
     docs      = state.get("cleaned_documents", [])
     source_id = state.get("source_id", "unknown")
 
+    embeddings = _get_semantic_embeddings()
     chunker = SemanticChunker(
-        OpenAIEmbeddings(model="text-embedding-3-small"),
+        embeddings,
         breakpoint_threshold_type="percentile",
         breakpoint_threshold_amount=90,
     )

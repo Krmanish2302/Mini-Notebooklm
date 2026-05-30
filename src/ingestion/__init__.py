@@ -36,7 +36,8 @@ class IngestionPipeline:
     image_pipeline).
 
     If source_type is NOT supplied, the call falls back to run_ingestion()
-    for backwards compatibility.
+    which accepts only (file_path, source_id, source_type=None) — no extra
+    kwargs are forwarded to avoid TypeError.
 
     NO auto-detection is performed here.  The caller (api.py form field,
     CLI arg, etc.) is always responsible for knowing the source type.
@@ -46,10 +47,8 @@ class IngestionPipeline:
         self,
         source: str,
         *,
-        source_id:     str | None = None,
-        source_type:   str | None = None,   # required to use the typed router
-        chunk_size:    int = 512,
-        chunk_overlap: int = 64,
+        source_id:   str | None = None,
+        source_type: str | None = None,
         **kwargs,
     ) -> dict:
         """
@@ -62,7 +61,7 @@ class IngestionPipeline:
         source_type  : One of "pdf", "youtube", "website", "text", "image".
                        When supplied, routes to the matching specialised pipeline
                        via ingestion_router.  When omitted, falls back to
-                       run_ingestion().
+                       run_ingestion() (no chunk_size/chunk_overlap support).
         """
         import uuid
         sid = source_id or str(uuid.uuid4())[:8]
@@ -79,13 +78,12 @@ class IngestionPipeline:
                 embedding_dim = kwargs.get("embedding_dim", 384),
             )
 
-        # Fallback: untyped legacy runner (no source_type provided)
+        # Fallback: run_ingestion only accepts (file_path, source_id, source_type)
+        # Do NOT forward chunk_size/chunk_overlap — run_ingestion doesn't accept them
         return run_ingestion(
             source,
-            source_id     = sid,
-            chunk_size    = chunk_size,
-            chunk_overlap = chunk_overlap,
-            **kwargs,
+            source_id   = sid,
+            source_type = kwargs.get("source_type"),
         )
 
     def list_sources(self) -> list:

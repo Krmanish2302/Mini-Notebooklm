@@ -3,11 +3,12 @@
 api.py — FastAPI backend for Mini NotebookLM
 Run: uvicorn api:app --reload --port 8000
 
-Changes (fix pass)
-------------------
-* _MODE_MAP gains "analyze" entry (PRD §6)
-* source_ids forwarded from QueryRequest → pipeline.ask(source_ids=...)
-* All other logic unchanged from v1.4.0
+Fix pass v1.4.2
+---------------
+* /api/ingest: temp file persisted until AFTER ingestion completes
+* /api/analyze: URL fetch uses WebBaseLoader, not pipeline.retrieve()
+* _MODE_MAP: "analyze" entry present
+* source_ids forwarded QueryRequest → pipeline.ask()
 """
 from __future__ import annotations
 
@@ -49,14 +50,13 @@ _INJECTION_RE = re.compile(
     r"(instruction|prompt|system|rule)"
 )
 
-# FIX #4: added "analyze" mode ─────────────────────────────────────────────────
 _MODE_MAP = {
     "chat":          "chat",
     "deep":          "research",
     "research":      "research",
     "deep_research": "research",
     "study":         "study",
-    "analyze":       "chat",   # analyze uses chat pipeline; distinction is in prompt
+    "analyze":       "chat",
 }
 
 EMBEDDING_MODELS = [
@@ -74,6 +74,16 @@ def _sanitize(q: str) -> str:
 
 def _resolve_mode(raw: str) -> str:
     return _MODE_MAP.get(raw.strip().lower(), "chat")
+
+def _fetch_url_content(url: str) -> str:
+    """Fetch plain text from a URL using LangChain WebBaseLoader."""
+    try:
+        from langchain_community.document_loaders import WebBaseLoader
+        docs = WebBaseLoader(url).load()
+        return "\n\n".join(d.page_content for d in docs)
+    except Exception as exc:
+        logger.warning("[_fetch_url_content] Failed to fetch %s: %s", url, exc)
+        return ""
 
 # ── Globals ────────────────────────────────────────────────────────────────────
 
@@ -96,7 +106,7 @@ async def lifespan(app: FastAPI):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Mini NotebookLM API", version="1.4.1", lifespan=lifespan)
+app = FastAPI(title="Mini NotebookLM API", version="1.4.2", lifespan=lifespan)
 
 _raw_origins = os.getenv(
     "CORS_ORIGINS",
@@ -126,7 +136,7 @@ class QueryRequest(BaseModel):
     top_p:        Optional[float] = None
     max_tokens:   Optional[int]   = None
     ground_truth: Optional[str]   = None
-    source_ids:   List[str]       = []   # restrict retrieval to these source IDs
+    source_ids:   List[str]       = []
 
 class ModeRequest(BaseModel):
     mode: str
@@ -209,12 +219,12 @@ def _ingest_via_router(
 ) -> dict:
     from src.ingestion.ingestion_router import ingest
     return ingest(
-        source_type  = source_type,
-        source_id    = source_id,
-        file_path    = file_path,
-        content      = content,
-        strategy     = strategy,
-        embedding_dim= 384,
+        source_type   = source_type,
+        source_id     = source_id,
+        file_path     = file_path,
+        content       = content,
+        strategy      = strategy,
+        embedding_dim = 384,
     )
 
 
@@ -223,7 +233,7 @@ def _ingest_via_router(
 @app.get("/api/health")
 def health():
     s = pipeline.status()
-    return {"status": "ok", "version": "1.4.1", **s}
+    return {"status": "ok", "version": "1.4.2", **s}
 
 @app.get("/api/stats")
 def get_stats():
@@ -305,10 +315,13 @@ async def analyze_source(request: Request, file: Optional[UploadFile] = File(Non
             text        = body.get("text", "").strip()
             source_type = body.get("source_type", "text").lower().strip()
             if url:
-                loop    = asyncio.get_running_loop()
-                fetched = await loop.run_in_executor(None, lambda: pipeline.retrieve(url))
-                source_content = url
+                # FIX: use WebBaseLoader to actually fetch the URL,
+                # NOT pipeline.retrieve() which does vector search
+                loop           = asyncio.get_running_loop()
+                source_content = await loop.run_in_executor(None, lambda: _fetch_url_content(url))
                 source_name    = url
+                if not source_content:
+                    raise HTTPException(status_code=422, detail=f"Could not fetch content from URL: {url}")
             elif text:
                 source_content = text
                 source_name    = "pasted text"
@@ -378,10 +391,11 @@ async def ingest_source(
             raw = await file.read(MAX_UPLOAD_BYTES + 1)
             if len(raw) > MAX_UPLOAD_BYTES:
                 raise HTTPException(status_code=413, detail="File exceeds 50 MB")
+            # FIX: write temp file and keep it alive until AFTER ingestion
             tmp = tempfile.NamedTemporaryFile(
                 delete=False, suffix=ext or ".tmp", dir=str(UPLOAD_DIR)
             )
-            tmp.write(raw); tmp.close()
+            tmp.write(raw); tmp.flush(); tmp.close()
             tmp_path      = tmp.name
             resolved_path = tmp_path
             if source_type == "pdf" and ext in {".png", ".jpg", ".jpeg"}:
@@ -393,9 +407,10 @@ async def ingest_source(
         else:
             raise HTTPException(status_code=400, detail="Provide 'file', 'url', or 'content'")
 
-        # Try ingestion_router first
+        loop = asyncio.get_running_loop()
+
+        # Try ingestion_router first (preferred typed path)
         try:
-            loop   = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
                 lambda: _ingest_via_router(
@@ -411,7 +426,6 @@ async def ingest_source(
             logger.warning("/api/ingest: ingestion_router not available, falling back")
 
         # Fallback: legacy pipeline.ingest()
-        loop   = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
             lambda: pipeline.ingest(resolved_path or ""),
@@ -423,9 +437,12 @@ async def ingest_source(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
+        # FIX: delete temp file only AFTER ingestion has completed
         if tmp_path and Path(tmp_path).exists():
-            try: os.unlink(tmp_path)
-            except Exception: pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 # ── Sources ────────────────────────────────────────────────────────────────────
