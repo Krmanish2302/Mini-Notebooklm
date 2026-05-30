@@ -4,6 +4,12 @@ chat_graph.py — LangGraph ChatGraph
 Graph topology:
     embed_query → retrieve → compress → rerank → build_prompt → generate → END
 
+Fixes applied:
+  FIX-P01: source_ids filter — retrieve node now filters FAISS results to
+            chunks whose metadata["source_id"] is in the allowed set.
+            ChatState gains a `source_ids` field (empty list = search all).
+  FIX-P02: ChatGraph.chat() accepts + forwards source_ids.
+
 History: RAG-based (no MemorySaver / ConversationBufferWindowMemory).
   - Past turns are stored + embedded in SQLite via RAGHistoryStore.
   - On each query the N most-relevant turns are retrieved by cosine
@@ -18,7 +24,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, TypedDict
 
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
 
 from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
@@ -31,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 RRF_K = 60
 
-# ── Persona system prompts ────────────────────────────────────────────────────
+# ── Persona system prompts ──────────────────────────────────────────────────
 
 _SYSTEM_CHAT = (
     "You're Carl Sagan if he were a chill classmate. "
@@ -49,23 +55,24 @@ _SYSTEM_DEEP = (
 )
 
 
-# ── State ─────────────────────────────────────────────────────────────────────
+# ── State ───────────────────────────────────────────────────────────────────
 
 class ChatState(TypedDict, total=False):
-    query:           str
-    rag_history:     str                 # pre-built by caller via RAGHistoryStore
-    retrieved:       List[Dict[str, Any]]
-    _query_vectors:  Dict[int, Any]      # internal
-    _formatted_messages: Any            # internal (List[BaseMessage])
-    response:        str
-    mode:            str                 # "chat" | "deep_research"
-    llm:             Any                 # BaseChatModel
-    top_k:           int
-    score_threshold: float
-    error:           Optional[str]
+    query:               str
+    rag_history:         str                  # pre-built by caller via RAGHistoryStore
+    source_ids:          List[str]            # FIX-P01: empty = search all sources
+    retrieved:           List[Dict[str, Any]]
+    _query_vectors:      Dict[int, Any]       # internal
+    _formatted_messages: Any                  # internal (List[BaseMessage])
+    response:            str
+    mode:                str                  # "chat" | "deep_research"
+    llm:                 Any                  # BaseChatModel
+    top_k:               int
+    score_threshold:     float
+    error:               Optional[str]
 
 
-# ── RRF helper ────────────────────────────────────────────────────────────────
+# ── RRF helper ─────────────────────────────────────────────────────────────────
 
 def _rrf_fuse(results_by_dim: Dict[int, List[tuple]], k: int = RRF_K) -> List[str]:
     scores: Dict[str, float] = {}
@@ -75,7 +82,7 @@ def _rrf_fuse(results_by_dim: Dict[int, List[tuple]], k: int = RRF_K) -> List[st
     return sorted(scores, key=lambda cid: scores[cid], reverse=True)
 
 
-# ── Node factories ─────────────────────────────────────────────────────────────
+# ── Node factories ─────────────────────────────────────────────────────────────────
 
 def _make_embed_query(faiss_store: MultiFAISSStore):
     def node(state: ChatState) -> ChatState:
@@ -103,15 +110,34 @@ def _make_retrieve(faiss_store: MultiFAISSStore, sqlite: SQLiteManager):
             qvecs = state.get("_query_vectors", {})
             if not qvecs:
                 return {**state, "retrieved": []}
-            top_k       = state.get("top_k", 8)
-            candidate_k = top_k * 3
-            raw         = faiss_store.search(qvecs, k=candidate_k)
-            fused_ids   = _rrf_fuse(raw)
+
+            top_k        = state.get("top_k", 8)
+            candidate_k  = top_k * 3
+            # FIX-P01: build allowed set (empty = no filter = search all)
+            allowed_ids: set = set(state.get("source_ids") or [])
+
+            raw       = faiss_store.search(qvecs, k=candidate_k)
+            fused_ids = _rrf_fuse(raw)
+
             chunks = []
             for cid in fused_ids[:candidate_k]:
+                # FIX-P01: parse source_id prefix from chunk_id ("<source_id>_<index>")
+                if allowed_ids:
+                    # chunk_id format: "<source_id>_<int>"  e.g. "bio_101_42"
+                    # source_id may itself contain underscores, so split from right once
+                    chunk_source = "_".join(cid.rsplit("_", 1)[:-1])
+                    if chunk_source not in allowed_ids:
+                        continue
+
                 content = sqlite.get_chunk_content(cid)
                 if content:
                     chunks.append({"id": cid, "content": content})
+
+            logger.debug(
+                "[ChatGraph:retrieve] fused=%d after_filter=%d (allowed_sources=%s)",
+                len(fused_ids), len(chunks),
+                list(allowed_ids) if allowed_ids else "all",
+            )
             return {**state, "retrieved": chunks}
         except Exception as exc:
             logger.error("[ChatGraph:retrieve] %s", exc)
@@ -171,7 +197,6 @@ def _make_build_prompt():
                 for i, c in enumerate(state.get("retrieved", []))
             ) or "[No sources retrieved]"
 
-            # RAG-based history injected directly — no MessagesPlaceholder / MemorySaver
             rag_history  = state.get("rag_history", "")
             history_line = f"\n\nCONVERSATION HISTORY:\n{rag_history}" if rag_history else ""
 
@@ -222,7 +247,7 @@ def _make_generate():
     return node
 
 
-# ── Graph builder ─────────────────────────────────────────────────────────────
+# ── Graph builder ─────────────────────────────────────────────────────────────────
 
 def build_chat_graph(
     faiss_store:  MultiFAISSStore,
@@ -247,11 +272,10 @@ def build_chat_graph(
     builder.add_edge("build_prompt", "generate")
     builder.add_edge("generate",     END)
 
-    # No MemorySaver — history managed externally via RAGHistoryStore
     return builder.compile()
 
 
-# ── ChatGraph façade ──────────────────────────────────────────────────────────
+# ── ChatGraph façade ────────────────────────────────────────────────────────────────
 
 class ChatGraph:
     """
@@ -264,10 +288,13 @@ class ChatGraph:
         3. After the graph returns, the new turn is saved via
            RAGHistoryStore.add_turn().
 
+    FIX-P01: source_ids is now forwarded into the graph via ChatState,
+             so the retrieve node can filter results to active sources only.
+
     Usage:
         cg = ChatGraph(faiss_store, sqlite, source_manager, rag_history_store)
         cg.set_llm(LLMRegistry.get())
-        result = cg.chat("What is photosynthesis?")
+        result = cg.chat("What is photosynthesis?", source_ids=["bio_101"])
         print(result["response"])
     """
 
@@ -301,10 +328,11 @@ class ChatGraph:
 
     def chat(
         self,
-        query:          str,
-        top_k:          int   = 8,
-        score_threshold: float = 0.0,
-        history_top_k:  int   = 4,
+        query:           str,
+        top_k:           int        = 8,
+        score_threshold: float      = 0.0,
+        history_top_k:   int        = 4,
+        source_ids:      List[str]  = None,   # FIX-P01: forwarded into retrieve node
     ) -> Dict[str, Any]:
         """
         Run one chat turn.
@@ -315,6 +343,7 @@ class ChatGraph:
         top_k           : number of retrieved source chunks
         score_threshold : minimum rerank score to keep a chunk
         history_top_k   : number of past turns to inject into prompt
+        source_ids      : restrict retrieval to these source IDs (empty = all)
         """
         # 1. Retrieve RAG-based history
         rag_history = ""
@@ -326,7 +355,7 @@ class ChatGraph:
             except Exception as exc:
                 logger.warning("[ChatGraph] history retrieval failed: %s", exc)
 
-        # 2. Run graph
+        # 2. Run graph  (FIX-P01: pass source_ids into state)
         initial_state: ChatState = {
             "query":           query,
             "rag_history":     rag_history,
@@ -334,6 +363,7 @@ class ChatGraph:
             "llm":             self._llm,
             "top_k":           top_k,
             "score_threshold": score_threshold,
+            "source_ids":      list(source_ids) if source_ids else [],
         }
         result = self.graph.invoke(initial_state)
 
