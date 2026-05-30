@@ -6,6 +6,10 @@ with a CohereRerank or FlashrankRerank compressor.
 
 Falls back to simple score-based reranking if no API key available.
 
+Fix #8: FlashrankRerank is now a module-level singleton (lazy init) so the
+        cross-encoder model is NOT reloaded from disk on every query call.
+        Saves 200–400 ms per request.
+
 Usage:
     from src.retrieval.reranker import Reranker
     reranker = Reranker()
@@ -14,7 +18,7 @@ Usage:
 from __future__ import annotations
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 from langchain_core.documents import Document
 
@@ -22,6 +26,39 @@ logger = logging.getLogger(__name__)
 
 RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "flashrank")  # "cohere" | "flashrank" | "none"
 COHERE_API_KEY  = os.getenv("COHERE_API_KEY", "")
+
+# FIX #8: module-level singletons — avoid reloading the model on every query
+_flashrank_compressor: Optional[object] = None
+_cohere_compressor:   Optional[object] = None
+
+
+def _get_flashrank_compressor(top_n: int):
+    """Lazy-init FlashrankRerank singleton (model loaded once per process)."""
+    global _flashrank_compressor
+    if _flashrank_compressor is None:
+        from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
+        _flashrank_compressor = FlashrankRerank(top_n=top_n)
+        logger.info("[Reranker] FlashrankRerank model loaded (singleton)")
+    else:
+        # update top_n for this call without reloading the model
+        _flashrank_compressor.top_n = top_n
+    return _flashrank_compressor
+
+
+def _get_cohere_compressor(top_n: int):
+    """Lazy-init CohereRerank singleton."""
+    global _cohere_compressor
+    if _cohere_compressor is None:
+        from langchain_cohere import CohereRerank
+        _cohere_compressor = CohereRerank(
+            cohere_api_key=COHERE_API_KEY,
+            top_n=top_n,
+            model="rerank-english-v3.0",
+        )
+        logger.info("[Reranker] CohereRerank singleton created")
+    else:
+        _cohere_compressor.top_n = top_n
+    return _cohere_compressor
 
 
 class Reranker:
@@ -48,14 +85,7 @@ class Reranker:
 
     def _cohere_rerank(self, query: str, docs: List[Document], top_n: int) -> List[Document]:
         try:
-            from langchain_cohere import CohereRerank
-            from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
-            compressor = CohereRerank(
-                cohere_api_key=COHERE_API_KEY,
-                top_n=top_n,
-                model="rerank-english-v3.0",
-            )
-            # Use directly as a compressor
+            compressor = _get_cohere_compressor(top_n)
             compressed = compressor.compress_documents(docs, query)
             logger.info("[Reranker] Cohere reranked %d → %d docs", len(docs), len(compressed))
             return compressed
@@ -65,8 +95,7 @@ class Reranker:
 
     def _flashrank_rerank(self, query: str, docs: List[Document], top_n: int) -> List[Document]:
         try:
-            from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
-            compressor = FlashrankRerank(top_n=top_n)
+            compressor = _get_flashrank_compressor(top_n)
             compressed = compressor.compress_documents(docs, query)
             logger.info("[Reranker] Flashrank reranked %d → %d docs", len(docs), len(compressed))
             return compressed

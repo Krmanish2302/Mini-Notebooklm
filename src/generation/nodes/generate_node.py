@@ -1,5 +1,9 @@
 """
 generate_node.py — LangGraph node: invoke LLM (blocking or streaming).
+
+Fix #3: Guard chunk.content against None (Groq/Anthropic emit None-content
+         chunks for tool-call and metadata events). Without the guard,
+         "".join(tokens) raises TypeError and streaming always crashes.
 """
 from __future__ import annotations
 import logging
@@ -23,11 +27,12 @@ def generate_response(state: dict) -> dict:
         if stream:
             tokens = []
             for chunk in llm.stream([HumanMessage(content=prompt)]):
-                tokens.append(chunk.content)
+                # FIX #3: chunk.content can be None for tool/metadata events
+                tokens.append(chunk.content or "")
             raw_output = "".join(tokens)
         else:
             response   = llm.invoke([HumanMessage(content=prompt)])
-            raw_output = response.content
+            raw_output = response.content or ""
 
         logger.info("[generate_response] Generated %d chars", len(raw_output))
         return {"raw_output": raw_output}

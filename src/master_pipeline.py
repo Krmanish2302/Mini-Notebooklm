@@ -15,14 +15,8 @@ Wires together:
                                            │    optional)    │
                                            └─────────────────┘
 
-Design principles
------------------
-1. Stateless generate() — every call is independent; no mutable LLM state.
-2. LLM is constructed once via LLMRegistry (lru_cache) — not re-instantiated per call.
-3. retrieval_query (HyDE/expanded) is ONLY passed to the retriever — never to the LLM.
-4. PersonaConfig is a value object; callers pass it per-call or set a default.
-5. RAGAS evaluation is opt-in — set evaluate=True or configure via env.
-6. The pipeline never imports Streamlit — UI concerns live in src.ui.
+Fix #7 (do_expand): ask() accepts and forwards do_expand into generate()
+so the retrieval graph's expand_query node can be disabled per-request.
 """
 from __future__ import annotations
 
@@ -40,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VECTORSTORE_PATH = os.getenv("VECTORSTORE_PATH", "data/vectorstores/default")
 
-# ── Optional integrations (graceful degradation if not installed) ─────────────
+# ── Optional integrations (graceful degradation if not installed) ─────────────────
 
 def _try_import_ingestion():
     try:
@@ -67,7 +61,7 @@ def _try_import_evaluator():
         return None
 
 
-# ── Config dataclass ──────────────────────────────────────────────────────────
+# ── Config dataclass ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class PipelineConfig:
@@ -85,7 +79,7 @@ class PipelineConfig:
     vectorstore_path:   str  = field(default_factory=lambda: os.getenv("VECTORSTORE_PATH", "data/vectorstores/default"))
     retrieval_k:        int  = field(default_factory=lambda: int(os.getenv("RETRIEVAL_K",    "6")))
     retrieval_rewrite:  bool = field(default_factory=lambda: os.getenv("RETRIEVAL_REWRITE", "true").lower() == "true")
-    retrieval_strategy: str  = field(default_factory=lambda: os.getenv("RETRIEVAL_STRATEGY", "auto"))  # auto|hyde|expand|both
+    retrieval_strategy: str  = field(default_factory=lambda: os.getenv("RETRIEVAL_STRATEGY", "auto"))
 
     # Generation
     default_mode:    str  = field(default_factory=lambda: os.getenv("GEN_MODE", "chat"))
@@ -98,26 +92,10 @@ class PipelineConfig:
     max_history_turns: int = field(default_factory=lambda: int(os.getenv("MAX_HISTORY_TURNS", "8")))
 
 
-# ── Result dataclass ──────────────────────────────────────────────────────────
+# ── Result dataclass ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class GenerationResult:
-    """
-    Structured result returned by MiniNotebookLM.ask().
-
-    Attributes
-    ----------
-    answer          : Clean answer string with inline [S1]… citations.
-    citations       : List of resolved citation dicts.
-    follow_ups      : 0-3 suggested follow-up questions.
-    sources_used    : Citation labels that appeared in the answer ([S1], [S2], …).
-    chunks_used     : Full chunk dicts for cited sources.
-    tokens_estimate : Rough token count of the answer.
-    ragas           : RAGAS evaluation dict — None if evaluate=False.
-    retrieval_query : The rewritten query used for retrieval (NOT shown to LLM).
-    mode            : Generation mode used ("chat"|"study"|"research").
-    error           : Non-None if the pipeline encountered a recoverable error.
-    """
     answer:           str
     citations:        List[Dict[str, Any]]       = field(default_factory=list)
     follow_ups:       List[str]                  = field(default_factory=list)
@@ -134,29 +112,12 @@ class GenerationResult:
         return dataclasses.asdict(self)
 
 
-# ── Main pipeline class ───────────────────────────────────────────────────────
+# ── Main pipeline class ─────────────────────────────────────────────────────────────────
 
 class MiniNotebookLM:
-    """
-    One-stop pipeline: ingest → retrieve → generate → (optionally) evaluate.
-
-    Quick start
-    -----------
-        nb = MiniNotebookLM()
-        nb.ingest("notes.pdf")
-        result = nb.ask("What is the main idea?")
-        print(result.answer)
-
-    With source filtering
-    ---------------------
-        result = nb.ask("What are the conclusions?",
-                        source_ids=["lecture_notes", "paper_02"])
-    """
-
     def __init__(self, config: Optional[PipelineConfig] = None):
         self.config = config or PipelineConfig()
 
-        # Lazy-loaded sub-systems
         self._ingestion_cls  = _try_import_ingestion()
         self._retrieval_cls  = _try_import_retrieval()
         self._evaluator_cls  = _try_import_evaluator()
@@ -165,10 +126,7 @@ class MiniNotebookLM:
         self._retrieval:  Any = None
         self._evaluator:  Any = None
 
-        # Conversation history: List[{"role": "user"|"assistant", "content": str}]
         self._history: List[Dict[str, str]] = []
-
-        # Last RAGAS result — accessible by UI without re-running
         self.last_ragas: Optional[Dict[str, Any]] = None
 
         logger.info(
@@ -176,7 +134,7 @@ class MiniNotebookLM:
             self.config.llm_provider, self.config.llm_model, self.config.default_mode,
         )
 
-    # ── Ingestion ─────────────────────────────────────────────────────────────
+    # ── Ingestion ──────────────────────────────────────────────────────────────────
 
     def ingest(
         self,
@@ -187,12 +145,6 @@ class MiniNotebookLM:
         chunk_overlap: int           = 64,
         **kwargs,
     ) -> Dict[str, Any]:
-        """
-        Ingest a document (file path, URL, or raw text) into the vector store.
-
-        Returns metadata dict: {source_id, chunks_added, source_type, …}
-        After ingestion, updates config.vectorstore_path if result provides one.
-        """
         if not self._ingestion_cls:
             raise RuntimeError("src.ingestion is not installed.")
 
@@ -208,20 +160,17 @@ class MiniNotebookLM:
         )
         logger.info("[ingest] %s → %s chunks", source, result.get("chunks_added", "?"))
 
-        # Update the vectorstore path so HybridRetriever knows where to look
         vpath = result.get("vectorstore_path") or result.get("vector_store_path")
         if vpath:
             self.config.vectorstore_path = vpath
-            # Reset retriever so it rebuilds against the new path
             self._retrieval = None
 
         return result
 
     def ingest_many(self, sources: List[str], **kwargs) -> List[Dict[str, Any]]:
-        """Ingest multiple sources. Returns list of per-source metadata."""
         return [self.ingest(s, **kwargs) for s in sources]
 
-    # ── Retrieval ─────────────────────────────────────────────────────────────
+    # ── Retrieval ──────────────────────────────────────────────────────────────────
 
     def retrieve(
         self,
@@ -231,26 +180,9 @@ class MiniNotebookLM:
         strategy:   Optional[str]       = None,
         source_ids: Optional[List[str]] = None,
     ) -> tuple[List[Document], str]:
-        """
-        Retrieve relevant chunks for *query*.
-
-        Parameters
-        ----------
-        query      : Raw user question.
-        k          : Override retrieval_k for this call only.
-        rewrite    : Override retrieval_rewrite for this call only.
-        strategy   : Override retrieval_strategy (auto|hyde|expand|both). Unused
-                     internally but kept for API compatibility.
-        source_ids : If provided, only return docs from these source IDs.
-
-        Returns
-        -------
-        (documents, retrieval_query)
-        """
         k       = k       if k       is not None else self.config.retrieval_k
         rewrite = rewrite if rewrite is not None else self.config.retrieval_rewrite
 
-        # Build HyDE / expanded retrieval query — for embedder only, NOT for LLM
         if rewrite:
             try:
                 ret_query = PromptBuilder.get_retrieval_query(query, rewrite=True)
@@ -263,7 +195,6 @@ class MiniNotebookLM:
             logger.warning("[retrieve] No retriever — returning empty docs.")
             return [], ret_query
 
-        # Construct HybridRetriever with the current vectorstore path
         if self._retrieval is None:
             self._retrieval = self._retrieval_cls(
                 vectorstore_path=self.config.vectorstore_path,
@@ -277,7 +208,7 @@ class MiniNotebookLM:
         )
         return docs, ret_query
 
-    # ── Generation ────────────────────────────────────────────────────────────
+    # ── Generation ──────────────────────────────────────────────────────────────────
 
     def ask(
         self,
@@ -293,24 +224,9 @@ class MiniNotebookLM:
         stream:        Optional[bool]           = None,
         clear_history: bool                    = False,
         source_ids:    Optional[List[str]]      = None,
+        # FIX #7: do_expand forwarded all the way from API -> master_pipeline -> generate()
+        do_expand:     bool                    = True,
     ) -> GenerationResult:
-        """
-        Full pipeline: retrieve → generate → (optionally) evaluate.
-
-        Parameters
-        ----------
-        query         : User question (raw; sanitized internally).
-        mode          : "chat" | "study" | "research". Default from config.
-        persona       : PersonaConfig — controls tone/style.
-        documents     : Pre-fetched docs. If None, retrieve() is called.
-        k             : Override retrieval_k for this call only.
-        rewrite       : Override retrieval_rewrite for this call only.
-        evaluate      : Run RAGAS. Default from config.auto_evaluate.
-        ground_truth  : Reference answer for RAGAS.
-        stream        : Stream LLM tokens. Default from config.stream.
-        clear_history : Wipe conversation history before this turn.
-        source_ids    : Restrict retrieval to these source IDs.
-        """
         mode     = mode     or self.config.default_mode
         evaluate = evaluate if evaluate is not None else self.config.auto_evaluate
         stream   = stream   if stream   is not None else self.config.stream
@@ -320,7 +236,7 @@ class MiniNotebookLM:
 
         safe_query = sanitize_query(query)
 
-        # ── 1. Retrieve ───────────────────────────────────────────────────────
+        # ── 1. Retrieve ───────────────────────────────────────────────────────────────
         ret_query = safe_query
         if documents is None:
             _sids = source_ids if source_ids else None
@@ -328,10 +244,10 @@ class MiniNotebookLM:
                 safe_query, k=k, rewrite=rewrite, source_ids=_sids
             )
 
-        # ── 2. Build conversation history string ──────────────────────────────
+        # ── 2. Build conversation history string ───────────────────────────────────
         history_str = self._format_history()
 
-        # ── 3. Generate via LangGraph ─────────────────────────────────────────
+        # ── 3. Generate via LangGraph ───────────────────────────────────────────────
         try:
             gen_result = generate(
                 query=safe_query,
@@ -340,6 +256,7 @@ class MiniNotebookLM:
                 history=history_str,
                 persona=persona or PersonaConfig(),
                 stream=stream,
+                do_expand=do_expand,  # FIX #7
             )
         except Exception as exc:
             logger.exception("[ask] Generation failed: %s", exc)
@@ -352,12 +269,12 @@ class MiniNotebookLM:
 
         answer = gen_result.get("answer", "")
 
-        # ── 4. Update history ─────────────────────────────────────────────────
+        # ── 4. Update history ─────────────────────────────────────────────────────────
         self._history.append({"role": "user",      "content": safe_query})
         self._history.append({"role": "assistant", "content": answer})
         self._trim_history()
 
-        # ── 5. RAGAS evaluation (optional) ────────────────────────────────────
+        # ── 5. RAGAS evaluation (optional) ────────────────────────────────────────────
         ragas_result: Optional[Dict[str, Any]] = None
         if evaluate and self._evaluator_cls:
             if self._evaluator is None:
@@ -388,7 +305,7 @@ class MiniNotebookLM:
             mode=mode,
         )
 
-    # ── Convenience aliases ────────────────────────────────────────────────────
+    # ── Convenience aliases ────────────────────────────────────────────────────────────────
 
     def chat(self, query: str, **kwargs) -> GenerationResult:
         return self.ask(query, mode="chat", **kwargs)
@@ -399,7 +316,7 @@ class MiniNotebookLM:
     def research(self, query: str, **kwargs) -> GenerationResult:
         return self.ask(query, mode="research", **kwargs)
 
-    # ── History management ─────────────────────────────────────────────────────
+    # ── History management ──────────────────────────────────────────────────────────────
 
     def _format_history(self) -> str:
         lines = []
@@ -420,7 +337,7 @@ class MiniNotebookLM:
     def history(self) -> List[Dict[str, str]]:
         return list(self._history)
 
-    # ── State inspection ──────────────────────────────────────────────────────
+    # ── State inspection ─────────────────────────────────────────────────────────────
 
     def status(self) -> Dict[str, Any]:
         llm_ok = False
@@ -434,7 +351,7 @@ class MiniNotebookLM:
             pass
 
         return {
-            "version":          "0.4.2",
+            "version":          "0.4.3",
             "llm_provider":     self.config.llm_provider,
             "llm_model":        self.config.llm_model,
             "llm_ok":           llm_ok,

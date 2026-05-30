@@ -1,5 +1,10 @@
 """
 extract_citations_node.py — LangGraph node: extract citations + final assembly.
+
+Fixes applied
+-------------
+* FIX #9: follow_ups precedence — use `or` instead of dict default so that
+          ResponseGenerator's extraction is used when ResponseParser returns [].
 """
 from __future__ import annotations
 import logging
@@ -38,7 +43,9 @@ def extract_citations(state: dict) -> dict:
         return {
             "answer":          assembled["answer"],
             "citations":       citations,
-            "follow_ups":      state.get("follow_ups", assembled["follow_ups"]),
+            # FIX #9: use `or` so ResponseGenerator's follow_ups are used when
+            # ResponseParser returned an empty list (not just when key is absent)
+            "follow_ups":      state.get("follow_ups") or assembled["follow_ups"],
             "sources_used":    assembled["sources_used"],
             "chunks_used":     assembled["chunks_used"],
             "tokens_estimate": assembled["tokens_estimate"],
@@ -59,4 +66,12 @@ def handle_error(state: dict) -> dict:
         state.get("failed_node", "unknown"),
         state.get("error", "Unknown error"),
     )
-    return {}
+    # FIX #11: return safe defaults so callers never get KeyError on answer/citations
+    return {
+        "answer":          "",
+        "citations":       [],
+        "follow_ups":      [],
+        "sources_used":    [],
+        "chunks_used":     [],
+        "tokens_estimate": 0,
+    }

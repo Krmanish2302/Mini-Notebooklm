@@ -3,12 +3,10 @@
 api.py — FastAPI backend for Mini NotebookLM
 Run: uvicorn api:app --reload --port 8000
 
-Fix pass v1.4.2
+Fix pass v1.4.3
 ---------------
-* /api/ingest: temp file persisted until AFTER ingestion completes
-* /api/analyze: URL fetch uses WebBaseLoader, not pipeline.retrieve()
-* _MODE_MAP: "analyze" entry present
-* source_ids forwarded QueryRequest → pipeline.ask()
+* Fix #7 : QueryRequest gains do_expand field; forwarded into retrieval state
+* All prior fixes (v1.4.2) retained
 """
 from __future__ import annotations
 
@@ -106,7 +104,7 @@ async def lifespan(app: FastAPI):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Mini NotebookLM API", version="1.4.2", lifespan=lifespan)
+app = FastAPI(title="Mini NotebookLM API", version="1.4.3", lifespan=lifespan)
 
 _raw_origins = os.getenv(
     "CORS_ORIGINS",
@@ -137,6 +135,9 @@ class QueryRequest(BaseModel):
     max_tokens:   Optional[int]   = None
     ground_truth: Optional[str]   = None
     source_ids:   List[str]       = []
+    # FIX #7: expose do_expand so clients can disable query expansion
+    # (e.g. for short factual queries where expansion degrades precision)
+    do_expand:    bool            = True
 
 class ModeRequest(BaseModel):
     mode: str
@@ -233,7 +234,7 @@ def _ingest_via_router(
 @app.get("/api/health")
 def health():
     s = pipeline.status()
-    return {"status": "ok", "version": "1.4.2", **s}
+    return {"status": "ok", "version": "1.4.3", **s}
 
 @app.get("/api/stats")
 def get_stats():
@@ -315,8 +316,6 @@ async def analyze_source(request: Request, file: Optional[UploadFile] = File(Non
             text        = body.get("text", "").strip()
             source_type = body.get("source_type", "text").lower().strip()
             if url:
-                # FIX: use WebBaseLoader to actually fetch the URL,
-                # NOT pipeline.retrieve() which does vector search
                 loop           = asyncio.get_running_loop()
                 source_content = await loop.run_in_executor(None, lambda: _fetch_url_content(url))
                 source_name    = url
@@ -391,7 +390,6 @@ async def ingest_source(
             raw = await file.read(MAX_UPLOAD_BYTES + 1)
             if len(raw) > MAX_UPLOAD_BYTES:
                 raise HTTPException(status_code=413, detail="File exceeds 50 MB")
-            # FIX: write temp file and keep it alive until AFTER ingestion
             tmp = tempfile.NamedTemporaryFile(
                 delete=False, suffix=ext or ".tmp", dir=str(UPLOAD_DIR)
             )
@@ -409,7 +407,6 @@ async def ingest_source(
 
         loop = asyncio.get_running_loop()
 
-        # Try ingestion_router first (preferred typed path)
         try:
             result = await loop.run_in_executor(
                 None,
@@ -425,7 +422,6 @@ async def ingest_source(
         except ImportError:
             logger.warning("/api/ingest: ingestion_router not available, falling back")
 
-        # Fallback: legacy pipeline.ingest()
         result = await loop.run_in_executor(
             None,
             lambda: pipeline.ingest(resolved_path or ""),
@@ -437,7 +433,6 @@ async def ingest_source(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
-        # FIX: delete temp file only AFTER ingestion has completed
         if tmp_path and Path(tmp_path).exists():
             try:
                 os.unlink(tmp_path)
@@ -496,6 +491,8 @@ async def query(req: QueryRequest):
                 evaluate=False,
                 ground_truth=req.ground_truth,
                 source_ids=_sids,
+                # FIX #7: forward do_expand so retrieval graph respects it
+                do_expand=req.do_expand,
             ),
         )
         context_chunks = gen_result.chunks_used or []
@@ -538,6 +535,8 @@ async def query_stream(req: QueryRequest):
                 ground_truth=req.ground_truth,
                 stream=True,
                 source_ids=_sids,
+                # FIX #7: forward do_expand in streaming path too
+                do_expand=req.do_expand,
             )
             full_answer = gen_result.answer
             chunks_used = gen_result.chunks_used or []

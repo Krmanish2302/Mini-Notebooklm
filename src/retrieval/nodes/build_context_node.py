@@ -1,5 +1,8 @@
 """
 build_context_node.py — LangGraph node: build final context string + error handler.
+
+Fix #11: handle_error returns safe defaults so callers never KeyError on
+         context / documents after a retrieval failure.
 """
 from __future__ import annotations
 import logging
@@ -36,4 +39,10 @@ def handle_error(state: dict) -> dict:
         state.get("failed_node", "unknown"),
         state.get("error", "Unknown error"),
     )
-    return {}
+    # FIX #11: return safe defaults — previously returned {} which left
+    # context / documents unset, causing KeyError in master_pipeline.py
+    return {
+        "context":   "",
+        "documents": [],
+        "metadata":  {"num_docs": 0, "context_chars": 0},
+    }
