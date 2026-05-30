@@ -3,18 +3,11 @@
 api.py — FastAPI backend for Mini NotebookLM
 Run: uvicorn api:app --reload --port 8000
 
-Changes (UI wiring pass)
-------------------------
-* /api/ingest   — now delegates to ingestion_router.ingest() for all 5 source types
-                   (pdf, youtube, text, image, website).  Old generic pipeline.ingest() path
-                   kept as fallback when ingestion_router not available.
-* /api/sources  — lists sources from SourceManager (pipeline._source_manager) first,
-                   falls back to pipeline._ingestion.list_sources()
-* /api/analyze  — unchanged (still uses ContentAnalyzer + AdaptiveChunker)
-* /api/query    — now forwards source_ids from request so chat_graph filters correctly
-* QueryRequest  — gains `source_ids: List[str]` field
-* /api/ingest   — gains `source_id` form field; auto-generates UUID if omitted
-* All other endpoints unchanged.
+Changes (fix pass)
+------------------
+* _MODE_MAP gains "analyze" entry (PRD §6)
+* source_ids forwarded from QueryRequest → pipeline.ask(source_ids=...)
+* All other logic unchanged from v1.4.0
 """
 from __future__ import annotations
 
@@ -44,7 +37,7 @@ from src.generation.llm_registry import LLMRegistry
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────
 MAX_UPLOAD_BYTES   = 50 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".csv", ".png", ".jpg", ".jpeg", ".mp4", ".mp3", ".wav"}
 QUERY_MAX_LEN      = 2_000
@@ -55,13 +48,17 @@ _INJECTION_RE = re.compile(
     r"(?i)(ignore|disregard|forget|override|bypass).{0,40}"
     r"(instruction|prompt|system|rule)"
 )
+
+# FIX #4: added "analyze" mode ─────────────────────────────────────────────────
 _MODE_MAP = {
     "chat":          "chat",
     "deep":          "research",
     "research":      "research",
     "deep_research": "research",
     "study":         "study",
+    "analyze":       "chat",   # analyze uses chat pipeline; distinction is in prompt
 }
+
 EMBEDDING_MODELS = [
     {"name": "all-MiniLM-L6-v2",      "dim": 384,  "max_tokens": 256,  "label": "MiniLM",    "speed": "fast",   "note": "Local · fastest"},
     {"name": "all-mpnet-base-v2",      "dim": 768,  "max_tokens": 384,  "label": "MPNet",     "speed": "medium", "note": "Local · balanced"},
@@ -70,7 +67,7 @@ EMBEDDING_MODELS = [
     {"name": "text-embedding-3-large", "dim": 3072, "max_tokens": 8191, "label": "OAI Large", "speed": "medium", "note": "OpenAI API key required"},
 ]
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _sanitize(q: str) -> str:
     return _INJECTION_RE.sub("", q)[:QUERY_MAX_LEN].strip()
@@ -78,7 +75,7 @@ def _sanitize(q: str) -> str:
 def _resolve_mode(raw: str) -> str:
     return _MODE_MAP.get(raw.strip().lower(), "chat")
 
-# ── Globals ────────────────────────────────────────────────────────────────
+# ── Globals ────────────────────────────────────────────────────────────────────
 
 pipeline:       MiniNotebookLM
 _persona:       PersonaConfig
@@ -97,9 +94,9 @@ async def lifespan(app: FastAPI):
     logger.info("lifespan: shutdown")
 
 
-# ── App ────────────────────────────────────────────────────────────────────
+# ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Mini NotebookLM API", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="Mini NotebookLM API", version="1.4.1", lifespan=lifespan)
 
 _raw_origins = os.getenv(
     "CORS_ORIGINS",
@@ -114,7 +111,7 @@ app.add_middleware(
 )
 
 
-# ── Request / Response models ────────────────────────────────────────────────────
+# ── Request / Response models ──────────────────────────────────────────────────
 
 class ConfigRequest(BaseModel):
     provider: str       = "groq"
@@ -129,7 +126,7 @@ class QueryRequest(BaseModel):
     top_p:        Optional[float] = None
     max_tokens:   Optional[int]   = None
     ground_truth: Optional[str]   = None
-    source_ids:   List[str]       = []       # NEW: restrict retrieval to these sources
+    source_ids:   List[str]       = []   # restrict retrieval to these source IDs
 
 class ModeRequest(BaseModel):
     mode: str
@@ -161,7 +158,7 @@ class QueryResponse(BaseModel):
     ragas:           Optional[dict] = None
 
 
-# ── Internal helpers ─────────────────────────────────────────────────────────────
+# ── Internal helpers ───────────────────────────────────────────────────────────
 
 async def _run_ragas(
     question: str,
@@ -188,7 +185,6 @@ async def _run_ragas(
 
 
 def _list_sources_safe() -> list:
-    """Try SourceManager first, then legacy ingestion attribute."""
     try:
         sm = getattr(pipeline, "_source_manager", None)
         if sm and hasattr(sm, "list_sources"):
@@ -211,7 +207,6 @@ def _ingest_via_router(
     content:     Optional[str] = None,
     strategy:    str           = "paragraph_based",
 ) -> dict:
-    """Delegate to ingestion_router; returns ingest result dict."""
     from src.ingestion.ingestion_router import ingest
     return ingest(
         source_type  = source_type,
@@ -223,12 +218,12 @@ def _ingest_via_router(
     )
 
 
-# ── Health ───────────────────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health():
     s = pipeline.status()
-    return {"status": "ok", "version": "1.4.0", **s}
+    return {"status": "ok", "version": "1.4.1", **s}
 
 @app.get("/api/stats")
 def get_stats():
@@ -238,7 +233,7 @@ def get_stats():
         return {"error": str(exc)}
 
 
-# ── LLM Config ───────────────────────────────────────────────────────────────────
+# ── LLM Config ─────────────────────────────────────────────────────────────────
 
 @app.post("/api/config")
 def set_config(req: ConfigRequest):
@@ -252,7 +247,7 @@ def set_config(req: ConfigRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── Mode ─────────────────────────────────────────────────────────────────────
+# ── Mode ───────────────────────────────────────────────────────────────────────
 
 @app.post("/api/mode")
 def set_mode(req: ModeRequest):
@@ -261,7 +256,7 @@ def set_mode(req: ModeRequest):
     return {"mode": req.mode, "internal": internal}
 
 
-# ── Persona ──────────────────────────────────────────────────────────────────
+# ── Persona ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/persona")
 def get_persona():
@@ -287,14 +282,14 @@ def set_persona(req: PersonaRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── Embedding models ─────────────────────────────────────────────────────────────
+# ── Embedding models ───────────────────────────────────────────────────────────
 
 @app.get("/api/embedding-models")
 def list_embedding_models():
     return {"models": EMBEDDING_MODELS}
 
 
-# ── Analyze ──────────────────────────────────────────────────────────────────
+# ── Analyze ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
 async def analyze_source(request: Request, file: Optional[UploadFile] = File(None)):
@@ -356,7 +351,7 @@ async def analyze_source(request: Request, file: Optional[UploadFile] = File(Non
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── Ingest ───────────────────────────────────────────────────────────────────
+# ── Ingest ─────────────────────────────────────────────────────────────────────
 
 @app.post("/api/ingest")
 async def ingest_source(
@@ -368,24 +363,12 @@ async def ingest_source(
     embedding_model:   Optional[str]        = Form(None),
     content:           Optional[str]        = Form(None),
 ):
-    """
-    Ingest a source via ingestion_router (preferred) or pipeline.ingest() fallback.
-
-    Form fields:
-        file              — uploaded file (PDF, txt, csv, image)
-        url               — URL for website / YouTube
-        source_type       — pdf | youtube | text | image | website
-        source_id         — optional stable ID (auto-generated UUID if omitted)
-        chunking_strategy — PDF only: paragraph_based | sentence_based | etc.
-        content           — text/paste only: raw text body
-    """
     sid      = (source_id or "").strip() or str(uuid.uuid4())[:8]
     strategy = (chunking_strategy or "paragraph_based").strip()
     tmp_path = None
 
     try:
-        # ── 1. Resolve file or URL ───────────────────────────────────────
-        resolved_path: Optional[str] = None
+        resolved_path:    Optional[str] = None
         resolved_content: Optional[str] = content
 
         if file:
@@ -399,9 +382,8 @@ async def ingest_source(
                 delete=False, suffix=ext or ".tmp", dir=str(UPLOAD_DIR)
             )
             tmp.write(raw); tmp.close()
-            tmp_path       = tmp.name
-            resolved_path  = tmp_path
-            # Infer source_type from extension if not explicitly set
+            tmp_path      = tmp.name
+            resolved_path = tmp_path
             if source_type == "pdf" and ext in {".png", ".jpg", ".jpeg"}:
                 source_type = "image"
         elif url:
@@ -411,7 +393,7 @@ async def ingest_source(
         else:
             raise HTTPException(status_code=400, detail="Provide 'file', 'url', or 'content'")
 
-        # ── 2. Try ingestion_router first ───────────────────────────────
+        # Try ingestion_router first
         try:
             loop   = asyncio.get_running_loop()
             result = await loop.run_in_executor(
@@ -424,16 +406,11 @@ async def ingest_source(
                     strategy    = strategy,
                 ),
             )
-            return {
-                "status":    "ingested",
-                "source_id": sid,
-                "router":    "ingestion_router",
-                "result":    result,
-            }
+            return {"status": "ingested", "source_id": sid, "router": "ingestion_router", "result": result}
         except ImportError:
-            logger.warning("/api/ingest: ingestion_router not available, falling back to pipeline.ingest()")
+            logger.warning("/api/ingest: ingestion_router not available, falling back")
 
-        # ── 3. Fallback: legacy pipeline.ingest() ──────────────────────
+        # Fallback: legacy pipeline.ingest()
         loop   = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
@@ -451,7 +428,7 @@ async def ingest_source(
             except Exception: pass
 
 
-# ── Sources ──────────────────────────────────────────────────────────────────
+# ── Sources ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/sources")
 def list_sources():
@@ -464,13 +441,11 @@ def list_sources():
 @app.delete("/api/sources/{source_id}")
 def delete_source(source_id: str):
     try:
-        # Try SourceManager first
         sm = getattr(pipeline, "_source_manager", None)
         if sm and hasattr(sm, "delete_source"):
             ok = sm.delete_source(source_id)
             if ok:
                 return {"status": "deleted", "source_id": source_id}
-        # Fallback to legacy ingestion
         ing = getattr(pipeline, "_ingestion", None)
         if ing and hasattr(ing, "delete_source"):
             ok = ing.delete_source(source_id)
@@ -484,7 +459,7 @@ def delete_source(source_id: str):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── Query (non-streaming) ─────────────────────────────────────────────────────────
+# ── Query (non-streaming) ──────────────────────────────────────────────────────
 
 @app.post("/api/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
@@ -493,6 +468,7 @@ async def query(req: QueryRequest):
     try:
         internal_mode = _resolve_mode(req.mode)
         safe_query    = _sanitize(req.query)
+        _sids         = req.source_ids if req.source_ids else None
         loop          = asyncio.get_running_loop()
         gen_result    = await loop.run_in_executor(
             None,
@@ -502,7 +478,7 @@ async def query(req: QueryRequest):
                 persona=_persona if internal_mode == "chat" else None,
                 evaluate=False,
                 ground_truth=req.ground_truth,
-                source_ids=req.source_ids or None,
+                source_ids=_sids,
             ),
         )
         context_chunks = gen_result.chunks_used or []
@@ -522,7 +498,7 @@ async def query(req: QueryRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── Query (SSE streaming) ────────────────────────────────────────────────────────
+# ── Query (SSE streaming) ──────────────────────────────────────────────────────
 
 @app.post("/api/query/stream")
 async def query_stream(req: QueryRequest):
@@ -534,6 +510,7 @@ async def query_stream(req: QueryRequest):
         chunks_used   = []
         safe_query    = _sanitize(req.query)
         internal_mode = _resolve_mode(req.mode)
+        _sids         = req.source_ids if req.source_ids else None
 
         try:
             gen_result = pipeline.ask(
@@ -543,7 +520,7 @@ async def query_stream(req: QueryRequest):
                 evaluate=False,
                 ground_truth=req.ground_truth,
                 stream=True,
-                source_ids=req.source_ids or None,
+                source_ids=_sids,
             )
             full_answer = gen_result.answer
             chunks_used = gen_result.chunks_used or []
@@ -578,7 +555,7 @@ async def query_stream(req: QueryRequest):
     )
 
 
-# ── RAGAS ────────────────────────────────────────────────────────────────────
+# ── RAGAS ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/evaluate")
 async def evaluate(req: EvaluateRequest):

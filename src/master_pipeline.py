@@ -155,6 +155,12 @@ class MiniNotebookLM:
         result = nb.ask("What is attention?", evaluate=True,
                         ground_truth="Attention is a mechanism that...")
         print(result.ragas)
+
+    With source filtering
+    ---------------------
+        # Only retrieve from specific ingested sources
+        result = nb.ask("What are the conclusions?",
+                        source_ids=["lecture_notes", "paper_02"])
     """
 
     def __init__(self, config: Optional[PipelineConfig] = None):
@@ -186,9 +192,9 @@ class MiniNotebookLM:
         self,
         source: str,
         *,
-        source_id:   Optional[str] = None,
-        chunk_size:  int           = 512,
-        chunk_overlap: int         = 64,
+        source_id:     Optional[str] = None,
+        chunk_size:    int           = 512,
+        chunk_overlap: int           = 64,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -220,20 +226,30 @@ class MiniNotebookLM:
 
     def retrieve(
         self,
-        query:    str,
-        k:        Optional[int]  = None,
-        rewrite:  Optional[bool] = None,
-        strategy: Optional[str]  = None,
+        query:      str,
+        k:          Optional[int]       = None,
+        rewrite:    Optional[bool]      = None,
+        strategy:   Optional[str]       = None,
+        source_ids: Optional[List[str]] = None,
     ) -> tuple[List[Document], str]:
         """
         Retrieve relevant chunks for *query*.
+
+        Parameters
+        ----------
+        query      : Raw user question.
+        k          : Override retrieval_k for this call only.
+        rewrite    : Override retrieval_rewrite for this call only.
+        strategy   : Override retrieval_strategy (auto|hyde|expand|both).
+        source_ids : If provided, only return docs from these source IDs.
+                     Passed directly to HybridRetriever.retrieve().
 
         Returns
         -------
         (documents, retrieval_query)
             documents       — List[Document] ranked by RRF score
             retrieval_query — the rewritten query used for embedding
-                              (BUG-R02: never passed to LLM)
+                              (never passed to LLM)
         """
         k        = k        if k        is not None else self.config.retrieval_k
         rewrite  = rewrite  if rewrite  is not None else self.config.retrieval_rewrite
@@ -241,13 +257,7 @@ class MiniNotebookLM:
 
         # Build retrieval query (HyDE / expand / both) — for embedder only
         if rewrite:
-            if strategy == "auto":
-                strategy = PromptBuilder.get_retrieval_query.__func__   # pick_strategy
-                from src.generation.prompt_builder import QueryRewriter
-                strat      = QueryRewriter.pick_strategy(query)
-                ret_query  = PromptBuilder.get_retrieval_query(query, rewrite=True)
-            else:
-                ret_query  = PromptBuilder.get_retrieval_query(query, rewrite=True)
+            ret_query = PromptBuilder.get_retrieval_query(query, rewrite=True)
         else:
             ret_query = query
 
@@ -258,25 +268,30 @@ class MiniNotebookLM:
         if self._retrieval is None:
             self._retrieval = self._retrieval_cls()
 
-        docs = self._retrieval.retrieve(ret_query, k=k)
-        logger.info("[retrieve] query_len=%d → %d docs", len(query), len(docs))
+        # Pass source_ids to HybridRetriever so both FAISS and BM25 are filtered
+        docs = self._retrieval.retrieve(ret_query, top_k=k, source_ids=source_ids or None)
+        logger.info(
+            "[retrieve] query_len=%d source_ids=%s → %d docs",
+            len(query), source_ids, len(docs),
+        )
         return docs, ret_query
 
     # ── Generation ────────────────────────────────────────────────────────────
 
     def ask(
         self,
-        query:        str,
+        query:         str,
         *,
-        mode:         Optional[str]           = None,
-        persona:      Optional[PersonaConfig] = None,
-        documents:    Optional[List[Document]] = None,
-        k:            Optional[int]            = None,
-        rewrite:      Optional[bool]           = None,
-        evaluate:     Optional[bool]           = None,
-        ground_truth: Optional[str]            = None,
-        stream:       Optional[bool]           = None,
-        clear_history: bool                   = False,
+        mode:          Optional[str]           = None,
+        persona:       Optional[PersonaConfig] = None,
+        documents:     Optional[List[Document]] = None,
+        k:             Optional[int]            = None,
+        rewrite:       Optional[bool]           = None,
+        evaluate:      Optional[bool]           = None,
+        ground_truth:  Optional[str]            = None,
+        stream:        Optional[bool]           = None,
+        clear_history: bool                    = False,
+        source_ids:    Optional[List[str]]      = None,
     ) -> GenerationResult:
         """
         Full pipeline: retrieve → generate → (optionally) evaluate.
@@ -293,6 +308,8 @@ class MiniNotebookLM:
         ground_truth  : Reference answer for RAGAS context_recall + answer_similarity.
         stream        : Stream LLM tokens. Default from config.stream.
         clear_history : Wipe conversation history before this turn.
+        source_ids    : Restrict retrieval to these source IDs (UI checkboxes).
+                        Empty list / None means use all ingested sources.
 
         Returns
         -------
@@ -310,7 +327,11 @@ class MiniNotebookLM:
         # ── 1. Retrieve ───────────────────────────────────────────────────────
         ret_query = safe_query
         if documents is None:
-            documents, ret_query = self.retrieve(safe_query, k=k, rewrite=rewrite)
+            # Treat empty list same as None (search all sources)
+            _sids = source_ids if source_ids else None
+            documents, ret_query = self.retrieve(
+                safe_query, k=k, rewrite=rewrite, source_ids=_sids
+            )
 
         # ── 2. Build conversation history string ──────────────────────────────
         history_str = self._format_history()
@@ -318,7 +339,7 @@ class MiniNotebookLM:
         # ── 3. Generate via LangGraph ─────────────────────────────────────────
         try:
             gen_result = generate(
-                query=safe_query,          # BUG-R02: original query, NOT ret_query
+                query=safe_query,          # original query, NOT ret_query
                 documents=documents,
                 mode=mode,
                 history=history_str,
@@ -426,7 +447,7 @@ class MiniNotebookLM:
             pass
 
         return {
-            "version":         "0.4.0",
+            "version":         "0.4.1",
             "llm_provider":    self.config.llm_provider,
             "llm_model":       self.config.llm_model,
             "llm_ok":          llm_ok,
