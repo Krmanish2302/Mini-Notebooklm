@@ -1,146 +1,127 @@
 """
 ingestion_graph.py
 
-Tracks the lineage of every ingested source through the pipeline stages.
-Stores a lightweight directed graph:  Source → Chunks → Embeddings → Index.
+Full LangGraph-powered ingestion pipeline for Mini-NotebookLM.
 
-This is NOT the knowledge graph (that lives in src/graph/).
-This is purely an audit / observability tool so the pipeline knows
-which sources have completed which stages.
+Flow
+----
+  load_document
+       │
+       ▼
+  detect_scanned  ──(is_scanned=True)──►  ocr_fallback
+       │                                       │
+       │(is_scanned=False)                     │
+       ▼                                       │
+  preprocess  ◄──────────────────────────────┘
+       │
+       ▼
+  choose_chunker  ──(semantic)──►  semantic_chunk
+       │                                │
+       │(recursive / default)           │
+       ▼                                │
+  recursive_chunk  ◄────────────────────┘
+       │
+       ▼
+  embed_and_index
+       │
+       ▼
+     END
 
-Usage (from master_pipeline.py):
-    graph = IngestionGraph()
-    graph.add_source(source_id, name="report.pdf", source_type="pdf")
-    graph.mark_stage(source_id, "extracted")
-    graph.mark_stage(source_id, "chunked", meta={"num_chunks": 42})
-    graph.mark_stage(source_id, "embedded")
-    graph.mark_stage(source_id, "indexed")
-    status = graph.get_status(source_id)  # → {"stages": [...], "complete": True}
+Usage
+-----
+    from src.ingestion import ingestion_app, IngestionState
+
+    state = ingestion_app.invoke({
+        "file_path": "/data/report.pdf",
+        "source_id": "report_001",
+    })
+    print(state["num_chunks"], "chunks indexed at", state["vectorstore_path"])
 """
-import time
-from typing import Dict, Any, List, Optional
+from __future__ import annotations
 
-# Ordered pipeline stages — a source progresses through these in sequence.
-PIPELINE_STAGES = [
-    "extracted",    # raw text pulled out of file / URL
-    "preprocessed", # cleaned / normalised
-    "chunked",      # split into chunks
-    "embedded",     # vector embeddings computed
-    "indexed",      # stored in FAISS + BM25
-]
+import logging
+from langgraph.graph import StateGraph, END
+
+from .state import IngestionState
+from .nodes.loader_node      import load_document
+from .nodes.detect_node      import detect_scanned
+from .nodes.ocr_node         import ocr_fallback
+from .nodes.preprocess_node  import preprocess
+from .nodes.chunking_node    import recursive_chunk, semantic_chunk, choose_chunker
+from .nodes.embed_node       import embed_and_index
+from .nodes.error_node       import handle_error
+
+logger = logging.getLogger(__name__)
+
+# ── Build graph ────────────────────────────────────────────────────────────────
+
+def build_ingestion_graph() -> StateGraph:
+    workflow = StateGraph(IngestionState)
+
+    # Register nodes
+    workflow.add_node("load_document",    load_document)
+    workflow.add_node("detect_scanned",   detect_scanned)
+    workflow.add_node("ocr_fallback",     ocr_fallback)
+    workflow.add_node("preprocess",       preprocess)
+    workflow.add_node("recursive_chunk",  recursive_chunk)
+    workflow.add_node("semantic_chunk",   semantic_chunk)
+    workflow.add_node("embed_and_index",  embed_and_index)
+    workflow.add_node("handle_error",     handle_error)
+
+    # Entry point
+    workflow.set_entry_point("load_document")
+
+    # load_document → detect_scanned  (or error)
+    workflow.add_conditional_edges(
+        "load_document",
+        lambda s: "handle_error" if s.get("error") else "detect_scanned",
+        {"detect_scanned": "detect_scanned", "handle_error": "handle_error"},
+    )
+
+    # detect_scanned → ocr_fallback  OR  preprocess
+    workflow.add_conditional_edges(
+        "detect_scanned",
+        lambda s: "ocr_fallback" if s.get("is_scanned") else "preprocess",
+        {"ocr_fallback": "ocr_fallback", "preprocess": "preprocess"},
+    )
+
+    # ocr_fallback → preprocess  (or error)
+    workflow.add_conditional_edges(
+        "ocr_fallback",
+        lambda s: "handle_error" if s.get("error") else "preprocess",
+        {"preprocess": "preprocess", "handle_error": "handle_error"},
+    )
+
+    # preprocess → choose chunker
+    workflow.add_conditional_edges(
+        "preprocess",
+        choose_chunker,
+        {"recursive_chunk": "recursive_chunk", "semantic_chunk": "semantic_chunk"},
+    )
+
+    # Both chunkers → embed_and_index
+    workflow.add_conditional_edges(
+        "recursive_chunk",
+        lambda s: "handle_error" if s.get("error") else "embed_and_index",
+        {"embed_and_index": "embed_and_index", "handle_error": "handle_error"},
+    )
+    workflow.add_conditional_edges(
+        "semantic_chunk",
+        lambda s: "handle_error" if s.get("error") else "embed_and_index",
+        {"embed_and_index": "embed_and_index", "handle_error": "handle_error"},
+    )
+
+    # embed_and_index → END  (or error)
+    workflow.add_conditional_edges(
+        "embed_and_index",
+        lambda s: "handle_error" if s.get("error") else END,
+        {END: END, "handle_error": "handle_error"},
+    )
+
+    workflow.add_edge("handle_error", END)
+
+    return workflow
 
 
-class IngestionGraph:
-    """
-    Lightweight in-memory lineage tracker for the ingestion pipeline.
-
-    Each source is a node; completed pipeline stages are stored as
-    timestamped edges so the UI and pipeline logic can query progress.
-    """
-
-    def __init__(self):
-        # source_id → {"name", "type", "added_at", "stages": [{stage, ts, meta}]}
-        self._nodes: Dict[str, Dict[str, Any]] = {}
-
-    # ── source management ────────────────────────────────────────────────────
-
-    def add_source(
-        self,
-        source_id: str,
-        name: str = "",
-        source_type: str = "unknown",
-    ) -> None:
-        """Register a new source at the start of ingestion."""
-        if source_id in self._nodes:
-            return  # idempotent
-        self._nodes[source_id] = {
-            "source_id": source_id,
-            "name": name,
-            "type": source_type,
-            "added_at": time.time(),
-            "stages": [],
-            "error": None,
-        }
-
-    def mark_stage(
-        self,
-        source_id: str,
-        stage: str,
-        meta: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """
-        Record that *source_id* has completed *stage*.
-
-        Args:
-            source_id: The source to update.
-            stage:     One of PIPELINE_STAGES.
-            meta:      Optional extra info (e.g. {"num_chunks": 42}).
-        """
-        if source_id not in self._nodes:
-            self.add_source(source_id)
-        self._nodes[source_id]["stages"].append({
-            "stage": stage,
-            "completed_at": time.time(),
-            "meta": meta or {},
-        })
-
-    def mark_error(
-        self,
-        source_id: str,
-        stage: str,
-        error: str,
-    ) -> None:
-        """Record a failure at *stage* for *source_id*."""
-        if source_id not in self._nodes:
-            self.add_source(source_id)
-        self._nodes[source_id]["error"] = {"stage": stage, "message": error, "at": time.time()}
-
-    # ── queries ───────────────────────────────────────────────────────────────
-
-    def get_status(self, source_id: str) -> Dict[str, Any]:
-        """
-        Return the ingestion status of a source.
-
-        Returns:
-            {
-                "source_id": str,
-                "stages":    [{"stage", "completed_at", "meta"}, ...],
-                "complete":  bool,   # True when all PIPELINE_STAGES done
-                "error":     dict | None,
-            }
-        """
-        node = self._nodes.get(source_id)
-        if not node:
-            return {"source_id": source_id, "stages": [], "complete": False, "error": None}
-
-        completed = {s["stage"] for s in node["stages"]}
-        return {
-            **node,
-            "complete": all(s in completed for s in PIPELINE_STAGES),
-        }
-
-    def get_all_statuses(self) -> List[Dict[str, Any]]:
-        """Return status dicts for every registered source."""
-        return [self.get_status(sid) for sid in self._nodes]
-
-    def is_complete(self, source_id: str) -> bool:
-        """True if every pipeline stage has been completed."""
-        return self.get_status(source_id)["complete"]
-
-    def completed_stages(self, source_id: str) -> List[str]:
-        """List of stage names that have been marked complete."""
-        node = self._nodes.get(source_id)
-        if not node:
-            return []
-        return [s["stage"] for s in node["stages"]]
-
-    def remove_source(self, source_id: str) -> None:
-        """Remove a source from the lineage graph."""
-        self._nodes.pop(source_id, None)
-
-    def clear(self) -> None:
-        """Reset the entire graph."""
-        self._nodes.clear()
-
-    def __repr__(self) -> str:
-        return f"IngestionGraph(sources={len(self._nodes)})"
+# Compiled app — import this anywhere in the codebase
+ingestion_app = build_ingestion_graph().compile()
