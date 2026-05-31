@@ -92,12 +92,14 @@ def embed_and_index(state: dict) -> dict:
     chunks = _dedup(chunks)
     for c in chunks:
         c.metadata["chunk_total"] = len(chunks)
-
     store_path = os.path.join(VECTOR_STORE_DIR, source_id)
     os.makedirs(store_path, exist_ok=True)
 
-    embeddings_model  = _get_embeddings()
-    logger.info("[embed_and_index] Embedding %d chunks (provider=%s)", len(chunks), EMBEDDING_PROVIDER)
+    embedding_model_name = state.get("embedding_model")
+    from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
+    embeddings_model = EmbeddingRegistry.get(embedding_model_name)
+    resolved_model_name = getattr(embeddings_model, "model_name", getattr(embeddings_model, "model", "unknown"))
+    logger.info("[embed_and_index] Embedding %d chunks (model=%s)", len(chunks), resolved_model_name)
 
     # Resolve dimension of embedding model
     sample_emb = embeddings_model.embed_query("test")
@@ -135,7 +137,11 @@ def embed_and_index(state: dict) -> dict:
             source_id=source_id,
             name=filename,
             source_type=state.get("source_type", "pdf"),
-            metadata={"total_pages": state.get("total_pages", 1), "num_chunks": len(chunks)}
+            metadata={
+                "total_pages": state.get("total_pages", 1),
+                "num_chunks": len(chunks),
+                "embedding_model": embedding_model_name or "all-MiniLM-L6-v2"
+            }
         )
         logger.info("[embed_and_index] Source '%s' registered in SQLite database as '%s'", source_id, filename)
     except Exception as db_exc:

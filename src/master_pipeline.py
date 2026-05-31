@@ -200,7 +200,7 @@ class MiniNotebookLM:
         strategy:   Optional[str]       = None,
         source_ids: Optional[List[str]] = None,
         mode:       Optional[str]       = None,
-    ) -> tuple[List[Document], str] | tuple[List[Document], str, Optional[dict]]:
+    ) -> tuple[List[Document], str, Optional[dict], dict]:
         k       = k       if k       is not None else self.config.retrieval_k
         rewrite = rewrite if rewrite is not None else self.config.retrieval_rewrite
 
@@ -218,7 +218,10 @@ class MiniNotebookLM:
 
         if not self._retrieval_cls:
             logger.warning("[retrieve] No retriever — returning empty docs.")
-            return [], ret_query, None
+            return [], ret_query, None, {
+                "dense_count": 0, "sparse_count": 0, "history_count": 0,
+                "rrf_fused": 0, "reranked": 0, "compressed": 0, "cached_hit": False
+            }
 
         # Determine target source IDs to query
         target_sids = source_ids
@@ -235,7 +238,10 @@ class MiniNotebookLM:
 
         if not target_sids:
             logger.warning("[retrieve] No active sources found to query.")
-            return [], ret_query, None
+            return [], ret_query, None, {
+                "dense_count": 0, "sparse_count": 0, "history_count": 0,
+                "rrf_fused": 0, "reranked": 0, "compressed": 0, "cached_hit": False
+            }
 
         # Resolve source names from SQLite
         source_names = {}
@@ -260,7 +266,16 @@ class MiniNotebookLM:
                 except Exception as e:
                     logger.warning("[retrieve] Semantic cache check failed: %s", e)
             if cache_hit is not None:
-                return [], ret_query, cache_hit
+                retrieval_stats = {
+                    "dense_count": 0,
+                    "sparse_count": 0,
+                    "history_count": 0,
+                    "rrf_fused": 0,
+                    "reranked": 0,
+                    "compressed": 0,
+                    "cached_hit": True,
+                }
+                return [], ret_query, cache_hit, retrieval_stats
 
             # Run parallel Dense similarity search + Sparse BM25 search + History turn retrieval
             from concurrent.futures import ThreadPoolExecutor
@@ -384,7 +399,17 @@ class MiniNotebookLM:
                 "[retrieve] Chat mode parallel retrieval: dense=%d sparse=%d history=%d fused=%d reranked=%d compressed=%d",
                 len(all_dense), len(all_sparse), len(history_docs), len(fused_docs), len(reranked_docs), len(compressed_docs)
             )
-            return compressed_docs, ret_query, None
+
+            retrieval_stats = {
+                "dense_count": len(all_dense),
+                "sparse_count": len(all_sparse),
+                "history_count": len(history_docs),
+                "rrf_fused": len(fused_docs),
+                "reranked": len(reranked_docs),
+                "compressed": len(compressed_docs),
+                "cached_hit": False,
+            }
+            return compressed_docs, ret_query, None, retrieval_stats
 
         # Retrieve documents from each target source (reuse cached retrievers) - Non-chat mode
         all_docs = []
@@ -421,7 +446,17 @@ class MiniNotebookLM:
             "[retrieve] query_len=%d target_sids=%s → %d docs",
             len(query), target_sids, len(unique_docs[:k]),
         )
-        return unique_docs[:k], ret_query, None
+
+        retrieval_stats = {
+            "dense_count": len(all_docs),
+            "sparse_count": 0,
+            "history_count": 0,
+            "rrf_fused": 0,
+            "reranked": 0,
+            "compressed": 0,
+            "cached_hit": False,
+        }
+        return unique_docs[:k], ret_query, None, retrieval_stats
 
 
     # ── Generation ──────────────────────────────────────────────────────────────────
@@ -455,16 +490,22 @@ class MiniNotebookLM:
         # ── 1. Retrieve ───────────────────────────────────────────────────────────────
         ret_query = safe_query
         cache_hit = None
+        retrieval_stats = {}
         if documents is None:
             _sids = source_ids if source_ids else None
-            ret_res = self.retrieve(
+            documents, ret_query, cache_hit, retrieval_stats = self.retrieve(
                 safe_query, k=k, rewrite=rewrite, source_ids=_sids, mode=mode
             )
-            if len(ret_res) == 3:
-                documents, ret_query, cache_hit = ret_res
-            else:
-                documents, ret_query = ret_res
-                cache_hit = None
+        else:
+            retrieval_stats = {
+                "dense_count": len(documents),
+                "sparse_count": 0,
+                "history_count": 0,
+                "rrf_fused": 0,
+                "reranked": 0,
+                "compressed": 0,
+                "cached_hit": False,
+            }
 
         # Handle Semantic Cache Hit:
         if cache_hit is not None:
@@ -476,7 +517,7 @@ class MiniNotebookLM:
             )
 
         # Handle No Chunks Fallback:
-        if mode == "chat" and not documents:
+        if not documents:
             return GenerationResult(
                 answer="Not in my notes, bro.",
                 retrieval_query=ret_query,
@@ -578,6 +619,241 @@ class MiniNotebookLM:
             quiz_cards=quiz_cards_res,
             summary_bullets=summary_bullets_res,
         )
+
+    def ask_stream(
+        self,
+        query:         str,
+        *,
+        mode:          Optional[str]           = None,
+        persona:       Optional[PersonaConfig] = None,
+        documents:     Optional[List[Document]] = None,
+        k:             Optional[int]            = None,
+        rewrite:       Optional[bool]           = None,
+        evaluate:      Optional[bool]           = None,
+        ground_truth:  Optional[str]            = None,
+        clear_history: bool                    = False,
+        source_ids:    Optional[List[str]]      = None,
+        do_expand:     bool                    = True,
+    ):
+        """
+        Stream the generation token by token.
+        Yields events matching the event format for SSE streaming.
+        """
+        mode     = mode     or self.config.default_mode
+        evaluate = evaluate if evaluate is not None else self.config.auto_evaluate
+
+        if clear_history:
+            self._history.clear()
+
+        safe_query = sanitize_query(query)
+
+        # ── 1. Retrieve ───────────────────────────────────────────────────────────────
+        ret_query = safe_query
+        cache_hit = None
+        retrieval_stats = {}
+        if documents is None:
+            _sids = source_ids if source_ids else None
+            documents, ret_query, cache_hit, retrieval_stats = self.retrieve(
+                safe_query, k=k, rewrite=rewrite, source_ids=_sids, mode=mode
+            )
+        else:
+            retrieval_stats = {
+                "dense_count": len(documents),
+                "sparse_count": 0,
+                "history_count": 0,
+                "rrf_fused": 0,
+                "reranked": 0,
+                "compressed": 0,
+                "cached_hit": False,
+            }
+
+        # Handle Semantic Cache Hit:
+        if cache_hit is not None:
+            answer = f"[Cached history to similar query (similarity score: {cache_hit['similarity']:.2f})]\n{cache_hit['answer']}"
+            
+            # Yield cached answer token by token
+            for word in answer.split(" "):
+                if word:
+                    yield {"type": "token", "content": word + " "}
+            
+            meta = {
+                "type": "metadata",
+                "citations": [],
+                "sources_used": [],
+                "follow_ups": [],
+                "sub_queries": [],
+                "quiz_cards": [],
+                "summary_bullets": [],
+                "learning_path": [],
+                "pipeline_mode": mode,
+                "ttft_ms": 0,
+                "total_time_ms": 0,
+                "retrieval_stats": retrieval_stats,
+                "chunk_strategy": "cache",
+                "model_name": self.config.llm_model,
+            }
+            yield meta
+            yield {"type": "done"}
+            return
+
+        # Handle No Chunks Fallback:
+        if not documents:
+            answer = "Not in my notes, bro."
+            for word in answer.split(" "):
+                if word:
+                    yield {"type": "token", "content": word + " "}
+            meta = {
+                "type": "metadata",
+                "citations": [],
+                "sources_used": [],
+                "follow_ups": [],
+                "sub_queries": [],
+                "quiz_cards": [],
+                "summary_bullets": [],
+                "learning_path": [],
+                "pipeline_mode": mode,
+                "ttft_ms": 0,
+                "total_time_ms": 0,
+                "retrieval_stats": retrieval_stats,
+                "chunk_strategy": "none",
+                "model_name": self.config.llm_model,
+            }
+            yield meta
+            yield {"type": "done"}
+            return
+
+        # ── 2. Build prompt ─────────────────────────────────────────────────────────
+        history_str = self._format_history()
+        from src.generation.prompt_builder import PromptBuilder
+        if mode == "study":
+            prompt = PromptBuilder.build_study_prompt(safe_query, documents, history_str)
+        elif mode == "research":
+            prompt = PromptBuilder.build_research_prompt(safe_query, documents, history_str)
+        else:
+            prompt = PromptBuilder.build_chat_prompt(safe_query, documents, history_str, persona or PersonaConfig())
+
+        # ── 3. Call LLM with streaming ──────────────────────────────────────────────
+        import time
+        from src.generation.llm_registry import LLMRegistry
+        from langchain_core.messages import HumanMessage
+
+        start_time = time.time()
+        ttft_ms = 0
+        tokens = []
+
+        try:
+            llm = LLMRegistry.get(
+                provider=self.config.llm_provider,
+                model=self.config.llm_model,
+                temperature=self.config.llm_temperature,
+                max_tokens=self.config.llm_max_tokens,
+            )
+
+            for chunk in llm.stream([HumanMessage(content=prompt)]):
+                content = chunk.content or ""
+                if content:
+                    if ttft_ms == 0:
+                        ttft_ms = int((time.time() - start_time) * 1000)
+                    tokens.append(content)
+                    yield {"type": "token", "content": content}
+
+            total_time_ms = int((time.time() - start_time) * 1000)
+            raw_output = "".join(tokens)
+
+            # ── 4. Parse & Assemble Response ──────────────────────────────────────────
+            from src.generation.response_parser import ResponseParser
+            from src.generation.response_generator import ResponseGenerator
+
+            # Extract/parse followups
+            parsed = ResponseParser.parse(raw_output)
+
+            # Build chunk details for ResponseGenerator
+            chunks = []
+            for i, doc in enumerate(documents, 1):
+                if hasattr(doc, "page_content"):
+                    content = doc.page_content
+                    meta    = doc.metadata or {}
+                else:
+                    content = doc.get("content", "")
+                    meta    = {k: v for k, v in doc.items() if k != "content"}
+                chunks.append({"citation_label": f"S{i}", "content": content, **meta})
+
+            generator = ResponseGenerator(chunks)
+            assembled = generator.assemble(
+                raw_llm_output=raw_output,
+                query=safe_query,
+            )
+
+            # Get final values
+            answer = assembled.get("answer", raw_output)
+            citations = assembled.get("citations", [])
+            follow_ups = parsed.follow_ups or assembled.get("follow_ups", [])
+            sources_used = assembled.get("sources_used", [])
+            chunks_used = assembled.get("chunks_used", [])
+
+            # ── 5. Update history ───────────────────────────────────────────────────
+            self._history.append({"role": "user",      "content": safe_query})
+            self._history.append({"role": "assistant", "content": answer})
+            self._trim_history()
+
+            if self.history_store is not None:
+                try:
+                    self.history_store.add_turn("default", safe_query, answer)
+                except Exception as e:
+                    logger.warning("[MiniNotebookLM] Failed to save turn to RAGHistoryStore: %s", e)
+
+            # ── 6. Mode-specific study/research materials ───────────────────────────
+            sub_queries_res = []
+            quiz_cards_res = []
+            summary_bullets_res = []
+            if mode == "study":
+                try:
+                    from src.retrieval.study_mode import StudyMode
+                    sm = StudyMode()
+                    quiz_cards_res = sm.flashcards(documents)
+                    summary_bullets_res = sm.summary_bullets(documents)
+                except Exception as exc:
+                    logger.warning("[ask] Study mode helper failed: %s", exc)
+            elif mode in ("research", "deep_research"):
+                try:
+                    import re
+                    llm_sync = LLMRegistry.get(temperature=0.5)
+                    sub_q_prompt = f"Given the user query: '{query}', suggest 3 specific, focused sub-queries to investigate in the context of the document. Return ONLY the 3 queries, one per line, starting with a bullet point (- or *)."
+                    res = llm_sync.invoke(sub_q_prompt)
+                    res_content = res.content or ""
+                    lines = [re.sub(r'^\s*[-•*\d.)]+\s*', '', line).strip() for line in res_content.splitlines() if line.strip()]
+                    sub_queries_res = [l for l in lines if l][:3]
+                except Exception as exc:
+                    logger.warning("[ask] Sub-queries generation failed: %s", exc)
+
+            # ── 7. Yield Metadata ───────────────────────────────────────────────────
+            chunk_strategy = "unknown"
+            if documents:
+                chunk_strategy = documents[0].metadata.get("chunking_strategy", "unknown")
+
+            meta = {
+                "type": "metadata",
+                "citations": citations,
+                "sources_used": sources_used,
+                "follow_ups": follow_ups,
+                "sub_queries": sub_queries_res,
+                "quiz_cards": quiz_cards_res,
+                "summary_bullets": summary_bullets_res,
+                "learning_path": [],
+                "pipeline_mode": mode,
+                "ttft_ms": ttft_ms,
+                "total_time_ms": total_time_ms,
+                "retrieval_stats": retrieval_stats,
+                "chunk_strategy": chunk_strategy,
+                "model_name": self.config.llm_model,
+                "chunks_used": chunks_used,
+            }
+            yield meta
+            yield {"type": "done"}
+
+        except Exception as exc:
+            logger.exception("[ask_stream] Streaming generation failed: %s", exc)
+            yield {"type": "error", "detail": str(exc)}
 
     # ── Convenience aliases ────────────────────────────────────────────────────────────────
 

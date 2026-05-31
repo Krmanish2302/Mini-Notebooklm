@@ -96,12 +96,26 @@ class HybridRetriever:
         self.dense_retriever = None
         self.bm25_retriever = None
 
-
     def _build(self, top_k: int) -> EnsembleRetriever:
         from langchain_community.vectorstores import FAISS
         from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
 
-        embeddings = EmbeddingRegistry.get()
+        # Extract source_id from vectorstore_path
+        import os
+        source_id = os.path.basename(self.vectorstore_path)
+        
+        # Query database to check embedding model used
+        embedding_model = None
+        try:
+            from src.storage.sqlite_manager import SQLiteManager
+            db = SQLiteManager()
+            source = db.get_source(source_id)
+            if source and "metadata" in source:
+                embedding_model = source["metadata"].get("embedding_model")
+        except Exception as e:
+            logger.warning("[HybridRetriever] Could not fetch embedding model for source %s: %s", source_id, e)
+
+        embeddings = EmbeddingRegistry.get(embedding_model)
 
         # ── Load FAISS once and share across dense + BM25 ──────────────
         vectorstore = FAISS.load_local(

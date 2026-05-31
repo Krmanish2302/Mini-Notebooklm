@@ -49,13 +49,13 @@ _DEFAULT_SEARCH_DEPTH = "advanced"   # "basic" | "advanced"
 
 class WebSearchAgent:
     """
-    Web search + content fetcher backed by Tavily via LangChain.
+    Web search + content fetcher backed by DuckDuckGo (no API keys needed).
 
     Parameters
     ----------
-    api_key         : Tavily API key (falls back to TAVILY_API_KEY env var)
+    api_key         : Unused. Kept for backward compatibility.
     max_results     : max search results to return  (default 10)
-    search_depth    : "basic" or "advanced"         (default "advanced")
+    search_depth    : Unused. Kept for backward compatibility.
     include_domains : allowlist of domains
     exclude_domains : blocklist of domains
     """
@@ -68,38 +68,20 @@ class WebSearchAgent:
         include_domains: Optional[List[str]] = None,
         exclude_domains: Optional[List[str]] = None,
     ) -> None:
-        key = api_key or os.environ.get("TAVILY_API_KEY", "")
-        if not key:
-            raise ValueError(
-                "Tavily API key not found. "
-                "Set the TAVILY_API_KEY environment variable or pass api_key='tvly-...'."
-            )
-        os.environ.setdefault("TAVILY_API_KEY", key)   # TavilySearchResults reads from env
-
         self.max_results     = max_results
         self.search_depth    = search_depth
         self.include_domains = include_domains or []
         self.exclude_domains = exclude_domains or []
-
-        # LangChain Tavily tool — handles auth, retries, response normalisation
-        self._tavily = TavilySearchResults(
-            max_results=max_results,
-            search_depth=search_depth,
-            include_domains=include_domains or [],
-            exclude_domains=exclude_domains or [],
-            include_answer=False,
-            include_raw_content=False,
-        )
         logger.info(
-            "[WebSearchAgent] Ready — depth=%s max=%d",
-            search_depth, max_results,
+            "[WebSearchAgent] Ready with DuckDuckGo fallback, max=%d",
+            max_results,
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def search(self, query: str) -> List[Dict[str, Any]]:
         """
-        Search the web and return results normalised for the UI.
+        Search the web using DuckDuckGo and return results normalised for the UI.
 
         Returns an empty list (never raises) on error so the UI degrades
         gracefully.
@@ -109,12 +91,12 @@ class WebSearchAgent:
         if not query.strip():
             return []
         try:
-            # TavilySearchResults.invoke() returns List[dict] with
-            # keys: url, content, title, score
-            raw: List[Dict] = self._tavily.invoke({"query": query})
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                raw = list(ddgs.text(query, max_results=self.max_results))
             return self._format_results(raw)
         except Exception as exc:
-            logger.warning("[WebSearchAgent] Search failed: %s", exc)
+            logger.warning("[WebSearchAgent] DuckDuckGo search failed: %s", exc)
             return [{"error": str(exc)}]
 
     def fetch_content(self, url: str) -> str:
@@ -171,35 +153,36 @@ class WebSearchAgent:
     # ── LangChain tool accessor ───────────────────────────────────────────────
 
     @property
-    def lc_tool(self) -> TavilySearchResults:
-        """
-        The underlying LangChain TavilySearchResults tool.
-        Use this when you want to pass the tool directly to
-        create_react_agent() or bind_tools().
-        """
-        return self._tavily
+    def lc_tool(self) -> Any:
+        return None
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    @staticmethod
-    def _format_results(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _format_results(self, raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Normalise TavilySearchResults output into the shape the UI expects.
-        TavilySearchResults returns: {url, content, title, score}
-        Output shape:               {id, title, url, snippet, score,
-                                     source_type, selected}
+        Normalise DDG text search output into the shape the UI expects.
+        DDGS returns: {'title', 'href', 'body'}
+        Output shape: {id, title, url, snippet, score, source_type, selected}
         """
         formatted: List[Dict[str, Any]] = []
         for i, r in enumerate(raw):
-            url   = r.get("url", "")
+            url   = r.get("href") or r.get("url") or ""
             title = r.get("title") or url or f"Result {i + 1}"
             uid   = f"web_{i}_{hashlib.md5(url.encode()).hexdigest()[:8]}"
+            
+            # Apply domain filters if any
+            domain = url.split("//")[-1].split("/")[0]
+            if self.include_domains and not any(d in domain for d in self.include_domains):
+                continue
+            if self.exclude_domains and any(d in domain for d in self.exclude_domains):
+                continue
+
             formatted.append({
                 "id":          uid,
                 "title":       title,
                 "url":         url,
-                "snippet":     r.get("content") or r.get("snippet", ""),
-                "score":       round(float(r.get("score", 0.0)), 3),
+                "snippet":     r.get("body") or r.get("content") or r.get("snippet") or "",
+                "score":       round(1.0 - (i * 0.05), 3),
                 "source_type": "website",
                 "selected":    False,
             })

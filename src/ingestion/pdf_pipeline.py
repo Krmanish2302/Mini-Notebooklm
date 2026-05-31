@@ -172,51 +172,179 @@ def _recommend_embedding(avg_tokens: float) -> str:
 # ---------------------------------------------------------------------------
 # Public: analyze_pdf (call before showing UI)
 # ---------------------------------------------------------------------------
-def analyze_pdf(file_path: str, source_id: str) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Public: analyze_pdf (call before showing UI)
+# ---------------------------------------------------------------------------
+def chunk_text_fixed(text: str, chunk_size: int = 500) -> List[str]:
+    chunks = []
+    current_chunk = ''
+    words = text.split()
+    for word in words:
+        if len(current_chunk) + len(word) + 1 <= chunk_size:
+            current_chunk += (word + ' ')
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = word + ' '
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return chunks
+
+
+def simulate_fixed_chunking(pages_metrics: List[Dict[str, Any]], chunk_size: int = 500) -> int:
+    total_chunks = 0
+    for page in pages_metrics:
+        chunks = chunk_text_fixed(page["text"], chunk_size=chunk_size)
+        total_chunks += len(chunks)
+    return total_chunks
+
+
+def simulate_semantic_chunking(pages_metrics: List[Dict[str, Any]], similarity_threshold: float = 0.75, max_tokens: int = 500) -> int:
+    try:
+        import nltk
+        from sklearn.metrics.pairwise import cosine_similarity
+        import numpy as np
+        from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
+        embeddings_model = EmbeddingRegistry.get()
+    except Exception as e:
+        logger.warning("Failed to initialize semantic chunking models for simulation: %s", e)
+        total_sentences = sum(page["page_sentence_count"] for page in pages_metrics)
+        return max(1, int(total_sentences / 4))
+
+    total_chunks = 0
+    for page in pages_metrics:
+        sentences = nltk.sent_tokenize(page["text"])
+        if not sentences:
+            continue
+        try:
+            embeddings = embeddings_model.embed_documents(sentences)
+            if not embeddings or len(embeddings) == 0:
+                continue
+            
+            chunks = []
+            current_chunk = [sentences[0]]
+            current_embedding = embeddings[0]
+
+            for i in range(1, len(sentences)):
+                sim = np.dot(current_embedding, embeddings[i])
+                chunk_token_count = len(" ".join(current_chunk)) // 4
+
+                if sim >= similarity_threshold and chunk_token_count < max_tokens:
+                    current_chunk.append(sentences[i])
+                    current_embedding = np.mean([current_embedding, embeddings[i]], axis=0)
+                else:
+                    chunks.append(" ".join(current_chunk))
+                    current_chunk = [sentences[i]]
+                    current_embedding = embeddings[i]
+
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+            total_chunks += len(chunks)
+        except Exception as exc:
+            logger.warning("Failed during semantic chunk simulation for page: %s", exc)
+            total_chunks += max(1, int(len(sentences) / 4))
+            
+    return total_chunks
+
+
+def simulate_recursive_chunking(pages_metrics: List[Dict[str, Any]], chunk_size: int = 800, chunk_overlap: int = 100) -> int:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_core.documents import Document
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    total_chunks = 0
+    for page in pages_metrics:
+        doc = Document(page_content=page["text"])
+        chunks = splitter.split_documents([doc])
+        total_chunks += len(chunks)
+    return total_chunks
+def analyze_pdf(file_path: str, source_id: str, start_page: int = 1) -> Dict[str, Any]:
     """
-    Extract + sample 20% of pages, compute stats for each strategy.
-    Returns a dict the UI uses to populate the PDF Analysis Panel.
+    Analyzes all active pages starting from start_page for metrics,
+    and runs strategy simulations on a 10-page slice.
+    Returns detailed metrics and strategy comparisons extrapolated.
     """
     from langchain_community.document_loaders import PyMuPDFLoader
 
     docs: List[Document] = PyMuPDFLoader(file_path).load()
     total_pages = len(docs)
-    sample_size = max(1, int(total_pages * ANALYSIS_SAMPLE))
+    
+    start_idx = min(total_pages - 1, max(0, start_page - 1))
+    
+    # 1. Parse metrics for all pages (starting from start_page to the end)
+    pages_metrics = []
+    active_docs = docs[start_idx:]
+    for i, doc in enumerate(active_docs):
+        text = doc.page_content or ""
+        import re
+        raw_paras = re.split(r'\n\s*\n', text)
+        cleaned_paras = []
+        for p in raw_paras:
+            p_clean = re.sub(r'\s*\n\s*', ' ', p).strip()
+            p_clean = re.sub(r' +', ' ', p_clean)
+            if p_clean:
+                cleaned_paras.append(p_clean)
+        
+        cleaned_text_with_paras = "\n\n".join(cleaned_paras)
+        
+        try:
+            import nltk
+            sentences = nltk.sent_tokenize(cleaned_text_with_paras)
+            sentence_count = len(sentences)
+        except Exception:
+            sentence_count = len(cleaned_text_with_paras.split(". "))
 
-    # Stratified sample — evenly spaced
-    step  = max(1, total_pages // sample_size)
-    sample_docs = docs[::step][:sample_size]
+        pages_metrics.append({
+            "page_number": start_idx + i + 1,
+            "page_char_count": len(cleaned_text_with_paras),
+            "page_word_count": len(cleaned_text_with_paras.split()),
+            "page_sentence_count": sentence_count,
+            "page_token_count": int(len(cleaned_text_with_paras) / 4),
+            "text": cleaned_text_with_paras
+        })
 
-    has_headings = any(_detect_headings(d.page_content) for d in sample_docs)
+    # Run simulations on up to a 10-page slice for speed
+    slice_metrics = pages_metrics[:10]
+    analyzed_pages = len(slice_metrics)
+    
+    fixed_chunks_sim = simulate_fixed_chunking(slice_metrics, chunk_size=500)
+    semantic_chunks_sim = simulate_semantic_chunking(slice_metrics, similarity_threshold=0.75, max_tokens=500)
+    recursive_chunks_sim = simulate_recursive_chunking(slice_metrics, chunk_size=800, chunk_overlap=100)
 
-    stats_by_strategy: Dict[str, Dict] = {}
-    for strategy in STRATEGY_DESCRIPTIONS:
-        chunks = _chunks_for_strategy(sample_docs, strategy)
-        stats  = _compute_stats(chunks)
-        # Extrapolate estimated_chunks to full doc
-        if stats and sample_size < total_pages:
-            ratio = total_pages / sample_size
-            stats["estimated_chunks"] = int(stats["estimated_chunks"] * ratio)
-        stats_by_strategy[strategy] = stats
+    # Extrapolate to the active page range
+    active_pages = total_pages - start_idx
+    extrapolation_ratio = active_pages / max(1, analyzed_pages)
 
-    recommended_strategy  = _recommend(stats_by_strategy, has_headings)
-    recommended_embedding = _recommend_embedding(
-        stats_by_strategy.get(recommended_strategy, {}).get("avg_tokens", 150)
-    )
+    estimated_fixed = int(fixed_chunks_sim * extrapolation_ratio)
+    estimated_semantic = int(semantic_chunks_sim * extrapolation_ratio)
+    estimated_recursive = int(recursive_chunks_sim * extrapolation_ratio)
 
-    total_words = sum(len(d.page_content.split()) for d in docs)
-
+    total_words_est = sum(p["page_word_count"] for p in pages_metrics)
+    total_words_extrapolated = total_words_est
     return {
         "source_id":             source_id,
         "file_path":             file_path,
         "total_pages":           total_pages,
-        "total_words_estimated": total_words,
-        "has_headings":          has_headings,
-        "sample_pages":          sample_size,
-        "strategies":            stats_by_strategy,
-        "recommended_strategy":  recommended_strategy,
-        "recommended_embedding": recommended_embedding,
-        "strategy_descriptions": STRATEGY_DESCRIPTIONS,
+        "start_page":            start_page,
+        "active_pages":          active_pages,
+        "analyzed_pages":        analyzed_pages,
+        "total_words_estimated": total_words_extrapolated,
+        "pages_metrics":         pages_metrics,
+        "strategies": {
+            "fixed_size": {
+                "estimated_chunks": estimated_fixed,
+                "label": "Fixed-Size (500 chars)",
+                "description": "Splits text at fixed character counts"
+            },
+            "semantic": {
+                "estimated_chunks": estimated_semantic,
+                "label": "Semantic Similarity (threshold 0.75)",
+                "description": "Splits text based on sentence similarity using local embeddings"
+            },
+            "recursive": {
+                "estimated_chunks": estimated_recursive,
+                "label": "Recursive Character (800 chars)",
+                "description": "Splits using hierarchical separators (paragraphs, sentences)"
+            }
+        }
     }
 
 
@@ -228,15 +356,21 @@ def pdf_extract(state: dict) -> dict:
     from langchain_community.document_loaders import PyMuPDFLoader
     file_path = state["file_path"]
     docs = PyMuPDFLoader(file_path).load()
+    total_pages = len(docs)
+    
+    start_page = int(state.get("start_page", 1))
+    start_idx = min(total_pages - 1, max(0, start_page - 1))
+    docs = docs[start_idx:]
+    
     # tag each page
     for i, doc in enumerate(docs):
         doc.metadata.update({
             "source_id":   state["source_id"],
             "source_type": "pdf",
-            "page_number": i + 1,
+            "page_number": start_idx + i + 1,
         })
-    logger.info("[pdf_extract] %d pages loaded from '%s'", len(docs), file_path)
-    return {"raw_documents": docs, "total_pages": len(docs)}
+    logger.info("[pdf_extract] %d pages loaded from '%s' starting from page %d", len(docs), file_path, start_page)
+    return {"raw_documents": docs, "total_pages": total_pages}
 
 
 @safe_node("pdf_chunk")
@@ -246,7 +380,67 @@ def pdf_chunk(state: dict) -> dict:
     strategy  = state.get("strategy", "paragraph_based")
     source_id = state["source_id"]
 
-    if strategy == "paragraph_based":
+    if strategy == "fixed_size":
+        from langchain_core.documents import Document
+        chunks = []
+        for doc in docs:
+            text = doc.page_content or ""
+            text_chunks = chunk_text_fixed(text, chunk_size=500)
+            for i, chunk_text in enumerate(text_chunks):
+                chunks.append(Document(
+                    page_content=chunk_text,
+                    metadata={**doc.metadata}
+                ))
+
+    elif strategy == "semantic":
+        from langchain_core.documents import Document
+        import nltk
+        from sklearn.metrics.pairwise import cosine_similarity
+        import numpy as np
+        from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
+
+        embeddings_model = EmbeddingRegistry.get()
+        chunks = []
+        for doc in docs:
+            text = doc.page_content or ""
+            sentences = nltk.sent_tokenize(text)
+            if not sentences:
+                continue
+            try:
+                embeddings = embeddings_model.embed_documents(sentences)
+                if not embeddings or len(embeddings) == 0:
+                    continue
+                
+                current_chunk = [sentences[0]]
+                current_embedding = embeddings[0]
+
+                for i in range(1, len(sentences)):
+                    sim = np.dot(current_embedding, embeddings[i])
+                    chunk_token_count = len(" ".join(current_chunk)) // 4
+
+                    if sim >= 0.75 and chunk_token_count < 500:
+                        current_chunk.append(sentences[i])
+                        current_embedding = np.mean([current_embedding, embeddings[i]], axis=0)
+                    else:
+                        chunks.append(Document(
+                            page_content=" ".join(current_chunk),
+                            metadata={**doc.metadata}
+                        ))
+                        current_chunk = [sentences[i]]
+                        current_embedding = embeddings[i]
+
+                if current_chunk:
+                    chunks.append(Document(
+                        page_content=" ".join(current_chunk),
+                        metadata={**doc.metadata}
+                    ))
+            except Exception as exc:
+                logger.warning("Semantic chunking failed: %s, falling back", exc)
+                from langchain_text_splitters import RecursiveCharacterTextSplitter
+                splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=80)
+                chunks.extend(splitter.split_documents([doc]))
+
+    elif strategy == "paragraph_based" or strategy == "paragraph":
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=800, chunk_overlap=80,
@@ -264,7 +458,7 @@ def pdf_chunk(state: dict) -> dict:
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
         chunks = splitter.split_documents(docs)
 
-    elif strategy == "sentence_based":
+    elif strategy == "sentence_based" or strategy == "sentence":
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=300, chunk_overlap=30,
@@ -272,9 +466,7 @@ def pdf_chunk(state: dict) -> dict:
         )
         chunks = splitter.split_documents(docs)
 
-    elif strategy == "chapter_based":
-        from langchain_text_splitters import MarkdownHeaderTextSplitter
-        # Fallback: treat ALL-CAPS lines as section boundaries via recursive
+    elif strategy == "chapter_based" or strategy == "chapter":
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=4000, chunk_overlap=200,
@@ -282,10 +474,10 @@ def pdf_chunk(state: dict) -> dict:
         )
         chunks = splitter.split_documents(docs)
 
-    elif strategy == "page_based":
-        chunks = docs  # one chunk per page
+    elif strategy == "page_based" or strategy == "page":
+        chunks = docs
 
-    else:  # semantic or unknown — default to paragraph
+    else:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=800, chunk_overlap=80,
@@ -337,6 +529,8 @@ def run_pdf_pipeline(
     strategy:      str = "paragraph_based",
     embedding_dim: int = 384,
     source_name:   Optional[str] = None,
+    start_page:    int = 1,
+    embedding_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run the full PDF ingestion pipeline.
@@ -349,6 +543,8 @@ def run_pdf_pipeline(
         "embedding_dim":  embedding_dim,
         "source_type":    "pdf",
         "source_name":    source_name,
+        "start_page":     start_page,
+        "embedding_model": embedding_model,
     }
     result = pdf_app.invoke(init_state)
     if result.get("error"):

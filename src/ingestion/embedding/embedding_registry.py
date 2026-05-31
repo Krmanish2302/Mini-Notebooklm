@@ -12,19 +12,31 @@ class EmbeddingRegistry:
     _instances: Dict[str, object] = {}
 
     @classmethod
-    def get(cls, provider: str = None):
-        provider = provider or os.getenv("EMBEDDING_PROVIDER", "huggingface")
-        if provider in cls._instances:
-            return cls._instances[provider]
+    def get(cls, model_name: str = None):
+        # Default fallback to env or all-MiniLM-L6-v2
+        if not model_name:
+            model_name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+            
+        # Standardize names/aliases
+        if model_name == "huggingface":
+            model_name = "all-MiniLM-L6-v2"
+        elif model_name == "openai":
+            model_name = "text-embedding-3-small"
 
-        if provider == "huggingface":
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-            emb = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        elif provider == "openai":
+        if model_name in cls._instances:
+            return cls._instances[model_name]
+
+        if model_name in {"text-embedding-3-small", "text-embedding-3-large"}:
             from langchain_openai import OpenAIEmbeddings
-            emb = OpenAIEmbeddings(model="text-embedding-3-small")
+            emb = OpenAIEmbeddings(model=model_name)
         else:
-            raise ValueError(f"Unknown embedding provider '{provider}'. Use 'openai' or 'huggingface'.")
+            # Assume it's a HuggingFace model name
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+            emb = HuggingFaceEmbeddings(model_name=model_name)
 
-        cls._instances[provider] = emb
+        cls._instances[model_name] = emb
         return emb
+
+    @classmethod
+    def get_default(cls):
+        return cls.get()

@@ -29,17 +29,17 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 SOURCE_TYPES = {"pdf", "youtube", "text", "image", "website"}
-
-
 def ingest(
-    source_type:   str,
-    source_id:     str,
-    file_path:     Optional[str] = None,
-    content:       Optional[str] = None,   # text paste shortcut
-    analyze_only:  bool = False,           # PDF only: return stats without chunking
-    strategy:      str  = "paragraph_based",
-    embedding_dim: int  = 384,
-    source_name:   Optional[str] = None,
+    source_type:     str,
+    source_id:       str,
+    file_path:       Optional[str] = None,
+    content:         Optional[str] = None,   # text paste shortcut
+    analyze_only:    bool = False,           # PDF only: return stats without chunking
+    strategy:        str  = "paragraph_based",
+    embedding_dim:   int  = 384,
+    source_name:     Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    start_page:      int  = 1,
 ) -> Dict[str, Any]:
     """
     Route to the correct pipeline and run it.
@@ -61,7 +61,7 @@ def ingest(
             raise ValueError("file_path required for PDF ingestion.")
         if analyze_only:
             from src.ingestion.pdf_pipeline import analyze_pdf
-            return analyze_pdf(file_path=file_path, source_id=source_id)
+            return analyze_pdf(file_path=file_path, source_id=source_id, start_page=start_page)
         from src.ingestion.pdf_pipeline import run_pdf_pipeline
         return run_pdf_pipeline(
             file_path=file_path,
@@ -69,6 +69,8 @@ def ingest(
             strategy=strategy,
             embedding_dim=embedding_dim,
             source_name=source_name,
+            start_page=start_page,
+            embedding_model=embedding_model,
         )
 
     # ── YouTube ──────────────────────────────────────────────────────────────
