@@ -10,7 +10,7 @@ import numpy as np
 from typing import List
 from .base_embedder import BaseEmbedder
 
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "huggingface")
 
 
 class TextEmbedder(BaseEmbedder):

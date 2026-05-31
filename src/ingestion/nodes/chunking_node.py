@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE         = int(os.getenv("CHUNK_SIZE",    "1000"))
 CHUNK_OVERLAP      = int(os.getenv("CHUNK_OVERLAP", "200"))
 SEMANTIC_CHUNKING  = os.getenv("SEMANTIC_CHUNKING_ENABLED", "false").lower() == "true"
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "huggingface")
 
 
 def _tag(chunks: List[Document], source_id: str, chunker: str) -> List[Document]:

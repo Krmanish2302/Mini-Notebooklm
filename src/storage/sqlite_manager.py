@@ -183,6 +183,30 @@ class SQLiteManager:
         })
         return Document(page_content=row["content"], metadata=meta)
 
+    def get_chunk_with_source(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve chunk details joined with source details (including source name)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT c.chunk_id, c.source_id, c.content, c.metadata_json, s.name AS source_name
+                FROM chunks c
+                LEFT JOIN sources s ON c.source_id = s.source_id
+                WHERE c.chunk_id = ?
+                """,
+                (chunk_id,),
+            ).fetchone()
+        if not row:
+            return None
+        meta = json.loads(row["metadata_json"] or "{}")
+        return {
+            "chunk_id":    row["chunk_id"],
+            "source_id":   row["source_id"],
+            "source_name": row["source_name"] or row["source_id"],
+            "content":     row["content"],
+            "metadata":    meta,
+        }
+
+
     def get_documents_by_source(self, source_id: str) -> List[Document]:
         """Return all chunks for a source as LangChain Documents."""
         with self._conn() as conn:

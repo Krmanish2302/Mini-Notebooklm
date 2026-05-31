@@ -39,6 +39,7 @@ def ingest(
     analyze_only:  bool = False,           # PDF only: return stats without chunking
     strategy:      str  = "paragraph_based",
     embedding_dim: int  = 384,
+    source_name:   Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Route to the correct pipeline and run it.
@@ -67,6 +68,7 @@ def ingest(
             source_id=source_id,
             strategy=strategy,
             embedding_dim=embedding_dim,
+            source_name=source_name,
         )
 
     # ── YouTube ──────────────────────────────────────────────────────────────
@@ -74,7 +76,7 @@ def ingest(
         if not file_path:
             raise ValueError("file_path (URL) required for YouTube ingestion.")
         from src.ingestion.youtube_pipeline import run_youtube_pipeline
-        return run_youtube_pipeline(url=file_path, source_id=source_id)
+        return run_youtube_pipeline(url=file_path, source_id=source_id, source_name=source_name)
 
     # ── Text / Paste ─────────────────────────────────────────────────────────
     if source_type == "text":
@@ -83,6 +85,7 @@ def ingest(
             source_id=source_id,
             file_path=file_path,
             content=content,
+            source_name=source_name,
         )
 
     # ── Image ─────────────────────────────────────────────────────────────────
@@ -90,11 +93,11 @@ def ingest(
         if not file_path:
             raise ValueError("file_path required for image ingestion.")
         from src.ingestion.image_pipeline import run_image_pipeline
-        return run_image_pipeline(file_path=file_path, source_id=source_id)
+        return run_image_pipeline(file_path=file_path, source_id=source_id, source_name=source_name)
 
     # ── Website ───────────────────────────────────────────────────────────────
     if source_type == "website":
         if not file_path:
             raise ValueError("file_path (URL) required for website ingestion.")
         from src.ingestion.website_pipeline import run_website_pipeline
-        return run_website_pipeline(url=file_path, source_id=source_id)
+        return run_website_pipeline(url=file_path, source_id=source_id, source_name=source_name)

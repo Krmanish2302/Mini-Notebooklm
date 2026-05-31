@@ -10,9 +10,14 @@ What changed vs v2
 """
 from __future__ import annotations
 
-import json
 import os
+os.environ.setdefault("PYTHONUTF8", "1")
+
+import json
 from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import requests
 import streamlit as st
@@ -87,25 +92,25 @@ def _fetch_sources() -> List[dict]:
 def _active_source_ids() -> List[str]:
     return [sid for sid, checked in st.session_state.active_sources.items() if checked]
 
-def _ingest_file(file_obj, source_type, source_id, strategy="paragraph_based"):
+def _ingest_file(file_obj, source_type, source_id, strategy="paragraph_based", source_name=None):
     return requests.post(
         f"{API_URL}/ingest",
         files={"file": (file_obj.name, file_obj.getvalue(), file_obj.type)},
-        data={"source_type": source_type, "source_id": source_id, "chunking_strategy": strategy},
+        data={"source_type": source_type, "source_id": source_id, "chunking_strategy": strategy, "source_name": source_name},
         timeout=180,
     )
 
-def _ingest_url(url, source_type, source_id):
+def _ingest_url(url, source_type, source_id, source_name=None):
     return requests.post(
         f"{API_URL}/ingest",
-        data={"url": url, "source_type": source_type, "source_id": source_id},
+        data={"url": url, "source_type": source_type, "source_id": source_id, "source_name": source_name},
         timeout=180,
     )
 
-def _ingest_text(text, source_id):
+def _ingest_text(text, source_id, source_name=None):
     return requests.post(
         f"{API_URL}/ingest",
-        data={"content": text, "source_type": "text", "source_id": source_id},
+        data={"content": text, "source_type": "text", "source_id": source_id, "source_name": source_name},
         timeout=120,
     )
 
@@ -123,7 +128,7 @@ with st.sidebar:
 
     st.subheader("⚙️ LLM Configuration")
     provider = st.selectbox("Provider", ["groq", "openai", "ollama", "gemini", "anthropic"])
-    model    = st.text_input("Model", value="llama-3.1-70b-versatile")
+    model    = st.text_input("Model", value="llama-3.3-70b-versatile")
     api_key  = st.text_input("API Key", type="password")
     if st.button("💾 Apply Config", use_container_width=True):
         r = _post("/config", json={"provider": provider, "model": model, "api_key": api_key})
@@ -176,13 +181,13 @@ with st.sidebar:
         pdf_file = st.file_uploader("Upload PDF", type=["pdf"], key="pdf_upload")
         if pdf_file:
             pdf_strategy = st.selectbox("Chunking strategy", PDF_STRATEGIES, index=0, key="pdf_strategy")
-            pdf_sid = st.text_input("Source ID (optional)", key="pdf_sid", placeholder="e.g. lecture_notes")
+            pdf_sid = st.text_input("Source ID/Name (optional)", key="pdf_sid", placeholder="e.g. lecture_notes")
             if st.button("⬆️ Ingest PDF", use_container_width=True, key="btn_pdf"):
                 sid = pdf_sid.strip() or pdf_file.name.replace(" ", "_")[:20]
                 with st.status(f"Ingesting {pdf_file.name} …", expanded=True) as status:
                     st.write("Uploading …"); bar = st.progress(20)
                     try:
-                        r = _ingest_file(pdf_file, "pdf", sid, pdf_strategy)
+                        r = _ingest_file(pdf_file, "pdf", sid, pdf_strategy, source_name=pdf_sid.strip() or pdf_file.name)
                         bar.progress(90)
                         if r and r.ok:
                             st.session_state.active_sources[sid] = True
@@ -194,7 +199,7 @@ with st.sidebar:
 
     with tab_yt:
         yt_url = st.text_input("YouTube URL", placeholder="https://youtu.be/...", key="yt_url")
-        yt_sid = st.text_input("Source ID (optional)", key="yt_sid", placeholder="e.g. talk_on_rag")
+        yt_sid = st.text_input("Source ID/Name (optional)", key="yt_sid", placeholder="e.g. talk_on_rag")
         if st.button("⬆️ Ingest YouTube", use_container_width=True, key="btn_yt"):
             if not yt_url.strip():
                 st.warning("Provide a YouTube URL.")
@@ -203,7 +208,7 @@ with st.sidebar:
                 with st.status("Fetching transcript …", expanded=True) as status:
                     bar = st.progress(30)
                     try:
-                        r = _ingest_url(yt_url, "youtube", sid)
+                        r = _ingest_url(yt_url, "youtube", sid, source_name=yt_sid.strip() or yt_url)
                         bar.progress(90)
                         if r and r.ok:
                             st.session_state.active_sources[sid] = True
@@ -215,7 +220,7 @@ with st.sidebar:
 
     with tab_web:
         web_url = st.text_input("Website URL", placeholder="https://example.com", key="web_url")
-        web_sid = st.text_input("Source ID (optional)", key="web_sid", placeholder="e.g. openai_blog")
+        web_sid = st.text_input("Source ID/Name (optional)", key="web_sid", placeholder="e.g. openai_blog")
         if st.button("⬆️ Ingest Website", use_container_width=True, key="btn_web"):
             if not web_url.strip():
                 st.warning("Provide a URL.")
@@ -224,7 +229,7 @@ with st.sidebar:
                 with st.status("Crawling page …", expanded=True) as status:
                     bar = st.progress(30)
                     try:
-                        r = _ingest_url(web_url, "website", sid)
+                        r = _ingest_url(web_url, "website", sid, source_name=web_sid.strip() or web_url)
                         bar.progress(90)
                         if r and r.ok:
                             st.session_state.active_sources[sid] = True
@@ -236,7 +241,7 @@ with st.sidebar:
 
     with tab_txt:
         txt_option = st.radio("Input", ["Upload file", "Paste text"], horizontal=True, key="txt_option")
-        txt_sid = st.text_input("Source ID (optional)", key="txt_sid", placeholder="e.g. notes_ch3")
+        txt_sid = st.text_input("Source ID/Name (optional)", key="txt_sid", placeholder="e.g. notes_ch3")
         if txt_option == "Upload file":
             txt_file = st.file_uploader("Upload .txt / .md / .csv", type=["txt", "md", "csv"], key="txt_upload")
             if txt_file and st.button("⬆️ Ingest File", use_container_width=True, key="btn_txt_file"):
@@ -244,7 +249,7 @@ with st.sidebar:
                 with st.status("Processing …", expanded=True) as status:
                     bar = st.progress(20)
                     try:
-                        r = _ingest_file(txt_file, "text", sid)
+                        r = _ingest_file(txt_file, "text", sid, source_name=txt_sid.strip() or txt_file.name)
                         bar.progress(90)
                         if r and r.ok:
                             st.session_state.active_sources[sid] = True
@@ -263,7 +268,7 @@ with st.sidebar:
                     with st.status("Processing …", expanded=True) as status:
                         bar = st.progress(30)
                         try:
-                            r = _ingest_text(pasted, sid)
+                            r = _ingest_text(pasted, sid, source_name=txt_sid.strip() or f"Pasted Text ({len(pasted)} chars)")
                             bar.progress(90)
                             if r and r.ok:
                                 st.session_state.active_sources[sid] = True
@@ -275,13 +280,13 @@ with st.sidebar:
 
     with tab_img:
         img_file = st.file_uploader("Upload image", type=["png", "jpg", "jpeg"], key="img_upload")
-        img_sid  = st.text_input("Source ID (optional)", key="img_sid", placeholder="e.g. diagram_ch2")
+        img_sid  = st.text_input("Source ID/Name (optional)", key="img_sid", placeholder="e.g. diagram_ch2")
         if img_file and st.button("⬆️ Ingest Image", use_container_width=True, key="btn_img"):
             sid = img_sid.strip() or img_file.name.replace(" ", "_")[:20]
             with st.status("Captioning image …", expanded=True) as status:
                 bar = st.progress(20)
                 try:
-                    r = _ingest_file(img_file, "image", sid)
+                    r = _ingest_file(img_file, "image", sid, source_name=img_sid.strip() or img_file.name)
                     bar.progress(90)
                     if r and r.ok:
                         st.session_state.active_sources[sid] = True

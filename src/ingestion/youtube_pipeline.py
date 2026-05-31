@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from langgraph.graph import END, StateGraph
+from src.ingestion.state import IngestionState
 
 from src.ingestion.nodes.utils import safe_node
 
@@ -74,8 +75,6 @@ def yt_clean(state: dict) -> dict:
         lines = [ln for ln in text.split("\n") if len(ln.split()) >= 5]
         text  = "\n".join(lines)
         wc    = len(text.split())
-        if wc < 10:
-            continue
         total_after += wc
         cleaned.append(Document(page_content=text, metadata=doc.metadata))
 
@@ -127,7 +126,7 @@ def yt_embed(state: dict) -> dict:
 # Graph
 # ---------------------------------------------------------------------------
 def _build_yt_graph() -> StateGraph:
-    g = StateGraph(dict)
+    g = StateGraph(IngestionState)
     g.add_node("yt_fetch", yt_fetch)
     g.add_node("yt_clean", yt_clean)
     g.add_node("yt_chunk", yt_chunk)
@@ -147,11 +146,12 @@ yt_app = _build_yt_graph()
 # ---------------------------------------------------------------------------
 # Public runner
 # ---------------------------------------------------------------------------
-def run_youtube_pipeline(url: str, source_id: str) -> Dict[str, Any]:
+def run_youtube_pipeline(url: str, source_id: str, source_name: Optional[str] = None) -> Dict[str, Any]:
     init_state = {
         "file_path":   url,
         "source_id":   source_id,
         "source_type": "youtube",
+        "source_name": source_name,
     }
     result = yt_app.invoke(init_state)
     if result.get("error"):

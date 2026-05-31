@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional
 
 from langchain_core.documents import Document
 from langgraph.graph import END, StateGraph
+from src.ingestion.state import IngestionState
 
 from src.ingestion.nodes.utils import safe_node
 
@@ -94,8 +95,6 @@ def text_preprocess(state: dict) -> dict:
         # Remove non-UTF-8 safe characters
         t = t.encode("utf-8", errors="ignore").decode("utf-8")
         t = t.strip()
-        if len(t.split()) < 10:
-            continue
         clean.append(Document(
             page_content=t,
             metadata={**doc.metadata, "word_count": len(t.split())},
@@ -138,7 +137,7 @@ def text_embed(state: dict) -> dict:
 # Graph
 # ---------------------------------------------------------------------------
 def _build_text_graph() -> StateGraph:
-    g = StateGraph(dict)
+    g = StateGraph(IngestionState)
     g.add_node("text_extract",    text_extract)
     g.add_node("text_preprocess", text_preprocess)
     g.add_node("text_chunk",      text_chunk)
@@ -162,6 +161,7 @@ def run_text_pipeline(
     source_id:  str,
     file_path:  Optional[str] = None,
     content:    Optional[str] = None,
+    source_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Ingest a text file (.txt/.md/.docx) or raw pasted content.
@@ -175,6 +175,7 @@ def run_text_pipeline(
         "source_type": "text",
         "file_path":   file_path,
         "content":     content,
+        "source_name": source_name,
     }
     result = text_app.invoke(init_state)
     if result.get("error"):

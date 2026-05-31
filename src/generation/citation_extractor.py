@@ -28,7 +28,7 @@ class CitationExtractor:
         ))
         results = []
         for label in labels:
-            chunk = self._label_map.get(label, {})
+            chunk = self._label_map.get(f"S{label}", {})
             if hasattr(chunk, "page_content"):
                 content = chunk.page_content
                 meta    = chunk.metadata or {}
@@ -38,9 +38,10 @@ class CitationExtractor:
             results.append({
                 "label":       f"[S{label}]",
                 "source_id":   meta.get("source_id", ""),
-                "source_name": meta.get("source", meta.get("source_name", "")),
-                "page":        meta.get("page", ""),
+                "source_name": meta.get("source", meta.get("source_name", meta.get("source_id", ""))),
+                "page":        meta.get("page", meta.get("page_number", "")),
                 "snippet":     content[:200],
+                "content":     content,
             })
         return results
 

@@ -17,6 +17,7 @@ Usage:
     chain = retrieval_chain | llm | make_eval_step(query="...")
 """
 from .ragas_evaluator import RAGASEvaluator, RAGASResult   # noqa: F401
+RagasEvaluator = RAGASEvaluator
 from .ragas_bridge    import (                              # noqa: F401
     attach_ragas,
     get_default_evaluator,
@@ -26,6 +27,7 @@ from .ragas_bridge    import (                              # noqa: F401
 
 __all__ = [
     "RAGASEvaluator",
+    "RagasEvaluator",
     "RAGASResult",
     "attach_ragas",
     "get_default_evaluator",

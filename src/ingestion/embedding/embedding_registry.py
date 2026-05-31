@@ -13,7 +13,7 @@ class EmbeddingRegistry:
 
     @classmethod
     def get(cls, provider: str = None):
-        provider = provider or os.getenv("EMBEDDING_PROVIDER", "openai")
+        provider = provider or os.getenv("EMBEDDING_PROVIDER", "huggingface")
         if provider in cls._instances:
             return cls._instances[provider]
 

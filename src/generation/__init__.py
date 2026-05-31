@@ -27,6 +27,7 @@ def generate(
     history:   str  = "",
     persona:   "PersonaConfig | None" = None,
     stream:    bool = False,
+    **kwargs,
 ) -> dict:
     """
     One-line entry point.

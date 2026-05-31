@@ -69,3 +69,10 @@ tmp/
 temp/
 *.tmp
 *.bak
+data/vectorstores/web_medium.com_data-/index.faiss
+data/vectorstores/web_medium.com_data-/index.pkl
+data/vectorstores/web_medium.com_data-/docstore/1c4ed293-29b4-4c1e-a0bf-8ee4a2d4b920
+data/vectorstores/web_medium.com_data-/docstore/03073285-4f27-4b18-8c51-e2fcad60c7ef
+data/vectorstores/web_medium.com_data-/docstore/ea327352-50ba-44ce-8a8d-c0b4a36062f3
+Mini_NotebookLM_PRD.md
+.gitignore

@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from langchain_core.documents import Document
 from langgraph.graph import END, StateGraph
+from src.ingestion.state import IngestionState
 
 from src.ingestion.nodes.utils import safe_node
 
@@ -145,7 +146,7 @@ def image_embed(state: dict) -> dict:
 # Graph
 # ---------------------------------------------------------------------------
 def _build_image_graph() -> StateGraph:
-    g = StateGraph(dict)
+    g = StateGraph(IngestionState)
     g.add_node("image_validate", image_validate)
     g.add_node("image_caption",  image_caption)
     g.add_node("image_chunk",    image_chunk)
@@ -165,11 +166,12 @@ image_app = _build_image_graph()
 # ---------------------------------------------------------------------------
 # Public runner
 # ---------------------------------------------------------------------------
-def run_image_pipeline(file_path: str, source_id: str) -> Dict[str, Any]:
+def run_image_pipeline(file_path: str, source_id: str, source_name: Optional[str] = None) -> Dict[str, Any]:
     init_state = {
         "file_path":   file_path,
         "source_id":   source_id,
         "source_type": "image",
+        "source_name": source_name,
     }
     result = image_app.invoke(init_state)
     if result.get("error"):

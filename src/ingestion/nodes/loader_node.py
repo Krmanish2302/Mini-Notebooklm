@@ -47,7 +47,8 @@ def _load_text(path: str) -> List[Document]:
 
 def _load_website(url: str) -> List[Document]:
     from langchain_community.document_loaders import WebBaseLoader
-    return WebBaseLoader(url).load()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    return WebBaseLoader(url, requests_kwargs={"headers": headers}).load()
 
 
 def _load_youtube(url: str) -> List[Document]:

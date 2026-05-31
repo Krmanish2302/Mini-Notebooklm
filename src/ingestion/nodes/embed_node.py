@@ -24,7 +24,7 @@ from .utils import safe_node
 logger = logging.getLogger(__name__)
 
 VECTOR_STORE_DIR   = os.getenv("VECTOR_STORE_DIR",   "data/vectorstores")
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "huggingface")
 
 
 def _get_embeddings():
@@ -96,14 +96,49 @@ def embed_and_index(state: dict) -> dict:
     store_path = os.path.join(VECTOR_STORE_DIR, source_id)
     os.makedirs(store_path, exist_ok=True)
 
-    embeddings  = _get_embeddings()
+    embeddings_model  = _get_embeddings()
     logger.info("[embed_and_index] Embedding %d chunks (provider=%s)", len(chunks), EMBEDDING_PROVIDER)
 
-    vectorstore = FAISS.from_documents(chunks, embeddings)
+    # Resolve dimension of embedding model
+    sample_emb = embeddings_model.embed_query("test")
+    dim = len(sample_emb)
+
+    import faiss
+    from langchain_community.docstore.in_memory import InMemoryDocstore
+
+    # Create HNSW flat index with Inner Product (Cosine similarity) metric
+    hnsw_index = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_INNER_PRODUCT)
+    hnsw_index.hnsw.efConstruction = 64
+    hnsw_index.hnsw.efSearch = 16
+
+    vectorstore = FAISS(
+        embedding_function=embeddings_model,
+        index=hnsw_index,
+        docstore=InMemoryDocstore(),
+        index_to_docstore_id={},
+    )
+    vectorstore.add_documents(chunks)
     vectorstore.save_local(store_path)
-    logger.info("[embed_and_index] FAISS saved → '%s'", store_path)
+    logger.info("[embed_and_index] FAISS (HNSW) saved → '%s'", store_path)
 
     build_parent_retriever(chunks=chunks, vectorstore_path=store_path)
     logger.info("[embed_and_index] ParentDocumentRetriever saved → '%s/docstore/'", store_path)
+
+    # Register the source in the SQLite database
+    try:
+        from src.storage.sqlite_manager import SQLiteManager
+        db = SQLiteManager()
+        filename = state.get("source_name") or state.get("file_path", source_id)
+        if filename and not state.get("source_name"):
+            filename = os.path.basename(filename)
+        db.save_source(
+            source_id=source_id,
+            name=filename,
+            source_type=state.get("source_type", "pdf"),
+            metadata={"total_pages": state.get("total_pages", 1), "num_chunks": len(chunks)}
+        )
+        logger.info("[embed_and_index] Source '%s' registered in SQLite database as '%s'", source_id, filename)
+    except Exception as db_exc:
+        logger.warning("[embed_and_index] Failed to register source in SQLite: %s", db_exc)
 
     return {"vectorstore_path": store_path, "num_chunks": len(chunks)}

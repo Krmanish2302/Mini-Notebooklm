@@ -69,11 +69,18 @@ class IngestionPipeline:
         if source_type:
             # Delegate entirely to the typed router — no detection needed
             from src.ingestion.ingestion_router import ingest as router_ingest
+            import os
+            is_file = False
+            try:
+                is_file = os.path.exists(source)
+            except Exception:
+                pass
+
             return router_ingest(
                 source_type   = source_type,
                 source_id     = sid,
-                file_path     = source if source_type != "text" else None,
-                content       = source if source_type == "text" else None,
+                file_path     = source if (source_type != "text" or is_file) else None,
+                content       = source if (source_type == "text" and not is_file) else None,
                 strategy      = kwargs.get("strategy", "paragraph_based"),
                 embedding_dim = kwargs.get("embedding_dim", 384),
             )

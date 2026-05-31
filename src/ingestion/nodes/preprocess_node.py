@@ -43,8 +43,7 @@ def preprocess(state: dict) -> dict:
     for doc in raw:
         content    = _clean(doc.page_content)
         word_count = len(content.split())
-        if word_count < MIN_WORDS:
-            continue
+        # Keep all pages, even if word_count is small or zero
         clean.append(Document(
             page_content=content,
             metadata={**doc.metadata, "word_count": word_count},

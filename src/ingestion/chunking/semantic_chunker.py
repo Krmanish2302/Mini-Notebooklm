@@ -17,7 +17,7 @@ class SemanticChunker(BaseChunker):
         self,
         breakpoint_threshold_type:   str = "percentile",
         breakpoint_threshold_amount: int = 90,
-        embedding_provider:          str = os.getenv("EMBEDDING_PROVIDER", "openai"),
+        embedding_provider:          str = os.getenv("EMBEDDING_PROVIDER", "huggingface"),
     ):
         self.threshold_type   = breakpoint_threshold_type
         self.threshold_amount = breakpoint_threshold_amount

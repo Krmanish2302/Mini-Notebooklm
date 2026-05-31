@@ -57,13 +57,19 @@ class ResponseGenerator:
             c for c in self.context_chunks
             if c.get("citation_label", "") in used_labels
         ]
+
+        # Strip inline citation markers from final answer text
+        clean_answer = _CITE_PATTERN.sub("", answer)
+        clean_answer = re.sub(r"\s+([.,!?;:])", r"\1", clean_answer)
+        clean_answer = re.sub(r" +", " ", clean_answer).strip()
+
         return {
-            "answer":          answer.strip(),
+            "answer":          clean_answer,
             "citations":       citations,
             "follow_ups":      follow_ups,
             "sources_used":    used_labels,
             "chunks_used":     chunks_used,
-            "tokens_estimate": self._token_estimate(answer),
+            "tokens_estimate": self._token_estimate(clean_answer),
         }
 
     @staticmethod
@@ -103,14 +109,16 @@ class ResponseGenerator:
                 citations.append({
                     "label":           lbl,
                     "source_id":       chunk.get("source_id", ""),
-                    "source_name":     chunk.get("source", chunk.get("source_name", "")),
+                    "source_name":     chunk.get("source_name", chunk.get("source", chunk.get("source_id", ""))),
+                    "page":            chunk.get("page", chunk.get("page_number", "")),
                     "content_snippet": chunk.get("content", "")[:200],
+                    "content":         chunk.get("content", ""),
                     "score":           chunk.get("rrf_score", 0.0),
                 })
             else:
                 citations.append({
-                    "label": lbl, "source_id": "", "source_name": "",
-                    "content_snippet": "", "score": 0.0,
+                    "label": lbl, "source_id": "", "source_name": "", "page": "",
+                    "content_snippet": "", "content": "", "score": 0.0,
                 })
         return citations
 

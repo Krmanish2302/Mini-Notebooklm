@@ -10,10 +10,12 @@ Fix pass v1.4.3
 """
 from __future__ import annotations
 
+import os
+os.environ.setdefault("PYTHONUTF8", "1")
+
 import asyncio
 import json
 import logging
-import os
 import re
 import tempfile
 import uuid
@@ -21,6 +23,9 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Deque, List, Optional
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -77,7 +82,8 @@ def _fetch_url_content(url: str) -> str:
     """Fetch plain text from a URL using LangChain WebBaseLoader."""
     try:
         from langchain_community.document_loaders import WebBaseLoader
-        docs = WebBaseLoader(url).load()
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        docs = WebBaseLoader(url, requests_kwargs={"headers": headers}).load()
         return "\n\n".join(d.page_content for d in docs)
     except Exception as exc:
         logger.warning("[_fetch_url_content] Failed to fetch %s: %s", url, exc)
@@ -123,7 +129,7 @@ app.add_middleware(
 
 class ConfigRequest(BaseModel):
     provider: str       = "groq"
-    model:    str       = "llama-3.1-70b-versatile"
+    model:    str       = "llama-3.3-70b-versatile"
     api_key:  SecretStr
 
 class QueryRequest(BaseModel):
@@ -197,18 +203,12 @@ async def _run_ragas(
 
 def _list_sources_safe() -> list:
     try:
-        sm = getattr(pipeline, "_source_manager", None)
-        if sm and hasattr(sm, "list_sources"):
-            return sm.list_sources()
-    except Exception:
-        pass
-    try:
-        ing = getattr(pipeline, "_ingestion", None)
-        if ing and hasattr(ing, "list_sources"):
-            return ing.list_sources()
-    except Exception:
-        pass
-    return []
+        from src.storage.sqlite_manager import SQLiteManager
+        db = SQLiteManager()
+        return db.list_sources()
+    except Exception as exc:
+        logger.warning("[_list_sources_safe] Failed to read sources from SQLite: %s", exc)
+        return []
 
 
 def _ingest_via_router(
@@ -217,6 +217,7 @@ def _ingest_via_router(
     file_path:   Optional[str] = None,
     content:     Optional[str] = None,
     strategy:    str           = "paragraph_based",
+    source_name: Optional[str] = None,
 ) -> dict:
     from src.ingestion.ingestion_router import ingest
     return ingest(
@@ -226,6 +227,7 @@ def _ingest_via_router(
         content       = content,
         strategy      = strategy,
         embedding_dim = 384,
+        source_name   = source_name,
     )
 
 
@@ -374,6 +376,7 @@ async def ingest_source(
     chunking_strategy: Optional[str]        = Form(None),
     embedding_model:   Optional[str]        = Form(None),
     content:           Optional[str]        = Form(None),
+    source_name:       Optional[str]        = Form(None),
 ):
     sid      = (source_id or "").strip() or str(uuid.uuid4())[:8]
     strategy = (chunking_strategy or "paragraph_based").strip()
@@ -416,6 +419,7 @@ async def ingest_source(
                     file_path   = resolved_path,
                     content     = resolved_content,
                     strategy    = strategy,
+                    source_name = source_name or file.filename if file else source_name,
                 ),
             )
             return {"status": "ingested", "source_id": sid, "router": "ingestion_router", "result": result}
@@ -453,21 +457,28 @@ def list_sources():
 @app.delete("/api/sources/{source_id}")
 def delete_source(source_id: str):
     try:
-        sm = getattr(pipeline, "_source_manager", None)
-        if sm and hasattr(sm, "delete_source"):
-            ok = sm.delete_source(source_id)
-            if ok:
-                return {"status": "deleted", "source_id": source_id}
-        ing = getattr(pipeline, "_ingestion", None)
-        if ing and hasattr(ing, "delete_source"):
-            ok = ing.delete_source(source_id)
-            if not ok:
-                raise HTTPException(status_code=404, detail=f"Source not found: {source_id}")
-            return {"status": "deleted", "source_id": source_id}
-        raise HTTPException(status_code=501, detail="No delete-capable ingestion module loaded")
+        from src.storage.sqlite_manager import SQLiteManager
+        import shutil
+        db = SQLiteManager()
+        source = db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail=f"Source not found: {source_id}")
+        
+        # Delete from SQLite database
+        db.delete_chunks_by_source(source_id)
+        db.delete_source(source_id)
+        
+        # Delete FAISS vectorstore files from disk
+        store_path = os.path.join("data/vectorstores", source_id)
+        if os.path.exists(store_path):
+            shutil.rmtree(store_path)
+            logger.info("[delete_source] Deleted FAISS directory: %s", store_path)
+            
+        return {"status": "deleted", "source_id": source_id}
     except HTTPException:
         raise
     except Exception as exc:
+        logger.exception("[delete_source] Failed to delete source: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -546,9 +557,13 @@ async def query_stream(req: QueryRequest):
                     yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
 
             meta = {
-                "citations":    gen_result.citations,
-                "sources_used": gen_result.sources_used,
-                "follow_ups":   gen_result.follow_ups,
+                "citations":       gen_result.citations,
+                "sources_used":    gen_result.sources_used,
+                "follow_ups":      gen_result.follow_ups,
+                "sub_queries":     gen_result.sub_queries,
+                "quiz_cards":      gen_result.quiz_cards,
+                "summary_bullets": gen_result.summary_bullets,
+                "learning_path":   gen_result.learning_path,
             }
             yield f"data: {json.dumps({'type': 'metadata', **meta})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"

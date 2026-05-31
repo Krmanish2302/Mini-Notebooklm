@@ -187,18 +187,48 @@ class MultiFAISSStore:
     def delete_chunks(self, chunk_ids: List[str], dim: int) -> None:
         if dim not in self._indexes:
             return
-        idx  = self._indexes[dim]
-        fids = [idx.id_map[cid] for cid in chunk_ids if cid in idx.id_map]
-        if not fids:
+        idx = self._indexes[dim]
+        keep_cids = [cid for cid in idx.id_map.keys() if cid not in chunk_ids]
+        if len(keep_cids) == len(idx.id_map):
             return
-        sel = faiss.IDSelectorArray(np.array(fids, dtype=np.int64))
-        idx.index.remove_ids(sel)
-        for cid in chunk_ids:
-            fid = idx.id_map.pop(cid, None)
-            if fid is not None:
-                idx.rev_map.pop(fid, None)
+        
+        if not keep_cids:
+            hnsw = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_INNER_PRODUCT)
+            hnsw.hnsw.efConstruction = 64
+            hnsw.hnsw.efSearch = 16
+            idx.index = faiss.IndexIDMap2(hnsw)
+            idx.index.set_direct_map(faiss.DirectMap.Hashtable)
+            idx.id_map.clear()
+            idx.rev_map.clear()
+            idx._next_id = 0
+        else:
+            vectors = []
+            new_id_map = {}
+            new_rev_map = {}
+            for i, cid in enumerate(keep_cids):
+                fid = idx.id_map[cid]
+                vec = idx.index.reconstruct(fid)
+                vectors.append(vec)
+                new_id_map[cid] = i
+                new_rev_map[i] = cid
+            
+            hnsw = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_INNER_PRODUCT)
+            hnsw.hnsw.efConstruction = 64
+            hnsw.hnsw.efSearch = 16
+            new_index = faiss.IndexIDMap2(hnsw)
+            new_index.set_direct_map(faiss.DirectMap.Hashtable)
+            
+            mat = np.stack(vectors).astype("float32")
+            fids = np.array(range(len(keep_cids)), dtype=np.int64)
+            new_index.add_with_ids(mat, fids)
+            
+            idx.index = new_index
+            idx.id_map = new_id_map
+            idx.rev_map = new_rev_map
+            idx._next_id = len(keep_cids)
+            
         self._save(dim)
-        logger.info("[MultiFAISSStore] Deleted %d vectors from dim=%d", len(fids), dim)
+        logger.info("[MultiFAISSStore] Deleted %d vectors from dim=%d", len(chunk_ids), dim)
 
     # BUG-C05: only public accessor for internal FAISS IDs
     def get_internal_id(self, chunk_id: str, dim: int) -> Optional[int]:
@@ -225,8 +255,10 @@ class MultiFAISSStore:
 
     def _get_or_create(self, dim: int) -> _DimIndex:
         if dim not in self._indexes:
-            flat  = faiss.IndexFlatIP(dim)
-            idmap = faiss.IndexIDMap2(flat)
+            hnsw = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_INNER_PRODUCT)
+            hnsw.hnsw.efConstruction = 64
+            hnsw.hnsw.efSearch = 16
+            idmap = faiss.IndexIDMap2(hnsw)
             idmap.set_direct_map(faiss.DirectMap.Hashtable)
             self._indexes[dim] = _DimIndex(dim=dim, index=idmap)
         return self._indexes[dim]

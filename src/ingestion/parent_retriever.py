@@ -31,9 +31,25 @@ from typing import List
 
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
-from langchain.retrievers import ParentDocumentRetriever
-from langchain.storage import LocalFileStore
-from langchain.storage._lc_store import create_kv_docstore
+try:
+    from langchain.retrievers import ParentDocumentRetriever
+except ImportError:
+    try:
+        from langchain_classic.retrievers import ParentDocumentRetriever
+    except ImportError:
+        from langchain_community.retrievers import ParentDocumentRetriever
+
+try:
+    from langchain.storage import LocalFileStore
+    from langchain.storage._lc_store import create_kv_docstore
+except ImportError:
+    try:
+        from langchain_classic.storage import LocalFileStore
+        from langchain_classic.storage._lc_store import create_kv_docstore
+    except ImportError:
+        from langchain_core.storage import LocalFileStore
+        from langchain_core.storage._lc_store import create_kv_docstore
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
@@ -41,15 +57,12 @@ logger = logging.getLogger(__name__)
 PARENT_CHUNK_SIZE  = int(os.getenv("PARENT_CHUNK_SIZE",  "2000"))
 CHILD_CHUNK_SIZE   = int(os.getenv("CHILD_CHUNK_SIZE",   "400"))
 CHUNK_OVERLAP      = int(os.getenv("CHUNK_OVERLAP",      "50"))
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "huggingface")
 
 
 def _get_embeddings():
-    if EMBEDDING_PROVIDER == "huggingface":
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    from langchain_openai import OpenAIEmbeddings
-    return OpenAIEmbeddings(model="text-embedding-3-small")
+    from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
+    return EmbeddingRegistry.get(EMBEDDING_PROVIDER)
 
 
 def _make_docstore(vectorstore_path: str):

@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
 from langgraph.graph import END, StateGraph
+from src.ingestion.state import IngestionState
 
 from src.ingestion.nodes.utils import safe_node
 
@@ -312,7 +313,7 @@ def pdf_embed(state: dict) -> dict:
 # Build graph
 # ---------------------------------------------------------------------------
 def _build_pdf_graph() -> StateGraph:
-    g = StateGraph(dict)
+    g = StateGraph(IngestionState)
     g.add_node("pdf_extract", pdf_extract)
     g.add_node("pdf_chunk",   pdf_chunk)
     g.add_node("pdf_embed",   pdf_embed)
@@ -335,6 +336,7 @@ def run_pdf_pipeline(
     source_id:     str,
     strategy:      str = "paragraph_based",
     embedding_dim: int = 384,
+    source_name:   Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run the full PDF ingestion pipeline.
@@ -346,6 +348,7 @@ def run_pdf_pipeline(
         "strategy":       strategy,
         "embedding_dim":  embedding_dim,
         "source_type":    "pdf",
+        "source_name":    source_name,
     }
     result = pdf_app.invoke(init_state)
     if result.get("error"):

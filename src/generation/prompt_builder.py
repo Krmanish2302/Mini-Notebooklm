@@ -85,33 +85,22 @@ class QueryRewriter:
         "once here there this that these those".split()
     )
 
-    def hyde(self, query: str) -> str:
-        stub = f"In the context of the ingested documents, a relevant passage about '{query}' would state:"
-        return f"{stub}\n{query}"
-
     def expand(self, query: str) -> str:
         tokens   = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_\-]{2,}\b", query)
         keywords = [t.lower() for t in tokens if t.lower() not in self._STOP]
         unique_kw = list(dict.fromkeys(keywords))
         return f"{query} | keywords: {', '.join(unique_kw)}" if unique_kw else query
 
-    def rewrite(self, query: str, strategy: str = "hyde") -> str:
-        if strategy == "hyde":   return self.hyde(query)
+    def rewrite(self, query: str, strategy: str = "expand") -> str:
         if strategy == "expand": return self.expand(query)
-        if strategy == "both":   return self.expand(self.hyde(query))
         return query
 
     @staticmethod
     def pick_strategy(query: str) -> str:
         word_count  = len(query.split())
-        is_question = query.strip().endswith("?") or (
-            query.split()[0].lower() in
-            {"what","why","how","when","where","who","explain","describe",
-             "compare","summarise","summarize","list","define"}
-        )
         if word_count <= 4:   return "expand"
-        if is_question:       return "hyde"
-        return "both"
+        return "none"
+
 
 
 # ── HistoryCompressor ──────────────────────────────────────────────────────────

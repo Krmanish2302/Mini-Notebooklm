@@ -152,7 +152,9 @@ class StudyPipeline:
             {
                 "citation_label": f"S{i+1}",
                 "content":        c["content"],
-                "source_id":      c.get("id", ""),
+                "source_id":      c.get("source_id", ""),
+                "source_name":    c.get("source_name", ""),
+                "page":           c.get("page", ""),
             }
             for i, c in enumerate(retrieved)
         ]

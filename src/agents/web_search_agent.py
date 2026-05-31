@@ -128,7 +128,8 @@ class WebSearchAgent:
         """
         # ── Layer 1: WebBaseLoader ────────────────────────────────────────────
         try:
-            loader = WebBaseLoader(web_paths=[url])
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+            loader = WebBaseLoader(web_paths=[url], requests_kwargs={"headers": headers})
             docs   = loader.load()
             if docs and docs[0].page_content.strip():
                 logger.debug("[WebSearchAgent] WebBaseLoader success: %s", url)

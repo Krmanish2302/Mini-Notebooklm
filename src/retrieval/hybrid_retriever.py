@@ -27,7 +27,13 @@ from typing import List, Optional
 
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers import EnsembleRetriever
+try:
+    from langchain.retrievers import EnsembleRetriever
+except ImportError:
+    try:
+        from langchain_classic.retrievers import EnsembleRetriever
+    except ImportError:
+        from langchain_community.retrievers import EnsembleRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -87,33 +93,44 @@ class HybridRetriever:
         self.sparse_weight    = sparse_weight
         self._ensemble: EnsembleRetriever | None = None
         self._all_docs: List[Document] = []
+        self.dense_retriever = None
+        self.bm25_retriever = None
+
 
     def _build(self, top_k: int) -> EnsembleRetriever:
-        from src.ingestion.parent_retriever import load_parent_retriever
         from langchain_community.vectorstores import FAISS
         from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
 
-        # ── Dense: ParentDocumentRetriever ─────────────────────────────
-        dense = load_parent_retriever(self.vectorstore_path)
-        dense.search_kwargs = {"k": top_k * 3}
+        embeddings = EmbeddingRegistry.get()
 
-        # ── Sparse: BM25 built from FAISS stored docs ──────────────────
-        embeddings  = EmbeddingRegistry.get()
+        # ── Load FAISS once and share across dense + BM25 ──────────────
         vectorstore = FAISS.load_local(
             self.vectorstore_path, embeddings, allow_dangerous_deserialization=True,
         )
+
+        # ── Dense: FAISS as retriever ──────────────────────────────────
+        dense = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": top_k * 3},
+        )
+
+        # ── Sparse: BM25 built from FAISS stored docs ─────────────────
         all_docs = _load_all_docs_safe(vectorstore)
         self._all_docs = all_docs
 
+        self.dense_retriever = dense
         if all_docs:
-            bm25 = BM25Retriever.from_documents(all_docs, k=top_k * 3)
+            self.bm25_retriever = BM25Retriever.from_documents(all_docs, k=top_k * 3)
         else:
+            self.bm25_retriever = None
+
+        if self.bm25_retriever is None:
             logger.warning("[HybridRetriever] BM25 corpus empty — using dense only")
             dense.search_kwargs = {"k": top_k}
             return dense  # type: ignore[return-value]
 
         return EnsembleRetriever(
-            retrievers=[dense, bm25],
+            retrievers=[self.dense_retriever, self.bm25_retriever],
             weights=[self.dense_weight, self.sparse_weight],
         )
 
@@ -137,37 +154,9 @@ class HybridRetriever:
         if self._ensemble is None:
             self._ensemble = self._build(k)
 
-        if source_ids:
-            sid_set = set(source_ids)
-
-            # Dense side — LangChain FAISS metadata filter
-            dense = self._ensemble.retrievers[0] if hasattr(self._ensemble, "retrievers") else self._ensemble
-            if hasattr(dense, "search_kwargs"):
-                dense.search_kwargs["filter"] = {
-                    "source_id": {"$in": list(sid_set)}
-                }
-
-            # Rebuild BM25 with only filtered docs
-            if self._all_docs and hasattr(self._ensemble, "retrievers") and len(self._ensemble.retrievers) > 1:
-                filtered_docs = [
-                    d for d in self._all_docs
-                    if d.metadata.get("source_id") in sid_set
-                ]
-                if filtered_docs:
-                    self._ensemble.retrievers[1] = BM25Retriever.from_documents(filtered_docs, k=k * 3)
-                else:
-                    logger.warning(
-                        "[HybridRetriever] No docs matched source_ids=%s — ignoring filter",
-                        source_ids,
-                    )
-        else:
-            dense = self._ensemble.retrievers[0] if hasattr(self._ensemble, "retrievers") else self._ensemble
-            if hasattr(dense, "search_kwargs"):
-                dense.search_kwargs.pop("filter", None)
-
         docs = self._ensemble.invoke(query)
 
-        # Post-filter safety net
+        # Post-filter by source_ids if requested
         if source_ids:
             sid_set = set(source_ids)
             docs = [d for d in docs if d.metadata.get("source_id") in sid_set]

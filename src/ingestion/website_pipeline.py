@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from langchain_core.documents import Document
 from langgraph.graph import END, StateGraph
+from src.ingestion.state import IngestionState
 
 from src.ingestion.nodes.utils import safe_node
 
@@ -67,7 +68,8 @@ def web_fetch(state: dict) -> dict:
         logger.warning("[web_fetch] Crawl4AI failed (%s), falling back to WebBaseLoader", crawl_err)
         try:
             from langchain_community.document_loaders import WebBaseLoader
-            docs    = WebBaseLoader(url).load()
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+            docs    = WebBaseLoader(url, requests_kwargs={"headers": headers}).load()
             content = "\n\n".join(d.page_content for d in docs)
             origin  = "webbaseloader"
         except Exception as wb_err:
@@ -125,9 +127,6 @@ def web_clean(state: dict) -> dict:
         after_chars = len(text)
         orig_chars  = state.get("original_char_count", len(text))
         reduction   = round(100 * (orig_chars - after_chars) / orig_chars, 1) if orig_chars else 0
-
-        if len(text.split()) < 20:
-            continue
 
         docs.append(Document(
             page_content=text,
@@ -227,7 +226,7 @@ def web_embed(state: dict) -> dict:
 # Graph
 # ---------------------------------------------------------------------------
 def _build_website_graph() -> StateGraph:
-    g = StateGraph(dict)
+    g = StateGraph(IngestionState)
     g.add_node("web_fetch", web_fetch)
     g.add_node("web_clean", web_clean)
     g.add_node("web_chunk", web_chunk)
@@ -247,11 +246,12 @@ website_app = _build_website_graph()
 # ---------------------------------------------------------------------------
 # Public runner
 # ---------------------------------------------------------------------------
-def run_website_pipeline(url: str, source_id: str) -> Dict[str, Any]:
+def run_website_pipeline(url: str, source_id: str, source_name: Optional[str] = None) -> Dict[str, Any]:
     init_state = {
         "file_path":   url,
         "source_id":   source_id,
         "source_type": "website",
+        "source_name": source_name,
     }
     result = website_app.invoke(init_state)
     if result.get("error"):
