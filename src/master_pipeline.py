@@ -1,34 +1,34 @@
 """
 master_pipeline.py — MiniNotebookLM: the single orchestration class.
 
-Wires together:
-  ┌─────────────┐    ┌───────────────┐    ┌──────────────────┐
-  │  Ingestion  │───▶│   Retrieval   │───▶│   Generation     │
-  │  (chunking, │    │ (hybrid RRF:  │    │  (LangGraph DAG: │
-  │  embedding, │    │  dense+BM25)  │    │  prompt→LLM      │
-  │  vector DB) │    │               │    │  →parse→cite)    │
-  └─────────────┘    └───────────────┘    └──────────────────┘
-                                                    │
-                                           ┌────────▼────────┐
-                                           │   Evaluation    │
-                                           │   (RAGAS,       │
-                                           │    optional)    │
-                                           └─────────────────┘
-
-Fix #7 (do_expand): ask() accepts and forwards do_expand into generate()
-so the retrieval graph's expand_query node can be disabled per-request.
+Wires together Ingestion, Retrieval, and Generation under a unified parallelized interface.
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage
 
 from src.generation import generate, PersonaConfig, LLMRegistry
 from src.generation.prompt_builder import PromptBuilder, sanitize_query
+from src.generation.response_parser import ResponseParser
+from src.generation.response_generator import ResponseGenerator
+
+from src.storage.sqlite_manager import SQLiteManager
+from src.storage.rag_history_store import RAGHistoryStore
+from src.storage.knowledge_graph_updater import KnowledgeGraphUpdater
+
+from src.retrieval.retrieval_graph import retrieval_app
+from src.retrieval.state import RetrievalState
+from src.retrieval.reorder import reorder_chunks
+from src.retrieval.nodes.build_context_node import format_study_graph_context
 
 logger = logging.getLogger(__name__)
 
@@ -134,14 +134,24 @@ class MiniNotebookLM:
         self._history: List[Dict[str, str]] = []
         self.last_ragas: Optional[Dict[str, Any]] = None
 
-        # Initialise SQLite-based RAGHistoryStore
+        # Reusable ThreadPoolExecutor for background tasks & parallel retrieval
+        self._executor = ThreadPoolExecutor(max_workers=16)
+
+        # Single instance level SQLiteManager database connection
         try:
-            from src.storage.rag_history_store import RAGHistoryStore
-            from src.storage.sqlite_manager import SQLiteManager
+            self._db = SQLiteManager()
+        except Exception as e:
+            logger.warning("[MiniNotebookLM] Failed to initialize SQLiteManager: %s", e)
+            self._db = None
+
+        # Initialise SQLite-based RAGHistoryStore using shared SQLiteManager
+        try:
             from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
-            db = SQLiteManager()
             embedder = EmbeddingRegistry.get()
-            self.history_store = RAGHistoryStore(db, embedder)
+            if self._db:
+                self.history_store = RAGHistoryStore(self._db, embedder)
+            else:
+                self.history_store = None
         except Exception as e:
             logger.warning("[MiniNotebookLM] Failed to initialize RAGHistoryStore: %s", e)
             self.history_store = None
@@ -150,6 +160,13 @@ class MiniNotebookLM:
             "[MiniNotebookLM] Init — provider=%s model=%s mode=%s",
             self.config.llm_provider, self.config.llm_model, self.config.default_mode,
         )
+
+    def __del__(self):
+        if hasattr(self, "_executor"):
+            try:
+                self._executor.shutdown(wait=False)
+            except Exception:
+                pass
 
     # ── Ingestion ──────────────────────────────────────────────────────────────────
 
@@ -189,7 +206,16 @@ class MiniNotebookLM:
         return result
 
     def ingest_many(self, sources: List[str], **kwargs) -> List[Dict[str, Any]]:
-        return [self.ingest(s, **kwargs) for s in sources]
+        results = [None] * len(sources)
+        futures = {self._executor.submit(self.ingest, source, **kwargs): i for i, source in enumerate(sources)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                logger.error("[ingest_many] Failed to ingest source %s: %s", sources[idx], exc)
+                results[idx] = {"error": str(exc), "source": sources[idx]}
+        return results
 
     # ── Retrieval ──────────────────────────────────────────────────────────────────
 
@@ -225,14 +251,16 @@ class MiniNotebookLM:
                 "rrf_fused": 0, "reranked": 0, "reordered": 0, "cached_hit": False
             }
 
-        # Determine target source IDs to query
+        # Determine target source IDs to query (reusing class-level SQLiteManager)
         target_sids = source_ids
         if not target_sids:
-            try:
-                from src.storage.sqlite_manager import SQLiteManager
-                db = SQLiteManager()
-                target_sids = [s["source_id"] for s in db.list_sources(active_only=True)]
-            except Exception:
+            if self._db:
+                try:
+                    target_sids = [s["source_id"] for s in self._db.list_sources(active_only=True)]
+                except Exception as e:
+                    logger.warning("[retrieve] Failed to list active sources: %s", e)
+                    target_sids = []
+            else:
                 try:
                     target_sids = [d for d in os.listdir("data/vectorstores") if os.path.isdir(os.path.join("data/vectorstores", d))]
                 except Exception:
@@ -245,15 +273,14 @@ class MiniNotebookLM:
                 "rrf_fused": 0, "reranked": 0, "reordered": 0, "cached_hit": False
             }
 
-        # Resolve source names from SQLite
+        # Resolve source names from SQLite (reusing class-level SQLiteManager)
         source_names = {}
-        try:
-            from src.storage.sqlite_manager import SQLiteManager
-            db = SQLiteManager()
-            for s in db.list_sources():
-                source_names[s["source_id"]] = s["name"]
-        except Exception as e:
-            logger.warning("[retrieve] Failed to load source names from SQLite: %s", e)
+        if self._db:
+            try:
+                for s in self._db.list_sources():
+                    source_names[s["source_id"]] = s["name"]
+            except Exception as e:
+                logger.warning("[retrieve] Failed to load source names from SQLite: %s", e)
 
         # Lazily initialise retriever cache
         if not hasattr(self, "_retriever_cache"):
@@ -276,65 +303,69 @@ class MiniNotebookLM:
         total_reranked = 0
         total_reordered = 0
 
-        from src.retrieval.retrieval_graph import retrieval_app
-        from src.retrieval.state import RetrievalState
-
+        # Parallelize active sources retrieval invocation
+        futures = {}
         for sid in target_sids:
             sid_path = os.path.join("data/vectorstores", sid)
             if os.path.exists(sid_path):
-                try:
-                    res = retrieval_app.invoke(RetrievalState(
-                        query=query,
-                        vectorstore_path=sid_path,
-                        top_k=k,
-                        use_rerank=True,
-                        use_reordering=True,
-                        do_expand=do_expand,
-                        mode=mode,
-                        source_ids=[sid]
-                    ))
-                    
-                    # Gather docs from result
-                    docs = res.get("documents", [])
-                    for doc in docs:
-                        if "source_id" not in doc.metadata:
-                            doc.metadata["source_id"] = sid
-                        doc.metadata["source_name"] = source_names.get(sid, doc.metadata.get("source_name", sid))
-                    all_docs.extend(docs)
-                    
-                    # Gather history_docs returned by study mode node
-                    hdocs = res.get("history_docs", [])
-                    for hd in hdocs:
-                        if "source_id" not in hd.metadata:
-                            hd.metadata["source_id"] = "history"
-                        hd.metadata["is_history"] = True
-                    all_docs.extend(hdocs)
-                    
-                    # Accumulate current concepts
-                    ccon = res.get("current_concepts", [])
-                    if ccon:
-                        all_current_concepts.extend(ccon)
-                    
-                    # Accumulate stats
-                    meta = res.get("metadata") or {}
-                    total_dense += meta.get("dense_count", 0)
-                    total_sparse += meta.get("sparse_count", 0)
-                    total_history += meta.get("history_count", 0)
-                    total_rrf += meta.get("rrf_fused", 0)
-                    total_reranked += meta.get("reranked", 0)
-                    total_reordered += meta.get("reordered", 0)
+                state = RetrievalState(
+                    query=query,
+                    vectorstore_path=sid_path,
+                    top_k=k,
+                    use_rerank=True,
+                    use_reordering=True,
+                    do_expand=do_expand,
+                    mode=mode,
+                    source_ids=[sid]
+                )
+                futures[self._executor.submit(retrieval_app.invoke, state)] = sid
 
-                    # Gather parents
-                    parents = res.get("reordered_parents", [])
-                    all_parents.extend(parents)
+        for future in as_completed(futures):
+            sid = futures[future]
+            try:
+                res = future.result()
+                
+                # Gather docs from result
+                docs = res.get("documents", [])
+                for doc in docs:
+                    if "source_id" not in doc.metadata:
+                        doc.metadata["source_id"] = sid
+                    doc.metadata["source_name"] = source_names.get(sid, doc.metadata.get("source_name", sid))
+                all_docs.extend(docs)
+                
+                # Gather history_docs returned by study mode node
+                hdocs = res.get("history_docs", [])
+                for hd in hdocs:
+                    if "source_id" not in hd.metadata:
+                        hd.metadata["source_id"] = "history"
+                    hd.metadata["is_history"] = True
+                all_docs.extend(hdocs)
+                
+                # Accumulate current concepts
+                ccon = res.get("current_concepts", [])
+                if ccon:
+                    all_current_concepts.extend(ccon)
+                
+                # Accumulate stats
+                meta = res.get("metadata") or {}
+                total_dense += meta.get("dense_count", 0)
+                total_sparse += meta.get("sparse_count", 0)
+                total_history += meta.get("history_count", 0)
+                total_rrf += meta.get("rrf_fused", 0)
+                total_reranked += meta.get("reranked", 0)
+                total_reordered += meta.get("reordered", 0)
+
+                # Gather parents
+                parents = res.get("reordered_parents", [])
+                all_parents.extend(parents)
+                
+                # Gather graph context
+                gctx = res.get("graph_context", [])
+                if gctx:
+                    all_graph_context.extend(gctx)
                     
-                    # Gather graph context
-                    gctx = res.get("graph_context", [])
-                    if gctx:
-                        all_graph_context.extend(gctx)
-                        
-                except Exception as e:
-                    logger.warning("[retrieve] LangGraph retrieval failed for source '%s': %s", sid, e)
+            except Exception as e:
+                logger.warning("[retrieve] LangGraph retrieval failed for source '%s': %s", sid, e)
 
         # De-duplicate unique documents and separate history
         seen = set()
@@ -352,7 +383,6 @@ class MiniNotebookLM:
                     source_docs.append(doc)
 
         if mode == "chat":
-            from src.retrieval.reorder import reorder_chunks
             chunks_with_scores = []
             for doc in source_docs:
                 score = doc.metadata.get("relevance_score", doc.metadata.get("score", 0.0))
@@ -391,7 +421,6 @@ class MiniNotebookLM:
                 unique_ccon.append(cc)
 
         if mode == "study":
-            from src.retrieval.nodes.build_context_node import format_study_graph_context
             graph_text = format_study_graph_context(all_graph_context, unique_ccon)
             
             reordered_source_docs = source_docs[:k]
@@ -445,6 +474,101 @@ class MiniNotebookLM:
         return all_docs, ret_query, None, retrieval_stats
 
 
+    # ── Helpers for ask & ask_stream logic deduplication ────────────────────────────
+
+    def _run_retrieval(
+        self,
+        query: str,
+        mode: str,
+        k: Optional[int],
+        rewrite: Optional[bool],
+        source_ids: Optional[List[str]],
+        documents: Optional[List[Document]],
+        do_expand: bool,
+    ) -> tuple[List[Document], str, Optional[dict], dict]:
+        ret_query = query
+        cache_hit = None
+        
+        if documents is None:
+            _sids = source_ids if source_ids else None
+            documents, ret_query, cache_hit, retrieval_stats = self.retrieve(
+                query, k=k, rewrite=rewrite, source_ids=_sids, mode=mode, do_expand=do_expand
+            )
+        else:
+            retrieval_stats = {
+                "dense_count": len(documents),
+                "sparse_count": 0,
+                "history_count": 0,
+                "rrf_fused": 0,
+                "reranked": 0,
+                "reordered": 0,
+                "cached_hit": False,
+            }
+        return documents, ret_query, cache_hit, retrieval_stats
+
+    def _post_process(
+        self,
+        query: str,
+        answer: str,
+        documents: List[Document],
+        mode: str,
+        evaluate: bool,
+        ground_truth: Optional[str],
+        sub_queries_future: Optional[Any] = None,
+    ) -> tuple[Optional[dict], List[str]]:
+        # 1. Safe Knowledge Graph Enrichment in Study Mode using shared SQLiteManager
+        if mode == "study" and documents:
+            try:
+                updater = KnowledgeGraphUpdater(self._db)
+                clean_docs = [d for d in documents if d.metadata.get("source_id") != "SQLite Study Graph"]
+                updater.enrich_graph(query, answer, clean_docs)
+            except Exception as e:
+                logger.warning("[MiniNotebookLM] Safe graph enrichment failed: %s", e)
+
+        # 2. Update history
+        self._history.append({"role": "user",      "content": query})
+        self._history.append({"role": "assistant", "content": answer})
+        self._trim_history()
+
+        # Save to SQLite-based RAGHistoryStore
+        if self.history_store is not None:
+            try:
+                self.history_store.add_turn("default", query, answer)
+            except Exception as e:
+                logger.warning("[MiniNotebookLM] Failed to save turn to RAGHistoryStore: %s", e)
+
+        # 3. RAGAS evaluation (optional)
+        ragas_result = None
+        if evaluate and self._evaluator_cls:
+            if self._evaluator is None:
+                self._evaluator = self._evaluator_cls()
+            try:
+                ragas_result = self._evaluator.evaluate(
+                    query=query,
+                    answer=answer,
+                    contexts=[
+                        (d.page_content if hasattr(d, "page_content") else d.get("content", ""))
+                        for d in documents
+                    ],
+                    ground_truth=ground_truth,
+                )
+                self.last_ragas = ragas_result
+            except Exception as exc:
+                logger.warning("[_post_process] RAGAS evaluation failed: %s", exc)
+
+        # 4. Resolve background sub-queries if research mode future is supplied
+        sub_queries_res = []
+        if sub_queries_future:
+            try:
+                res = sub_queries_future.result(timeout=15)
+                content = res.content or ""
+                lines = [re.sub(r'^\s*[-•*\d.)]+\s*', '', line).strip() for line in content.splitlines() if line.strip()]
+                sub_queries_res = [l for l in lines if l][:3]
+            except Exception as exc:
+                logger.warning("[_post_process] Sub-queries background generation failed: %s", exc)
+
+        return ragas_result, sub_queries_res
+
 
     # ── Generation ──────────────────────────────────────────────────────────────────
 
@@ -462,7 +586,6 @@ class MiniNotebookLM:
         stream:        Optional[bool]           = None,
         clear_history: bool                    = False,
         source_ids:    Optional[List[str]]      = None,
-        # FIX #7: do_expand forwarded all the way from API -> master_pipeline -> generate()
         do_expand:     bool                    = True,
     ) -> GenerationResult:
         mode     = mode     or self.config.default_mode
@@ -475,24 +598,9 @@ class MiniNotebookLM:
         safe_query = sanitize_query(query)
 
         # ── 1. Retrieve ───────────────────────────────────────────────────────────────
-        ret_query = safe_query
-        cache_hit = None
-        retrieval_stats = {}
-        if documents is None:
-            _sids = source_ids if source_ids else None
-            documents, ret_query, cache_hit, retrieval_stats = self.retrieve(
-                safe_query, k=k, rewrite=rewrite, source_ids=_sids, mode=mode, do_expand=do_expand
-            )
-        else:
-            retrieval_stats = {
-                "dense_count": len(documents),
-                "sparse_count": 0,
-                "history_count": 0,
-                "rrf_fused": 0,
-                "reranked": 0,
-                "reordered": 0,
-                "cached_hit": False,
-            }
+        documents, ret_query, cache_hit, retrieval_stats = self._run_retrieval(
+            safe_query, mode, k, rewrite, source_ids, documents, do_expand
+        )
 
         # Handle Semantic Cache Hit:
         if cache_hit is not None:
@@ -514,7 +622,17 @@ class MiniNotebookLM:
         # ── 2. Build conversation history string ───────────────────────────────────
         history_str = self._format_history()
 
-        # ── 3. Generate via LangGraph ───────────────────────────────────────────────
+        # ── 3. Kick off sub-queries concurrently in background thread if research mode ──
+        sub_queries_future = None
+        if mode in ("research", "deep_research"):
+            try:
+                llm_sub = LLMRegistry.get(temperature=0.5)
+                sub_q_prompt = f"Given the user query: '{query}', suggest 3 specific, focused sub-queries to investigate in the context of the document. Return ONLY the 3 queries, one per line, starting with a bullet point (- or *)."
+                sub_queries_future = self._executor.submit(llm_sub.invoke, sub_q_prompt)
+            except Exception as exc:
+                logger.warning("[ask] Failed to kick off sub-queries in background: %s", exc)
+
+        # ── 4. Generate via LangGraph ───────────────────────────────────────────────
         try:
             gen_result = generate(
                 query=safe_query,
@@ -523,7 +641,7 @@ class MiniNotebookLM:
                 history=history_str,
                 persona=persona or PersonaConfig(),
                 stream=stream,
-                do_expand=do_expand,  # FIX #7
+                do_expand=do_expand,
             )
         except Exception as exc:
             logger.exception("[ask] Generation failed: %s", exc)
@@ -536,65 +654,10 @@ class MiniNotebookLM:
 
         answer = gen_result.get("answer", "")
 
-        # Safe Knowledge Graph Enrichment in Study Mode
-        if mode == "study" and documents:
-            try:
-                from src.storage.knowledge_graph_updater import KnowledgeGraphUpdater
-                updater = KnowledgeGraphUpdater()
-                clean_docs = [d for d in documents if d.metadata.get("source_id") != "SQLite Study Graph"]
-                updater.enrich_graph(safe_query, answer, clean_docs)
-            except Exception as e:
-                logger.warning("[MiniNotebookLM] Safe graph enrichment failed: %s", e)
-
-
-        # ── 4. Update history ─────────────────────────────────────────────────────────
-        self._history.append({"role": "user",      "content": safe_query})
-        self._history.append({"role": "assistant", "content": answer})
-        self._trim_history()
-
-        # Save to SQLite-based RAGHistoryStore
-        if self.history_store is not None:
-            try:
-                self.history_store.add_turn("default", safe_query, answer)
-            except Exception as e:
-                logger.warning("[MiniNotebookLM] Failed to save turn to RAGHistoryStore: %s", e)
-
-        # ── 5. RAGAS evaluation (optional) ────────────────────────────────────────────
-        ragas_result: Optional[Dict[str, Any]] = None
-        if evaluate and self._evaluator_cls:
-            if self._evaluator is None:
-                self._evaluator = self._evaluator_cls()
-            try:
-                ragas_result = self._evaluator.evaluate(
-                    query=safe_query,
-                    answer=answer,
-                    contexts=[
-                        (d.page_content if hasattr(d, "page_content") else d.get("content", ""))
-                        for d in documents
-                    ],
-                    ground_truth=ground_truth,
-                )
-                self.last_ragas = ragas_result
-            except Exception as exc:
-                logger.warning("[ask] RAGAS evaluation failed: %s", exc)
-
-        # ── 6. Mode-specific study/research materials ─────────────────────────────────
-        sub_queries_res = []
-        quiz_cards_res = []
-        summary_bullets_res = []
-        # Study mode flashcards/summary bullets dropped
-        if mode in ("research", "deep_research") and documents:
-            try:
-                import re
-                from src.generation.llm_registry import LLMRegistry
-                llm = LLMRegistry.get(temperature=0.5)
-                sub_q_prompt = f"Given the user query: '{query}', suggest 3 specific, focused sub-queries to investigate in the context of the document. Return ONLY the 3 queries, one per line, starting with a bullet point (- or *)."
-                res = llm.invoke(sub_q_prompt)
-                content = res.content or ""
-                lines = [re.sub(r'^\s*[-•*\d.)]+\s*', '', line).strip() for line in content.splitlines() if line.strip()]
-                sub_queries_res = [l for l in lines if l][:3]
-            except Exception as exc:
-                logger.warning("[ask] Sub-queries generation failed: %s", exc)
+        # ── 5. Unified Post-Process & Evaluation ──────────────────────────────────────
+        ragas_result, sub_queries_res = self._post_process(
+            safe_query, answer, documents, mode, evaluate, ground_truth, sub_queries_future
+        )
 
         return GenerationResult(
             answer=answer,
@@ -607,8 +670,8 @@ class MiniNotebookLM:
             retrieval_query=ret_query,
             mode=mode,
             sub_queries=sub_queries_res,
-            quiz_cards=quiz_cards_res,
-            summary_bullets=summary_bullets_res,
+            quiz_cards=[],
+            summary_bullets=[],
             graph_context=getattr(self, "_last_graph_context", []),
         )
 
@@ -640,24 +703,9 @@ class MiniNotebookLM:
         safe_query = sanitize_query(query)
 
         # ── 1. Retrieve ───────────────────────────────────────────────────────────────
-        ret_query = safe_query
-        cache_hit = None
-        retrieval_stats = {}
-        if documents is None:
-            _sids = source_ids if source_ids else None
-            documents, ret_query, cache_hit, retrieval_stats = self.retrieve(
-                safe_query, k=k, rewrite=rewrite, source_ids=_sids, mode=mode, do_expand=do_expand
-            )
-        else:
-            retrieval_stats = {
-                "dense_count": len(documents),
-                "sparse_count": 0,
-                "history_count": 0,
-                "rrf_fused": 0,
-                "reranked": 0,
-                "reordered": 0,
-                "cached_hit": False,
-            }
+        documents, ret_query, cache_hit, retrieval_stats = self._run_retrieval(
+            safe_query, mode, k, rewrite, source_ids, documents, do_expand
+        )
 
         # Handle Semantic Cache Hit:
         if cache_hit is not None:
@@ -716,7 +764,6 @@ class MiniNotebookLM:
 
         # ── 2. Build prompt ─────────────────────────────────────────────────────────
         history_str = self._format_history()
-        from src.generation.prompt_builder import PromptBuilder
         if mode == "study":
             prompt = PromptBuilder.build_study_prompt(safe_query, documents, history_str)
         elif mode == "research":
@@ -724,11 +771,17 @@ class MiniNotebookLM:
         else:
             prompt = PromptBuilder.build_chat_prompt(safe_query, documents, history_str, persona or PersonaConfig())
 
-        # ── 3. Call LLM with streaming ──────────────────────────────────────────────
-        import time
-        from src.generation.llm_registry import LLMRegistry
-        from langchain_core.messages import HumanMessage
+        # ── 3. Kick off sub-queries concurrently in background thread if research mode ──
+        sub_queries_future = None
+        if mode in ("research", "deep_research"):
+            try:
+                llm_sub = LLMRegistry.get(temperature=0.5)
+                sub_q_prompt = f"Given the user query: '{query}', suggest 3 specific, focused sub-queries to investigate in the context of the document. Return ONLY the 3 queries, one per line, starting with a bullet point (- or *)."
+                sub_queries_future = self._executor.submit(llm_sub.invoke, sub_q_prompt)
+            except Exception as exc:
+                logger.warning("[ask_stream] Failed to kick off sub-queries in background: %s", exc)
 
+        # ── 4. Call LLM with streaming ──────────────────────────────────────────────
         start_time = time.time()
         ttft_ms = 0
         tokens = []
@@ -752,10 +805,7 @@ class MiniNotebookLM:
             total_time_ms = int((time.time() - start_time) * 1000)
             raw_output = "".join(tokens)
 
-            # ── 4. Parse & Assemble Response ──────────────────────────────────────────
-            from src.generation.response_parser import ResponseParser
-            from src.generation.response_generator import ResponseGenerator
-
+            # ── 5. Parse & Assemble Response ──────────────────────────────────────────
             # Extract/parse followups
             parsed = ResponseParser.parse(raw_output)
 
@@ -783,43 +833,10 @@ class MiniNotebookLM:
             sources_used = assembled.get("sources_used", [])
             chunks_used = assembled.get("chunks_used", [])
 
-            # Safe Knowledge Graph Enrichment in Study Mode
-            if mode == "study" and documents:
-                try:
-                    from src.storage.knowledge_graph_updater import KnowledgeGraphUpdater
-                    updater = KnowledgeGraphUpdater()
-                    clean_docs = [d for d in documents if d.metadata.get("source_id") != "SQLite Study Graph"]
-                    updater.enrich_graph(safe_query, answer, clean_docs)
-                except Exception as e:
-                    logger.warning("[MiniNotebookLM] Safe graph enrichment failed: %s", e)
-
-            # ── 5. Update history ───────────────────────────────────────────────────
-            self._history.append({"role": "user",      "content": safe_query})
-            self._history.append({"role": "assistant", "content": answer})
-            self._trim_history()
-
-            if self.history_store is not None:
-                try:
-                    self.history_store.add_turn("default", safe_query, answer)
-                except Exception as e:
-                    logger.warning("[MiniNotebookLM] Failed to save turn to RAGHistoryStore: %s", e)
-
-            # ── 6. Mode-specific study/research materials ───────────────────────────
-            sub_queries_res = []
-            quiz_cards_res = []
-            summary_bullets_res = []
-            # Study mode flashcards/summary bullets dropped
-            if mode in ("research", "deep_research"):
-                try:
-                    import re
-                    llm_sync = LLMRegistry.get(temperature=0.5)
-                    sub_q_prompt = f"Given the user query: '{query}', suggest 3 specific, focused sub-queries to investigate in the context of the document. Return ONLY the 3 queries, one per line, starting with a bullet point (- or *)."
-                    res = llm_sync.invoke(sub_q_prompt)
-                    res_content = res.content or ""
-                    lines = [re.sub(r'^\s*[-•*\d.)]+\s*', '', line).strip() for line in res_content.splitlines() if line.strip()]
-                    sub_queries_res = [l for l in lines if l][:3]
-                except Exception as exc:
-                    logger.warning("[ask] Sub-queries generation failed: %s", exc)
+            # ── 6. Unified Post-Process & Evaluation ──────────────────────────────────
+            ragas_result, sub_queries_res = self._post_process(
+                safe_query, answer, documents, mode, evaluate, ground_truth, sub_queries_future
+            )
 
             # ── 7. Yield Metadata ───────────────────────────────────────────────────
             chunk_strategy = "unknown"
@@ -832,8 +849,8 @@ class MiniNotebookLM:
                 "sources_used": sources_used,
                 "follow_ups": follow_ups,
                 "sub_queries": sub_queries_res,
-                "quiz_cards": quiz_cards_res,
-                "summary_bullets": summary_bullets_res,
+                "quiz_cards": [],
+                "summary_bullets": [],
                 "learning_path": [],
                 "pipeline_mode": mode,
                 "ttft_ms": ttft_ms,
@@ -843,6 +860,7 @@ class MiniNotebookLM:
                 "model_name": self.config.llm_model,
                 "chunks_used": chunks_used,
                 "graph_context": getattr(self, "_last_graph_context", []),
+                "ragas": ragas_result,
             }
             yield meta
             yield {"type": "done"}
