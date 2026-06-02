@@ -24,11 +24,11 @@ class SemanticChunker(BaseChunker):
         self.embedding_provider = embedding_provider
 
     def _get_embeddings(self):
-        if self.embedding_provider == "huggingface":
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-            return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        from langchain_openai import OpenAIEmbeddings
-        return OpenAIEmbeddings(model="text-embedding-3-small")
+        if self.embedding_provider == "openai":
+            from langchain_openai import OpenAIEmbeddings
+            return OpenAIEmbeddings(model="text-embedding-3-small")
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
     def chunk_documents(self, docs: List[Document]) -> List[Document]:
         from langchain_experimental.text_splitter import SemanticChunker as _SC

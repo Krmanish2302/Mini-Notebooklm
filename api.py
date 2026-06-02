@@ -64,7 +64,7 @@ _MODE_MAP = {
 
 EMBEDDING_MODELS = [
     {"name": "all-MiniLM-L6-v2",      "dim": 384,  "max_tokens": 256,  "label": "MiniLM",    "speed": "fast",   "note": "Local · fastest"},
-    {"name": "all-mpnet-base-v2",      "dim": 768,  "max_tokens": 384,  "label": "MPNet",     "speed": "medium", "note": "Local · balanced"},
+    {"name": "multi-qa-mpnet-base",    "dim": 768,  "max_tokens": 512,  "label": "Multi-QA",  "speed": "medium", "note": "Local · best search"},
     {"name": "e5-large-v2",            "dim": 1024, "max_tokens": 512,  "label": "E5-Large",  "speed": "slow",   "note": "Local · most accurate"},
     {"name": "text-embedding-3-small", "dim": 1536, "max_tokens": 8191, "label": "OAI Small", "speed": "fast",   "note": "OpenAI API key required"},
     {"name": "text-embedding-3-large", "dim": 3072, "max_tokens": 8191, "label": "OAI Large", "speed": "medium", "note": "OpenAI API key required"},
