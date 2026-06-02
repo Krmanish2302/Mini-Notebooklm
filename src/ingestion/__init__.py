@@ -77,12 +77,15 @@ class IngestionPipeline:
                 pass
 
             return router_ingest(
-                source_type   = source_type,
-                source_id     = sid,
-                file_path     = source if (source_type != "text" or is_file) else None,
-                content       = source if (source_type == "text" and not is_file) else None,
-                strategy      = kwargs.get("strategy", "paragraph_based"),
-                embedding_dim = kwargs.get("embedding_dim", 384),
+                source_type     = source_type,
+                source_id       = sid,
+                file_path       = source if (source_type != "text" or is_file) else None,
+                content         = source if (source_type == "text" and not is_file) else None,
+                strategy        = kwargs.get("strategy", kwargs.get("chunking_strategy", "paragraph_based")),
+                embedding_dim   = kwargs.get("embedding_dim", 384),
+                source_name     = kwargs.get("source_name"),
+                embedding_model = kwargs.get("embedding_model"),
+                start_page      = kwargs.get("start_page", 1),
             )
 
         # Fallback: run_ingestion only accepts (file_path, source_id, source_type)

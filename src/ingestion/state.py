@@ -16,6 +16,12 @@ class IngestionState(TypedDict, total=False):
     file_path:   str        # absolute or relative path / URL
     source_id:   str        # caller-supplied unique identifier
     source_type: str        # "pdf" | "csv" | "text" | "website" | "youtube"
+    source_name: Optional[str]
+    start_page:  Optional[int]
+    embedding_model: Optional[str]
+    strategy:    Optional[str]
+    embedding_dim: Optional[int]
+
 
     # ── intermediate ────────────────────────────────────────────────
     raw_documents:     List[Document]   # after loader node

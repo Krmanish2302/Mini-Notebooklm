@@ -309,8 +309,10 @@ class RAGASEvaluator:
                    len(self._tokenise(s) & c_tok) / max(len(self._tokenise(s)), 1)
                    >= self.overlap_threshold
             )
+            cid = c.get("id", c.get("chunk_id", c.get("source_id", "?")))
+            cid_str = str(cid) if cid is not None else "?"
             chunk_details.append({
-                "chunk_id":           c.get("id", c.get("chunk_id", c.get("source_id", "?")))[:16],
+                "chunk_id":           cid_str[:16],
                 "source":             c.get("source_id", "unknown"),
                 "citation":           c.get("citation_label", ""),
                 "contributed":        contrib > 0,

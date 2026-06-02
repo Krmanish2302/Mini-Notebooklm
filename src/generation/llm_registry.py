@@ -69,14 +69,16 @@ class LLMRegistry:
 
         if p == "openai":
             from langchain_openai import ChatOpenAI
+            base_url = os.environ.get("OPENAI_API_BASE") or os.environ.get("OPENAI_BASE_URL")
             key = api_key or os.environ.get("OPENAI_API_KEY")
-            if not key:
-                raise ValueError("Set OPENAI_API_KEY or pass api_key=")
+            if not key and not base_url:
+                raise ValueError("Set OPENAI_API_KEY, OPENAI_API_BASE, or pass api_key=")
             return ChatOpenAI(
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                openai_api_key=key,
+                openai_api_key=key or "lm-studio",
+                base_url=base_url,
             )
 
         if p == "gemini":

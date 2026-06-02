@@ -92,18 +92,125 @@ def embed_and_index(state: dict) -> dict:
     chunks = _dedup(chunks)
     for c in chunks:
         c.metadata["chunk_total"] = len(chunks)
+    
+    source_type = state.get("source_type", "pdf")
+    
+    # ── Group chunks into parents ────────────────────────────────────────────
+    from src.ingestion.parent_child_creator import group_chunks_into_parents
+    parents = group_chunks_into_parents(chunks, source_id, source_type)
+    
+    # Map child IDs to parent_id and schema fields
+    child_to_parent = {}
+    for p in parents:
+        for cid in p["child_ids"]:
+            child_to_parent[cid] = p["parent_id"]
+
+    for i, c in enumerate(chunks):
+        cid = c.metadata.get("chunk_id") or f"{source_id}_{i}"
+        c.metadata["chunk_id"] = cid
+        c.metadata["child_id"] = cid
+        c.metadata["source_id"] = source_id
+        c.metadata["source_type"] = source_type
+        c.metadata["document_id"] = state.get("file_path", source_id)
+        c.metadata["chunking_strategy_used"] = c.metadata.get("strategy_used") or state.get("strategy", "unknown")
+        c.metadata["position_in_source"] = c.metadata.get("chunk_index", i)
+        
+        # Parent mapping
+        pid = child_to_parent.get(cid)
+        c.metadata["parent_id"] = pid
+        
+        # Position in parent
+        if pid:
+            parent_record = next((p for p in parents if p["parent_id"] == pid), None)
+            if parent_record:
+                try:
+                    c.metadata["position_in_parent"] = parent_record["child_ids"].index(cid)
+                except ValueError:
+                    c.metadata["position_in_parent"] = 0
+            else:
+                c.metadata["position_in_parent"] = 0
+        else:
+            c.metadata["position_in_parent"] = 0
+
+        # Child type
+        if "child_type" not in c.metadata:
+            if source_type == "youtube":
+                c.metadata["child_type"] = "transcript"
+            elif source_type == "image":
+                c.metadata["child_type"] = "caption"
+            else:
+                c.metadata["child_type"] = "text"
+
+        # Page number
+        c.metadata["page_number"] = c.metadata.get("page") or c.metadata.get("page_number")
+        
+        # Timestamps for video
+        if source_type == "youtube":
+            c.metadata["timestamps"] = {
+                "start": c.metadata.get("start"),
+                "end": c.metadata.get("end")
+            }
+            
+        # Heading path
+        c.metadata["heading_path"] = c.metadata.get("section_heading") or c.metadata.get("chapter")
+        
+        # Text representation
+        c.metadata["text"] = c.page_content
+
     store_path = os.path.join(VECTOR_STORE_DIR, source_id)
     os.makedirs(store_path, exist_ok=True)
 
-    embedding_model_name = state.get("embedding_model")
+    # Force the use of exactly one main retrieval embedding model for FAISS
     from src.ingestion.embedding.embedding_registry import EmbeddingRegistry
-    embeddings_model = EmbeddingRegistry.get(embedding_model_name)
+    embeddings_model = EmbeddingRegistry.get()
     resolved_model_name = getattr(embeddings_model, "model_name", getattr(embeddings_model, "model", "unknown"))
-    logger.info("[embed_and_index] Embedding %d chunks (model=%s)", len(chunks), resolved_model_name)
+    logger.info("[embed_and_index] Embedding %d chunks using main retrieval model: %s", len(chunks), resolved_model_name)
 
     # Resolve dimension of embedding model
     sample_emb = embeddings_model.embed_query("test")
     dim = len(sample_emb)
+
+    # ── Save parents and child chunks in SQLite ──────────────────────────────
+    try:
+        from src.storage.sqlite_manager import SQLiteManager
+        db = SQLiteManager()
+        
+        # 1. Register/Save source
+        filename = state.get("source_name") or state.get("file_path", source_id)
+        if filename and not state.get("source_name"):
+            filename = os.path.basename(filename)
+        db.save_source(
+            source_id=source_id,
+            name=filename,
+            source_type=source_type,
+            metadata={
+                "total_pages": state.get("total_pages", 1),
+                "num_chunks": len(chunks),
+                "embedding_model": resolved_model_name
+            }
+        )
+        logger.info("[embed_and_index] Source '%s' registered in SQLite", source_id)
+        
+        # 2. Save parents
+        if parents:
+            n_parents = db.save_parents_batch(parents)
+            logger.info("[embed_and_index] Saved %d parents to SQLite", n_parents)
+            
+        # 3. Save child chunks to SQLite chunks table
+        chunk_records = []
+        for c in chunks:
+            chunk_records.append({
+                "chunk_id": c.metadata.get("chunk_id"),
+                "source_id": source_id,
+                "content": c.page_content,
+                "metadata": c.metadata,
+                "embedding_dim": dim
+            })
+        n_chunks = db.save_chunks_batch(chunk_records)
+        logger.info("[embed_and_index] Saved %d child chunks to SQLite chunks table", n_chunks)
+        
+    except Exception as db_exc:
+        logger.warning("[embed_and_index] Failed to register metadata or parents/chunks in SQLite: %s", db_exc)
 
     import faiss
     from langchain_community.docstore.in_memory import InMemoryDocstore
@@ -126,25 +233,5 @@ def embed_and_index(state: dict) -> dict:
     build_parent_retriever(chunks=chunks, vectorstore_path=store_path)
     logger.info("[embed_and_index] ParentDocumentRetriever saved → '%s/docstore/'", store_path)
 
-    # Register the source in the SQLite database
-    try:
-        from src.storage.sqlite_manager import SQLiteManager
-        db = SQLiteManager()
-        filename = state.get("source_name") or state.get("file_path", source_id)
-        if filename and not state.get("source_name"):
-            filename = os.path.basename(filename)
-        db.save_source(
-            source_id=source_id,
-            name=filename,
-            source_type=state.get("source_type", "pdf"),
-            metadata={
-                "total_pages": state.get("total_pages", 1),
-                "num_chunks": len(chunks),
-                "embedding_model": embedding_model_name or "all-MiniLM-L6-v2"
-            }
-        )
-        logger.info("[embed_and_index] Source '%s' registered in SQLite database as '%s'", source_id, filename)
-    except Exception as db_exc:
-        logger.warning("[embed_and_index] Failed to register source in SQLite: %s", db_exc)
-
     return {"vectorstore_path": store_path, "num_chunks": len(chunks)}
+

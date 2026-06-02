@@ -6,23 +6,19 @@ LangGraph ingestion pipeline for image sources (PRD §2.5).
 Stages:
   1. image_validate  — check format (PNG/JPG/WebP/GIF), get dimensions
   2. image_caption   — VLM via Ollama (LLaVA primary, moondream2 fallback)
-  3. image_chunk     — single chunk (VLM output is already 100-250 words)
+  3. image_chunk     — parse VLM output + local OCR -> 3 child chunks
   4. image_embed     — embed + persist
-
-Usage:
-    from src.ingestion.image_pipeline import run_image_pipeline
-    result = run_image_pipeline(file_path="diagram.png", source_id="img_001")
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict, Optional
 
 from langchain_core.documents import Document
 from langgraph.graph import END, StateGraph
 from src.ingestion.state import IngestionState
-
 from src.ingestion.nodes.utils import safe_node
 
 logger = logging.getLogger(__name__)
@@ -31,16 +27,18 @@ OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 VLM_PRIMARY      = os.getenv("VLM_PRIMARY",     "llava")
 VLM_FALLBACK     = os.getenv("VLM_FALLBACK",    "moondream")
 
-CAPTION_PROMPT = """Describe this image in comprehensive detail. Include:
-1. Main subject(s) and what they are doing or showing
-2. All visible text or numbers (transcribe exactly)
-3. Charts, graphs, or data visualizations (describe all values, labels, trends)
-4. Spatial relationships between elements
-5. Colors, styles, or visual patterns that carry meaning
-6. Any context clues about the purpose or source of this image
+CAPTION_PROMPT = """Analyze this image and provide three distinct sections in your response:
 
-Be precise and factual. Do not speculate. Use technical language if appropriate."""
+[CAPTION]
+Provide a detailed 1-2 paragraph description/caption of the main subject, context, and visual style of the image.
 
+[OCR]
+Transcribe every word, letter, number, and piece of visible text exactly as it appears in the image. If there is no text, write "No text present".
+
+[REGIONS]
+Identify the key regions, objects, or bounding areas in the image and describe what is present in each part (e.g. 'top-right: logo', 'center: bar chart').
+
+Ensure you use the exact headers [CAPTION], [OCR], and [REGIONS] as delimiters in your response."""
 
 # ---------------------------------------------------------------------------
 # Nodes
@@ -69,7 +67,6 @@ def image_validate(state: dict) -> dict:
         "image_format":     fmt,
         "image_size_bytes": size_bytes,
     }
-
 
 @safe_node("image_caption")
 def image_caption(state: dict) -> dict:
@@ -111,36 +108,106 @@ def image_caption(state: dict) -> dict:
 
     return {"caption": caption, "vlm_model_used": vlm_model}
 
-
 @safe_node("image_chunk")
 def image_chunk(state: dict) -> dict:
     source_id = state["source_id"]
-    caption   = state["caption"]
+    caption_content = state["caption"]
     file_path = state["file_path"]
 
-    chunk = Document(
-        page_content=caption,
+    # Parse sections from VLM response
+    caption_text = ""
+    ocr_text = ""
+    regions_text = ""
+
+    try:
+        caption_match = re.search(r"\[CAPTION\](.*?)(?=\[OCR\]|\[REGIONS\]|$)", caption_content, re.DOTALL | re.IGNORECASE)
+        ocr_match = re.search(r"\[OCR\](.*?)(?=\[CAPTION\]|\[REGIONS\]|$)", caption_content, re.DOTALL | re.IGNORECASE)
+        regions_match = re.search(r"\[REGIONS\](.*?)(?=\[CAPTION\]|\[OCR\]|$)", caption_content, re.DOTALL | re.IGNORECASE)
+
+        if caption_match:
+            caption_text = caption_match.group(1).strip()
+        if ocr_match:
+            ocr_text = ocr_match.group(1).strip()
+        if regions_match:
+            regions_text = regions_match.group(1).strip()
+    except Exception as parse_err:
+        logger.warning("[image_chunk] Failed to parse VLM output: %s", parse_err)
+
+    if not caption_text:
+        caption_text = caption_content.strip()
+    if not ocr_text:
+        ocr_text = "No text present"
+    if not regions_text:
+        regions_text = "General image content"
+
+    # supplement VLM OCR using local pytesseract
+    try:
+        import pytesseract
+        from PIL import Image
+        local_ocr = pytesseract.image_to_string(Image.open(file_path)).strip()
+        if local_ocr and len(local_ocr) > 3:
+            logger.info("[image_chunk] Local pytesseract OCR text extracted (%d chars)", len(local_ocr))
+            ocr_text = f"{ocr_text}\n\n[Local Tesseract OCR Extraction]:\n{local_ocr}"
+    except Exception as ocr_err:
+        logger.warning("[image_chunk] Local pytesseract OCR not available: %s", ocr_err)
+
+    chunks = []
+    
+    # 1. Caption Child Chunk
+    chunks.append(Document(
+        page_content=caption_text,
         metadata={
             "source_id":         source_id,
             "source_type":       "image",
-            "chunk_id":          f"{source_id}_0",
+            "chunk_id":          f"{source_id}_caption",
             "chunk_index":       0,
-            "modality":          "image_caption",
+            "child_type":        "caption",
+            "strategy_used":     "vlm_caption",
             "image_path":        file_path,
             "image_dimensions":  state.get("image_dimensions", ""),
             "vlm_model_used":    state.get("vlm_model_used", ""),
-            "caption_length":    len(caption.split()),
-        },
-    )
-    logger.info("[image_chunk] Single caption chunk (%d tokens est)", chunk.metadata["caption_length"])
-    return {"chunks": [chunk]}
+        }
+    ))
 
+    # 2. OCR Child Chunk
+    chunks.append(Document(
+        page_content=ocr_text,
+        metadata={
+            "source_id":         source_id,
+            "source_type":       "image",
+            "chunk_id":          f"{source_id}_ocr",
+            "chunk_index":       1,
+            "child_type":        "ocr",
+            "strategy_used":     "vlm_ocr",
+            "image_path":        file_path,
+            "image_dimensions":  state.get("image_dimensions", ""),
+            "vlm_model_used":    state.get("vlm_model_used", ""),
+        }
+    ))
+
+    # 3. Regions Child Chunk
+    chunks.append(Document(
+        page_content=regions_text,
+        metadata={
+            "source_id":         source_id,
+            "source_type":       "image",
+            "chunk_id":          f"{source_id}_regions",
+            "chunk_index":       2,
+            "child_type":        "region_description",
+            "strategy_used":     "vlm_regions",
+            "image_path":        file_path,
+            "image_dimensions":  state.get("image_dimensions", ""),
+            "vlm_model_used":    state.get("vlm_model_used", ""),
+        }
+    ))
+
+    logger.info("[image_chunk] Created 3 child chunks: caption, ocr, region_description")
+    return {"chunks": chunks}
 
 @safe_node("image_embed")
 def image_embed(state: dict) -> dict:
     from src.ingestion.nodes.embed_node import embed_and_index
     return embed_and_index(state)
-
 
 # ---------------------------------------------------------------------------
 # Graph
@@ -159,9 +226,7 @@ def _build_image_graph() -> StateGraph:
     g.add_edge("image_embed",    END)
     return g.compile()
 
-
 image_app = _build_image_graph()
-
 
 # ---------------------------------------------------------------------------
 # Public runner
@@ -177,8 +242,6 @@ def run_image_pipeline(file_path: str, source_id: str, source_name: Optional[str
     if result.get("error"):
         raise RuntimeError(f"Image pipeline failed: {result['error']}")
     logger.info(
-        "[run_image_pipeline] Done — caption %d words, model=%s",
-        result.get("caption", "").count(" ") + 1 if result.get("caption") else 0,
-        result.get("vlm_model_used", "?"),
+        "[run_image_pipeline] Done — VLM description and OCR child chunks indexed."
     )
     return result

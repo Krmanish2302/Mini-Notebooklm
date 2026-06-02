@@ -54,13 +54,13 @@ class AdvancedRetriever:
         top_k:            int  = TOP_K,
         expand_queries:   bool = EXPAND_QUERIES,
         use_rerank:       bool = USE_RERANK,
-        use_compression:  bool = False,
+        use_reordering:   bool = True,
     ):
         self.vectorstore_path = vectorstore_path
         self.top_k            = top_k
         self.expand_queries   = expand_queries
         self.use_rerank       = use_rerank
-        self.use_compression  = use_compression
+        self.use_reordering   = use_reordering
 
         self._hybrid    = HybridRetriever(vectorstore_path, top_k=top_k * 3)
         self._decomposer = SubQueryDecomposer(n=3, use_llm=expand_queries)
@@ -101,16 +101,24 @@ class AdvancedRetriever:
         if self.use_rerank and all_docs:
             all_docs = self._reranker.rerank(query, all_docs, top_n=self.top_k)
 
-        # 4. Contextual compression (optional, costs LLM calls)
-        if self.use_compression and all_docs:
-            from .contextual_compressor import ContextualCompressor
-            all_docs = ContextualCompressor().compress(query, all_docs)
-
-        # 5. Final trim
+        # 4. Final trim
         final_docs = all_docs[:self.top_k]
 
+        # 5. Reorder (Lost-in-the-Middle)
+        if self.use_reordering and final_docs:
+            from .reorder import reorder_chunks
+            chunks_with_scores = []
+            for doc in final_docs:
+                score = doc.metadata.get("relevance_score", doc.metadata.get("score", 0.0))
+                try:
+                    score = float(score)
+                except (ValueError, TypeError):
+                    score = 0.0
+                chunks_with_scores.append((doc, score))
+            final_docs = reorder_chunks(chunks_with_scores)
+
         # 6. Build context
-        context = self._builder.build(final_docs, query)
+        context = self._builder.build(final_docs, query="")
 
         return {
             "context":   context,

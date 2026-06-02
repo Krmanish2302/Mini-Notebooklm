@@ -662,6 +662,8 @@ def render_chat_interface():
             ragas = msg.get("ragas")
 
             if msg["role"] == "assistant" and ragas:
+                if _HAS_UI:
+                    render_grounding_badge(ragas)
                 # Custom SVG circle gauge
                 faithfulness = ragas.get("faithfulness")
                 if faithfulness is not None:
@@ -703,7 +705,20 @@ def render_chat_interface():
                                 st.caption(f"• **History Turn Candidates:** {stats.get('history_count', 0)}")
                                 st.caption(f"• **Reciprocal Rank Fusion (RRF) Candidates:** {stats.get('rrf_fused', 0)}")
                                 st.caption(f"• **Reranked Candidates (FlashRank):** {stats.get('reranked', 0)}")
-                                st.caption(f"• **Compressed Sentences (Contextual Compressor):** {stats.get('compressed', 0)}")
+                                if "reordered" in stats:
+                                    st.caption(f"• **Reordered Chunks (Lost-in-the-Middle):** {stats.get('reordered', 0)}")
+                                else:
+                                    st.caption(f"• **Compressed Sentences (Contextual Compressor):** {stats.get('compressed', 0)}")
+                            st.divider()
+
+                        if meta.get("pipeline_mode") in ("deep_research", "study"):
+                            st.markdown("**📂 Parent-Child Context Resolution**")
+                            st.caption("• **SQLite Parent Store:** Fine-grained retrieved child chunks were resolved to whole parent sections/pages in SQLite to preserve full context.")
+                            
+                        if meta.get("graph_context"):
+                            st.markdown("**🌐 SQLite Knowledge Graph Concept Map**")
+                            for rel in meta["graph_context"]:
+                                st.caption(f"• `{rel['source']}` \u2192 `{rel['target']}` ({rel['relation']}) [Confidence: {rel.get('confidence', 1.0)}]")
                             st.divider()
 
                         if meta.get("sub_queries"):
@@ -720,6 +735,7 @@ def render_chat_interface():
                                 st.divider()
                         if ragas and _HAS_UI:
                             render_ragas_panel(ragas, key=f"hist_{idx}")
+
             except Exception:
                 pass
 
@@ -757,6 +773,23 @@ def render_chat_interface():
 
             # Streaming block — catch ALL exceptions to never block rendering
             try:
+                spinner_html = """
+                <div class="loader-container" style="display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-radius: 12px; background: rgba(128, 128, 128, 0.05); border: 1px solid rgba(128, 128, 128, 0.1); width: fit-content; margin-bottom: 12px;">
+                    <div class="spinner" style="width: 20px; height: 20px; border: 2px solid transparent; border-top: 2px solid #6366F1; border-right: 2px solid #8B5CF6; border-radius: 50%; animation: spin 0.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;"></div>
+                    <span class="loading-text" style="font-family: 'Outfit', 'Inter', sans-serif; font-size: 14px; color: var(--text-color, #4B5563); font-weight: 500; animation: pulse 1.5s infinite ease-in-out;">Retrieving knowledge & thinking...</span>
+                </div>
+                <style>
+                    @keyframes spin {
+                        0% { transform: rotate(0deg); }
+                        100% { transform: rotate(360deg); }
+                    }
+                    @keyframes pulse {
+                        0%, 100% { opacity: 0.6; }
+                        50% { opacity: 1; }
+                    }
+                </style>
+                """
+                placeholder.markdown(spinner_html, unsafe_allow_html=True)
                 with requests.post(
                     f"{API_URL}/query/stream", json=payload, stream=True, timeout=120
                 ) as r:
@@ -794,8 +827,10 @@ def render_chat_interface():
             if stream_error:
                 st.error(stream_error)
 
-            # Grounding circle
+            # Grounding circle and inline badge
             if ragas_result:
+                if _HAS_UI:
+                    render_grounding_badge(ragas_result)
                 faithfulness = ragas_result.get("faithfulness")
                 if faithfulness is not None:
                     draw_grounding_circle(faithfulness)
@@ -851,7 +886,10 @@ def render_chat_interface():
                                 st.caption(f"• **History Turn Candidates:** {stats.get('history_count', 0)}")
                                 st.caption(f"• **Reciprocal Rank Fusion (RRF) Candidates:** {stats.get('rrf_fused', 0)}")
                                 st.caption(f"• **Reranked Candidates (FlashRank):** {stats.get('reranked', 0)}")
-                                st.caption(f"• **Compressed Sentences (Contextual Compressor):** {stats.get('compressed', 0)}")
+                                if "reordered" in stats:
+                                    st.caption(f"• **Reordered Chunks (Lost-in-the-Middle):** {stats.get('reordered', 0)}")
+                                else:
+                                    st.caption(f"• **Compressed Sentences (Contextual Compressor):** {stats.get('compressed', 0)}")
                             st.divider()
 
                         if metadata.get("sub_queries"):

@@ -316,22 +316,44 @@ def _make_retrieve(faiss_store: MultiFAISSStore, sqlite: SQLiteManager, rag_hist
     return node
 
 
-def _make_compress(compressor):
+def _make_reorder():
     def node(state: ChatState) -> ChatState:
-        if state.get("error") or compressor is None:
+        if state.get("error"):
             return state
         if state.get("cached_response"):
             return state
-        chunks = state.get("retrieved", [])
-        if not chunks:
+        retrieved = state.get("retrieved", [])
+        if not retrieved:
             return state
         try:
-            # Fix parameter order bug: query first, then chunks
-            compressed = compressor.compress(state["query"], chunks)
-            logger.debug("[ChatGraph:compress] %d → %d", len(chunks), len(compressed))
-            return {**state, "retrieved": compressed}
+            from src.retrieval.reorder import reorder_chunks
+
+            # Separate history_chunks and source chunks from retrieved based on source_id == "history"
+            history_chunks = [c for c in retrieved if c.get("source_id") == "history"]
+            source_chunks = [c for c in retrieved if c.get("source_id") != "history"]
+
+            # Extract rerank_score (or default score) for source chunks and call reorder_chunks on them
+            chunks_with_scores = []
+            for c in source_chunks:
+                score = c.get("rerank_score", c.get("score", 0.0))
+                try:
+                    score = float(score)
+                except (ValueError, TypeError):
+                    score = 0.0
+                chunks_with_scores.append((c, score))
+
+            reordered_sources = reorder_chunks(chunks_with_scores)
+
+            # Re-assemble retrieved documents by prepending history_chunks before reordered_sources
+            combined = history_chunks + reordered_sources
+
+            logger.debug(
+                "[ChatGraph:reorder] %d sources reordered, %d history chunks prepended",
+                len(reordered_sources), len(history_chunks)
+            )
+            return {**state, "retrieved": combined}
         except Exception as exc:
-            logger.warning("[ChatGraph:compress] fallback — %s", exc)
+            logger.warning("[ChatGraph:reorder] fallback — %s", exc)
             return state
     return node
 
@@ -467,7 +489,7 @@ def build_chat_graph(
     builder = StateGraph(ChatState)
     builder.add_node("embed_query",  _make_embed_query(faiss_store))
     builder.add_node("retrieve",     _make_retrieve(faiss_store, sqlite, rag_history_store))
-    builder.add_node("compress",     _make_compress(compressor))
+    builder.add_node("reorder",      _make_reorder())
     builder.add_node("rerank",       _make_rerank(reranker))
     builder.add_node("build_prompt", _make_build_prompt())
     builder.add_node("generate",     _make_generate())
@@ -475,8 +497,8 @@ def build_chat_graph(
     builder.set_entry_point("embed_query")
     builder.add_edge("embed_query",  "retrieve")
     builder.add_edge("retrieve",     "rerank")
-    builder.add_edge("rerank",       "compress")
-    builder.add_edge("compress",     "build_prompt")
+    builder.add_edge("rerank",       "reorder")
+    builder.add_edge("reorder",      "build_prompt")
     builder.add_edge("build_prompt", "generate")
     builder.add_edge("generate",     END)
 

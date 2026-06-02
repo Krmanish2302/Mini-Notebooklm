@@ -44,7 +44,19 @@ CREATE TABLE IF NOT EXISTS chat_history (
     created_at  REAL    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ch_session ON chat_history(session_id);
+
+CREATE TABLE IF NOT EXISTS chat_history_chunks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT    NOT NULL,
+    turn_index  INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    chunk_text  TEXT    NOT NULL,
+    chunk_embedding TEXT NOT NULL,
+    created_at  REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chc_session ON chat_history_chunks(session_id);
 """
+
 
 
 class RAGHistoryStore:
@@ -113,9 +125,29 @@ class RAGHistoryStore:
                 """,
                 (session_id, turn_index, user_query, assistant_answer, emb_json, q_emb_json, r_emb_json, time.time()),
             )
+            
+        # Chunk assistant answer by sentences
+        import re
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", assistant_answer) if s.strip()]
+        if sentences:
+            with self._db._conn() as conn:
+                for idx, sentence in enumerate(sentences):
+                    s_emb = self._embed_text(sentence)
+                    s_emb_json = json.dumps(s_emb) if s_emb else None
+                    if s_emb_json:
+                        conn.execute(
+                            """
+                            INSERT INTO chat_history_chunks
+                                (session_id, turn_index, chunk_index, chunk_text, chunk_embedding, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (session_id, turn_index, idx, sentence, s_emb_json, time.time()),
+                        )
+                        
         logger.debug(
-            "[RAGHistoryStore] saved turn %d for session=%s", turn_index, session_id
+            "[RAGHistoryStore] saved turn %d for session=%s and split into %d chunks", turn_index, session_id, len(sentences)
         )
+
 
     def _embed_text(self, text: str) -> Optional[List[float]]:
         if self._emb is None:
@@ -240,52 +272,125 @@ class RAGHistoryStore:
     ) -> List[Document]:
         """
         Retrieve top_k past turns formatted as Document objects containing only responses.
-        Matched against response_embedding.
+        Matched against response chunk embeddings in chat_history_chunks.
         """
         from langchain_core.documents import Document
 
-        with self._db._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT turn_index, user_query, assistant_answer, response_embedding
-                FROM   chat_history
-                WHERE  session_id = ?
-                ORDER  BY turn_index ASC
-                """,
-                (session_id,),
-            ).fetchall()
+        # Try to retrieve from chat_history_chunks table first
+        chunk_rows = []
+        try:
+            with self._db._conn() as conn:
+                chunk_rows = conn.execute(
+                    """
+                    SELECT turn_index, chunk_index, chunk_text, chunk_embedding
+                    FROM   chat_history_chunks
+                    WHERE  session_id = ?
+                    ORDER  BY turn_index ASC, chunk_index ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+        except Exception as e:
+            logger.warning("[RAGHistoryStore] Failed to query chat_history_chunks: %s", e)
+
+        # If chunk_rows exist, score and return top chunks
+        if chunk_rows and self._emb is not None:
+            scored_chunks = []
+            try:
+                q_vec = self._emb.embed_query(current_query)
+                for row in chunk_rows:
+                    emb_json = row[3] # chunk_embedding
+                    if not emb_json:
+                        continue
+                    try:
+                        chunk_vec = json.loads(emb_json)
+                        score = _cosine(q_vec, chunk_vec)
+                        scored_chunks.append((row, score))
+                    except Exception:
+                        continue
+            except Exception as exc:
+                logger.warning("[RAGHistoryStore] retrieve_history_docs chunk scoring failed: %s", exc)
+
+            if scored_chunks:
+                top = sorted(scored_chunks, key=lambda x: x[1], reverse=True)[:top_k]
+                # Re-sort chronologically by turn_index and chunk_index
+                top.sort(key=lambda x: (x[0][0], x[0][1]))
+                
+                docs = []
+                for row, score in top:
+                    docs.append(Document(
+                        page_content=row[2], # chunk_text
+                        metadata={
+                            "source_id": "history",
+                            "source_name": "Chat History",
+                            "is_history": True,
+                            "turn_index": row[0],
+                            "chunk_index": row[1],
+                            "relevance_score": score
+                        }
+                    ))
+                return docs
+
+        # Fallback if chat_history_chunks is empty: load raw turns from chat_history and chunk on-the-fly
+        try:
+            with self._db._conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT turn_index, user_query, assistant_answer, response_embedding
+                    FROM   chat_history
+                    WHERE  session_id = ?
+                    ORDER  BY turn_index ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+        except Exception:
+            rows = []
 
         if not rows:
             return []
 
-        scored = []
+        # If we have turns, we split them into chunks on-the-fly and score them
+        scored_chunks = []
         if self._emb is not None:
             try:
                 q_vec = self._emb.embed_query(current_query)
+                import re
                 for row in rows:
-                    emb_json = row[3] # response_embedding
-                    if not emb_json:
-                        continue
-                    try:
-                        turn_vec = json.loads(emb_json)
-                        score    = _cosine(q_vec, turn_vec)
-                        scored.append((row, score))
-                    except Exception:
-                        continue
+                    turn_idx = row[0]
+                    assistant_answer = row[2]
+                    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", assistant_answer) if s.strip()]
+                    for chunk_idx, sentence in enumerate(sentences):
+                        s_emb = self._embed_text(sentence)
+                        if s_emb:
+                            score = _cosine(q_vec, s_emb)
+                            scored_chunks.append((turn_idx, chunk_idx, sentence, score))
             except Exception as exc:
-                logger.warning("[RAGHistoryStore] retrieve_history_docs scoring failed: %s", exc)
+                logger.warning("[RAGHistoryStore] retrieve_history_docs fallback chunking/scoring failed: %s", exc)
 
-        if scored:
-            top = sorted(scored, key=lambda x: x[1], reverse=True)[:top_k]
-            top.sort(key=lambda x: x[0][0])
-            turns = [t[0] for t in top]
-        else:
-            turns = rows[-fallback_last:]
+        if scored_chunks:
+            top = sorted(scored_chunks, key=lambda x: x[3], reverse=True)[:top_k]
+            top.sort(key=lambda x: (x[0], x[1]))
+            
+            docs = []
+            for turn_idx, chunk_idx, text, score in top:
+                docs.append(Document(
+                    page_content=text,
+                    metadata={
+                        "source_id": "history",
+                        "source_name": "Chat History",
+                        "is_history": True,
+                        "turn_index": turn_idx,
+                        "chunk_index": chunk_idx,
+                        "relevance_score": score
+                    }
+                ))
+            return docs
 
+        # Ultimate fallback: return last turns as whole documents
+        turns = rows[-fallback_last:]
         docs = []
         for row in turns:
             docs.append(Document(
-                page_content=row[2], # assistant_answer only
+                page_content=row[2], # assistant_answer
                 metadata={
                     "source_id": "history",
                     "source_name": "Chat History",
@@ -294,6 +399,7 @@ class RAGHistoryStore:
                 }
             ))
         return docs
+
 
     def check_semantic_cache(
         self,

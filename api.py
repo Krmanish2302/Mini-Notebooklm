@@ -156,6 +156,8 @@ async def lifespan(app: FastAPI):
     _persona       = PersonaConfig()
     _ragas_history = deque(maxlen=50)
     pipeline       = MiniNotebookLM(PipelineConfig())
+    if pipeline._evaluator_cls and pipeline._evaluator is None:
+        pipeline._evaluator = pipeline._evaluator_cls()
     logger.info("lifespan: pipeline ready — %s", pipeline.status())
     yield
     logger.info("lifespan: shutdown")
@@ -245,16 +247,30 @@ async def _run_ragas(
     contexts: list,
     ground_truth: Optional[str] = None,
 ) -> dict:
+    if not pipeline._evaluator:
+        if hasattr(pipeline, "_evaluator_cls") and pipeline._evaluator_cls:
+            pipeline._evaluator = pipeline._evaluator_cls()
+        else:
+            return {}
+
+    # Standardise contexts to list of Document or dict expected by evaluator
+    from langchain_core.documents import Document
+    context_chunks = []
+    for c in contexts:
+        if isinstance(c, dict):
+            context_chunks.append(c)
+        elif hasattr(c, "page_content"):
+            context_chunks.append(c)
+        else:
+            context_chunks.append({"content": str(c)})
+
     loop   = asyncio.get_running_loop()
     result = await loop.run_in_executor(
         None,
         lambda: pipeline._evaluator.evaluate(
-            query=question,
+            question=question,
             answer=answer,
-            contexts=[
-                (c.get("content", "") if isinstance(c, dict) else str(c))
-                for c in contexts
-            ],
+            context_chunks=context_chunks,
             ground_truth=ground_truth,
         ) if pipeline._evaluator else {},
     )
@@ -663,6 +679,7 @@ def delete_source(source_id: str):
         
         # Delete from SQLite database
         db.delete_chunks_by_source(source_id)
+        db.delete_parents_by_source(source_id)
         db.delete_source(source_id)
         
         # Delete FAISS vectorstore files from disk
@@ -712,6 +729,10 @@ async def query(req: QueryRequest):
             "sources_used": gen_result.sources_used,
             "chunks_used": len(gen_result.chunks_used),
             "tokens_estimate": gen_result.tokens_estimate,
+            "sub_queries": gen_result.sub_queries,
+            "quiz_cards": gen_result.quiz_cards,
+            "summary_bullets": gen_result.summary_bullets,
+            "graph_context": gen_result.graph_context,
             "ragas": ragas,
         }
         serializable_data = json.loads(safe_json_dumps(res_dict))
@@ -768,6 +789,9 @@ async def query_stream(req: QueryRequest):
                     raise event
 
                 etype = event.get("type")
+                if etype == "done":
+                    break
+
                 if etype == "token":
                     full_answer += event.get("content", "")
                 elif etype == "metadata":
@@ -798,13 +822,14 @@ async def query_stream(req: QueryRequest):
                         logger.warning("Event serialization failed for type=%s: %s", etype, ser_exc)
 
             if full_answer and chunks_used:
-                async def _eval():
-                    try:
-                        ragas = await _run_ragas(safe_query, full_answer, chunks_used, req.ground_truth)
-                        pipeline.last_ragas = ragas
-                    except Exception as exc:
-                        logger.warning("Post-stream RAGAS failed: %s", exc)
-                asyncio.create_task(_eval())
+                try:
+                    ragas = await _run_ragas(safe_query, full_answer, chunks_used, req.ground_truth)
+                    pipeline.last_ragas = ragas
+                    yield f"data: {safe_json_dumps({'type': 'ragas', **ragas})}\n\n"
+                except Exception as exc:
+                    logger.warning("Post-stream RAGAS failed: %s", exc)
+
+            yield f"data: {safe_json_dumps({'type': 'done'})}\n\n"
 
         except Exception as exc:
             yield f"data: {safe_json_dumps({'type': 'error', 'detail': str(exc)})}\n\n"

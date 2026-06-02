@@ -63,8 +63,46 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+CREATE TABLE IF NOT EXISTS parents (
+    parent_id      TEXT PRIMARY KEY,
+    source_id      TEXT NOT NULL,
+    source_type    TEXT NOT NULL,
+    parent_strategy TEXT NOT NULL,
+    parent_type    TEXT NOT NULL,
+    parent_text    TEXT NOT NULL,
+    parent_metadata_json TEXT NOT NULL DEFAULT '{}',
+    range_info     TEXT,
+    child_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graph_nodes (
+    node_id      TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    type         TEXT NOT NULL, -- 'concept', 'entity', 'learning_signal', etc.
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graph_edges (
+    edge_id      TEXT PRIMARY KEY,
+    source_node  TEXT NOT NULL,
+    target_node  TEXT NOT NULL,
+    relation     TEXT NOT NULL, -- 'prerequisite_of', 'depends_on', 'contrast_with', 'example_of', 'related_to', etc.
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    confidence   REAL NOT NULL DEFAULT 1.0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL,
+    FOREIGN KEY (source_node) REFERENCES graph_nodes(node_id),
+    FOREIGN KEY (target_node) REFERENCES graph_nodes(node_id),
+    UNIQUE(source_node, target_node, relation)
+);
+
 CREATE INDEX IF NOT EXISTS idx_chunks_source    ON chunks(source_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_parents_source   ON parents(source_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_src  ON graph_edges(source_node);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_tgt  ON graph_edges(target_node);
 """
 
 
@@ -368,17 +406,219 @@ class SQLiteManager:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
 
+    # ── Parents API ───────────────────────────────────────────────────────────
+
+    def save_parent(
+        self,
+        parent_id:       str,
+        source_id:       str,
+        source_type:     str,
+        parent_strategy: str,
+        parent_type:     str,
+        parent_text:     str,
+        parent_metadata: Optional[Dict[str, Any]] = None,
+        range_info:      Optional[str] = None,
+        child_ids:       Optional[List[str]] = None,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO parents (parent_id, source_id, source_type, parent_strategy, parent_type, parent_text, parent_metadata_json, range_info, child_ids_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(parent_id) DO UPDATE SET
+                    parent_text          = excluded.parent_text,
+                    parent_metadata_json = excluded.parent_metadata_json,
+                    range_info           = excluded.range_info,
+                    child_ids_json       = excluded.child_ids_json
+                """,
+                (
+                    parent_id, source_id, source_type, parent_strategy, parent_type, parent_text,
+                    json.dumps(parent_metadata or {}), range_info,
+                    json.dumps(child_ids or []), _now()
+                )
+            )
+
+    def save_parents_batch(self, parents: List[Dict[str, Any]]) -> int:
+        rows = [
+            (
+                p["parent_id"], p["source_id"], p["source_type"], p["parent_strategy"],
+                p["parent_type"], p["parent_text"], json.dumps(p.get("parent_metadata") or {}),
+                p.get("range_info"), json.dumps(p.get("child_ids") or []), _now()
+            )
+            for p in parents
+        ]
+        with self._conn() as conn:
+            conn.executemany(
+                """
+                INSERT INTO parents (parent_id, source_id, source_type, parent_strategy, parent_type, parent_text, parent_metadata_json, range_info, child_ids_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(parent_id) DO UPDATE SET
+                    parent_text          = excluded.parent_text,
+                    parent_metadata_json = excluded.parent_metadata_json,
+                    range_info           = excluded.range_info,
+                    child_ids_json       = excluded.child_ids_json
+                """,
+                rows
+            )
+        return len(rows)
+
+    def get_parent(self, parent_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM parents WHERE parent_id = ?", (parent_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "parent_id":       row["parent_id"],
+            "source_id":       row["source_id"],
+            "source_type":     row["source_type"],
+            "parent_strategy": row["parent_strategy"],
+            "parent_type":     row["parent_type"],
+            "parent_text":     row["parent_text"],
+            "parent_metadata": json.loads(row["parent_metadata_json"] or "{}"),
+            "range_info":      row["range_info"],
+            "child_ids":       json.loads(row["child_ids_json"] or "[]"),
+            "created_at":      row["created_at"]
+        }
+
+    def get_parents_batch(self, parent_ids: List[str]) -> List[Dict[str, Any]]:
+        if not parent_ids:
+            return []
+        placeholders = ",".join("?" for _ in parent_ids)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM parents WHERE parent_id IN ({placeholders})", parent_ids
+            ).fetchall()
+        return [
+            {
+                "parent_id":       r["parent_id"],
+                "source_id":       r["source_id"],
+                "source_type":     r["source_type"],
+                "parent_strategy": r["parent_strategy"],
+                "parent_type":     r["parent_type"],
+                "parent_text":     r["parent_text"],
+                "parent_metadata": json.loads(r["parent_metadata_json"] or "{}"),
+                "range_info":      r["range_info"],
+                "child_ids":       json.loads(r["child_ids_json"] or "[]"),
+                "created_at":      r["created_at"]
+            }
+            for r in rows
+        ]
+
+    def delete_parents_by_source(self, source_id: str) -> int:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM parents WHERE source_id = ?", (source_id,))
+        return cur.rowcount
+
+    # ── Knowledge Graph API ───────────────────────────────────────────────────
+
+    def add_graph_node(self, node_id: str, name: str, node_type: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO graph_nodes (node_id, name, type, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    name          = excluded.name,
+                    type          = excluded.type,
+                    metadata_json = excluded.metadata_json
+                """,
+                (node_id, name, node_type, json.dumps(metadata or {}), _now())
+            )
+
+    def add_graph_edge(
+        self,
+        source_node: str,
+        target_node: str,
+        relation:    str,
+        provenance:  Optional[Dict[str, Any]] = None,
+        confidence:  float = 1.0,
+        metadata:    Optional[Dict[str, Any]] = None,
+    ) -> None:
+        edge_id = f"{source_node}_{target_node}_{relation}"
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO graph_edges (edge_id, source_node, target_node, relation, provenance_json, confidence, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_node, target_node, relation) DO UPDATE SET
+                    provenance_json = excluded.provenance_json,
+                    confidence      = excluded.confidence,
+                    metadata_json   = excluded.metadata_json
+                """,
+                (
+                    edge_id, source_node, target_node, relation,
+                    json.dumps(provenance or {}), confidence,
+                    json.dumps(metadata or {}), _now()
+                )
+            )
+
+    def get_graph_neighbors(self, node_names_or_ids: List[str]) -> List[Dict[str, Any]]:
+        if not node_names_or_ids:
+            return []
+        placeholders = ",".join("?" for _ in node_names_or_ids)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT e.*, sn.name as source_name, tn.name as target_name 
+                FROM graph_edges e
+                JOIN graph_nodes sn ON e.source_node = sn.node_id
+                JOIN graph_nodes tn ON e.target_node = tn.node_id
+                WHERE sn.node_id IN ({placeholders}) 
+                   OR sn.name IN ({placeholders})
+                   OR tn.node_id IN ({placeholders})
+                   OR tn.name IN ({placeholders})
+                """,
+                node_names_or_ids * 4
+            ).fetchall()
+        return [
+            {
+                "edge_id":         r["edge_id"],
+                "source_node":     r["source_node"],
+                "source_name":     r["source_name"],
+                "target_node":     r["target_node"],
+                "target_name":     r["target_name"],
+                "relation":        r["relation"],
+                "provenance":      json.loads(r["provenance_json"] or "{}"),
+                "confidence":      r["confidence"],
+                "metadata":        json.loads(r["metadata_json"] or "{}"),
+                "created_at":      r["created_at"]
+            }
+            for r in rows
+        ]
+
+    def list_graph_nodes(self) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM graph_nodes").fetchall()
+        return [
+            {
+                "node_id":    r["node_id"],
+                "name":       r["name"],
+                "type":       r["type"],
+                "metadata":   json.loads(r["metadata_json"] or "{}"),
+                "created_at": r["created_at"]
+            }
+            for r in rows
+        ]
+
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> Dict[str, int]:
         with self._conn() as conn:
-            chunks   = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-            sources  = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
-            sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-            messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            chunks      = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            sources     = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+            sessions    = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            messages    = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            parents     = conn.execute("SELECT COUNT(*) FROM parents").fetchone()[0]
+            graph_nodes = conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0]
+            graph_edges = conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
         return {
-            "chunks":   chunks,
-            "sources":  sources,
-            "sessions": sessions,
-            "messages": messages,
+            "chunks":      chunks,
+            "sources":     sources,
+            "sessions":    sessions,
+            "messages":    messages,
+            "parents":     parents,
+            "graph_nodes": graph_nodes,
+            "graph_edges": graph_edges,
         }

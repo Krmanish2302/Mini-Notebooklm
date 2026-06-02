@@ -157,21 +157,29 @@ def format_context(documents: List[Any]) -> str:
     if not documents:
         return _NO_SOURCES_BLOCK
     parts: List[str] = []
-    for i, doc in enumerate(documents, 1):
+    source_idx = 1
+    for doc in documents:
         if hasattr(doc, "page_content"):
             content = doc.page_content
             meta    = doc.metadata or {}
         else:
             content = doc.get("content", "")
             meta    = {k: v for k, v in doc.items() if k != "content"}
+            
+        if meta.get("source_id") == "SQLite Study Graph":
+            parts.append(f"CONCEPT KNOWLEDGE MAP (SQLite Graph):\n{content}")
+            continue
+
         src = meta.get("source", meta.get("source_id", ""))
         src_suffix = (" " + _EM_DASH + " " + src) if src else ""
-        header = f"[S{i}]{src_suffix}"
+        header = f"[S{source_idx}]{src_suffix}"
         block  = f"{header}\n{content}"
         if ctx := meta.get("context_window", ""):
             block += f"\n[context] {ctx}"
         parts.append(block)
+        source_idx += 1
     return "\n\n".join(parts)
+
 
 
 # ── PromptBuilder ──────────────────────────────────────────────────────────────

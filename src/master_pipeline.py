@@ -110,6 +110,7 @@ class GenerationResult:
     quiz_cards:       List[Dict[str, Any]]       = field(default_factory=list)
     summary_bullets:  List[str]                  = field(default_factory=list)
     learning_path:    List[Dict[str, Any]]       = field(default_factory=list)
+    graph_context:    List[Dict[str, Any]]       = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         import dataclasses
@@ -200,6 +201,7 @@ class MiniNotebookLM:
         strategy:   Optional[str]       = None,
         source_ids: Optional[List[str]] = None,
         mode:       Optional[str]       = None,
+        do_expand:  bool                = True,
     ) -> tuple[List[Document], str, Optional[dict], dict]:
         k       = k       if k       is not None else self.config.retrieval_k
         rewrite = rewrite if rewrite is not None else self.config.retrieval_rewrite
@@ -220,7 +222,7 @@ class MiniNotebookLM:
             logger.warning("[retrieve] No retriever — returning empty docs.")
             return [], ret_query, None, {
                 "dense_count": 0, "sparse_count": 0, "history_count": 0,
-                "rrf_fused": 0, "reranked": 0, "compressed": 0, "cached_hit": False
+                "rrf_fused": 0, "reranked": 0, "reordered": 0, "cached_hit": False
             }
 
         # Determine target source IDs to query
@@ -240,7 +242,7 @@ class MiniNotebookLM:
             logger.warning("[retrieve] No active sources found to query.")
             return [], ret_query, None, {
                 "dense_count": 0, "sparse_count": 0, "history_count": 0,
-                "rrf_fused": 0, "reranked": 0, "compressed": 0, "cached_hit": False
+                "rrf_fused": 0, "reranked": 0, "reordered": 0, "cached_hit": False
             }
 
         # Resolve source names from SQLite
@@ -257,194 +259,177 @@ class MiniNotebookLM:
         if not hasattr(self, "_retriever_cache"):
             self._retriever_cache: Dict[str, Any] = {}
 
-        if mode == "chat":
-            # Semantic query caching check
-            cache_hit = None
-            if self.history_store is not None:
-                try:
-                    cache_hit = self.history_store.check_semantic_cache("default", query, threshold=0.90)
-                except Exception as e:
-                    logger.warning("[retrieve] Semantic cache check failed: %s", e)
-            if cache_hit is not None:
-                retrieval_stats = {
-                    "dense_count": 0,
-                    "sparse_count": 0,
-                    "history_count": 0,
-                    "rrf_fused": 0,
-                    "reranked": 0,
-                    "compressed": 0,
-                    "cached_hit": True,
-                }
-                return [], ret_query, cache_hit, retrieval_stats
+        # Semantic query caching check (disabled/dropped)
+        cache_hit = None
 
-            # Run parallel Dense similarity search + Sparse BM25 search + History turn retrieval
-            from concurrent.futures import ThreadPoolExecutor
-            dense_futures = {}
-            sparse_futures = {}
-            history_future = None
-
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                if self.history_store is not None:
-                    history_future = executor.submit(
-                        self.history_store.retrieve_history_docs,
-                        session_id="default",
-                        current_query=query,
-                        top_k=2
-                    )
-
-                for sid in target_sids:
-                    sid_path = os.path.join("data/vectorstores", sid)
-                    if os.path.exists(sid_path):
-                        try:
-                            if sid not in self._retriever_cache:
-                                self._retriever_cache[sid] = self._retrieval_cls(
-                                    vectorstore_path=sid_path, top_k=k
-                                )
-                            r = self._retriever_cache[sid]
-                            if r._ensemble is None:
-                                r._ensemble = r._build(k)
-                            
-                            if getattr(r, "dense_retriever", None) is not None:
-                                dense_futures[sid] = executor.submit(r.dense_retriever.invoke, query)
-                            if getattr(r, "bm25_retriever", None) is not None:
-                                sparse_futures[sid] = executor.submit(r.bm25_retriever.invoke, query)
-                        except Exception as e:
-                            logger.warning("[retrieve] Failed to submit parallel searches for '%s': %s", sid, e)
-
-            # Collect history chunks (containing only assistant responses)
-            history_docs = []
-            if history_future is not None:
-                try:
-                    history_docs = history_future.result()
-                except Exception as e:
-                    logger.warning("[retrieve] Parallel history retrieval failed: %s", e)
-
-            # Collect dense and sparse documents
-            all_dense = []
-            for sid, fut in dense_futures.items():
-                try:
-                    docs = fut.result()
-                    for doc in docs:
-                        if "source_id" not in doc.metadata:
-                            doc.metadata["source_id"] = sid
-                        doc.metadata["source_name"] = source_names.get(sid, doc.metadata.get("source_name", sid))
-                    all_dense.extend(docs)
-                except Exception as e:
-                    logger.warning("[retrieve] Parallel dense search failed for '%s': %s", sid, e)
-
-            all_sparse = []
-            for sid, fut in sparse_futures.items():
-                try:
-                    docs = fut.result()
-                    for doc in docs:
-                        if "source_id" not in doc.metadata:
-                            doc.metadata["source_id"] = sid
-                        doc.metadata["source_name"] = source_names.get(sid, doc.metadata.get("source_name", sid))
-                    all_sparse.extend(docs)
-                except Exception as e:
-                    logger.warning("[retrieve] Parallel sparse search failed for '%s': %s", sid, e)
-
-            # Extract distinct rank lists for RRF
-            def get_cid(d):
-                return d.metadata.get("chunk_id") or d.metadata.get("id") or str(hash(d.page_content))
-
-            dense_ids, seen_dense = [], set()
-            for doc in all_dense:
-                cid = get_cid(doc)
-                if cid not in seen_dense:
-                    seen_dense.add(cid)
-                    dense_ids.append(cid)
-
-            sparse_ids, seen_sparse = [], set()
-            for doc in all_sparse:
-                cid = get_cid(doc)
-                if cid not in seen_sparse:
-                    seen_sparse.add(cid)
-                    sparse_ids.append(cid)
-
-            # RRF Fusion (dense and sparse only)
-            RRF_K = 60
-            scores = {}
-            for rank, cid in enumerate(dense_ids):
-                scores[cid] = scores.get(cid, 0.0) + 1.0 / (RRF_K + rank + 1)
-            for rank, cid in enumerate(sparse_ids):
-                scores[cid] = scores.get(cid, 0.0) + 1.0 / (RRF_K + rank + 1)
-
-            fused_cids = sorted(scores, key=lambda cid: scores[cid], reverse=True)[:k]
-            doc_map = {get_cid(d): d for d in all_dense + all_sparse}
-            fused_docs = [doc_map[cid] for cid in fused_cids if cid in doc_map]
-
-            # Reranking on fused documents
-            try:
-                from src.retrieval.reranker import Reranker
-                reranker = Reranker()
-                reranked_docs = reranker.rerank(query, fused_docs, top_n=k)
-            except Exception as e:
-                logger.warning("[retrieve] Parallel reranking failed: %s", e)
-                reranked_docs = fused_docs[:k]
-
-            # Combine reranked documents and history chunks (history does not participate in RRF or reranking)
-            combined_docs = reranked_docs + history_docs
-
-            # Contextual compression on the combined documents
-            try:
-                from src.retrieval.contextual_compressor import ContextualCompressor
-                compressor = ContextualCompressor()
-                compressed_docs = compressor.compress(query, combined_docs)
-            except Exception as e:
-                logger.warning("[retrieve] Parallel contextual compression failed: %s", e)
-                compressed_docs = combined_docs
-
-            logger.info(
-                "[retrieve] Chat mode parallel retrieval: dense=%d sparse=%d history=%d fused=%d reranked=%d compressed=%d",
-                len(all_dense), len(all_sparse), len(history_docs), len(fused_docs), len(reranked_docs), len(compressed_docs)
-            )
-
-            retrieval_stats = {
-                "dense_count": len(all_dense),
-                "sparse_count": len(all_sparse),
-                "history_count": len(history_docs),
-                "rrf_fused": len(fused_docs),
-                "reranked": len(reranked_docs),
-                "compressed": len(compressed_docs),
-                "cached_hit": False,
-            }
-            return compressed_docs, ret_query, None, retrieval_stats
-
-        # Retrieve documents from each target source (reuse cached retrievers) - Non-chat mode
+        # Retrieve documents from each target source using LangGraph retrieval_app
         all_docs = []
+        all_parents = []
+        all_graph_context = []
+        all_current_concepts = []
+        
+        # Accumulate stats
+        total_dense = 0
+        total_sparse = 0
+        total_history = 0
+        total_rrf = 0
+        total_reranked = 0
+        total_reordered = 0
+
+        from src.retrieval.retrieval_graph import retrieval_app
+        from src.retrieval.state import RetrievalState
+
         for sid in target_sids:
             sid_path = os.path.join("data/vectorstores", sid)
             if os.path.exists(sid_path):
                 try:
-                    if sid not in self._retriever_cache:
-                        self._retriever_cache[sid] = self._retrieval_cls(
-                            vectorstore_path=sid_path, top_k=k
-                        )
-                    r = self._retriever_cache[sid]
-                    docs = r.retrieve(ret_query, top_k=k)
+                    res = retrieval_app.invoke(RetrievalState(
+                        query=query,
+                        vectorstore_path=sid_path,
+                        top_k=k,
+                        use_rerank=True,
+                        use_reordering=True,
+                        do_expand=do_expand,
+                        mode=mode,
+                        source_ids=[sid]
+                    ))
+                    
+                    # Gather docs from result
+                    docs = res.get("documents", [])
                     for doc in docs:
                         if "source_id" not in doc.metadata:
                             doc.metadata["source_id"] = sid
                         doc.metadata["source_name"] = source_names.get(sid, doc.metadata.get("source_name", sid))
                     all_docs.extend(docs)
+                    
+                    # Gather history_docs returned by study mode node
+                    hdocs = res.get("history_docs", [])
+                    for hd in hdocs:
+                        if "source_id" not in hd.metadata:
+                            hd.metadata["source_id"] = "history"
+                        hd.metadata["is_history"] = True
+                    all_docs.extend(hdocs)
+                    
+                    # Accumulate current concepts
+                    ccon = res.get("current_concepts", [])
+                    if ccon:
+                        all_current_concepts.extend(ccon)
+                    
+                    # Accumulate stats
+                    meta = res.get("metadata") or {}
+                    total_dense += meta.get("dense_count", 0)
+                    total_sparse += meta.get("sparse_count", 0)
+                    total_history += meta.get("history_count", 0)
+                    total_rrf += meta.get("rrf_fused", 0)
+                    total_reranked += meta.get("reranked", 0)
+                    total_reordered += meta.get("reordered", 0)
+
+                    # Gather parents
+                    parents = res.get("reordered_parents", [])
+                    all_parents.extend(parents)
+                    
+                    # Gather graph context
+                    gctx = res.get("graph_context", [])
+                    if gctx:
+                        all_graph_context.extend(gctx)
+                        
                 except Exception as e:
-                    logger.warning("[retrieve] Failed to retrieve from source '%s': %s", sid, e)
+                    logger.warning("[retrieve] LangGraph retrieval failed for source '%s': %s", sid, e)
 
-        # De-duplicate by document content and sort by score descending
+        # De-duplicate unique documents and separate history
         seen = set()
-        unique_docs = []
-        for doc in all_docs:
-            content_hash = hash(doc.page_content)
-            if content_hash not in seen:
-                seen.add(content_hash)
-                unique_docs.append(doc)
+        history_docs = []
+        source_docs = []
 
-        unique_docs = sorted(unique_docs, key=lambda x: x.metadata.get("score", 0.0), reverse=True)
-        
+        for doc in all_docs:
+            is_hist = doc.metadata.get("is_history") or doc.metadata.get("source_id") == "history"
+            cid = doc.metadata.get("parent_id") or doc.metadata.get("chunk_id") or hash(doc.page_content[:200])
+            if cid not in seen:
+                seen.add(cid)
+                if is_hist:
+                    history_docs.append(doc)
+                else:
+                    source_docs.append(doc)
+
+        if mode == "chat":
+            from src.retrieval.reorder import reorder_chunks
+            chunks_with_scores = []
+            for doc in source_docs:
+                score = doc.metadata.get("relevance_score", doc.metadata.get("score", 0.0))
+                try:
+                    score = float(score)
+                except (ValueError, TypeError):
+                    score = 0.0
+                chunks_with_scores.append((doc, score))
+            reordered_source_docs = reorder_chunks(chunks_with_scores)[:k]
+            combined_docs = history_docs[:2] + reordered_source_docs
+
+            logger.info(
+                "[retrieve] Chat mode LangGraph retrieval: dense=%d sparse=%d history=%d fused=%d reranked=%d reordered=%d",
+                total_dense, total_sparse, total_history, total_rrf, total_reranked, len(reordered_source_docs)
+            )
+
+            retrieval_stats = {
+                "dense_count": total_dense,
+                "sparse_count": total_sparse,
+                "history_count": total_history,
+                "rrf_fused": total_rrf,
+                "reranked": total_reranked,
+                "reordered": len(reordered_source_docs),
+                "cached_hit": False,
+            }
+            self._last_graph_context = []
+            return combined_docs, ret_query, None, retrieval_stats
+
+        # Deduplicate current concepts
+        seen_ccon = set()
+        unique_ccon = []
+        for cc in all_current_concepts:
+            cc_name = cc.get("name", "").strip().lower()
+            if cc_name and cc_name not in seen_ccon:
+                seen_ccon.add(cc_name)
+                unique_ccon.append(cc)
+
+        if mode == "study":
+            from src.retrieval.nodes.build_context_node import format_study_graph_context
+            graph_text = format_study_graph_context(all_graph_context, unique_ccon)
+            
+            reordered_source_docs = source_docs[:k]
+            combined_docs = []
+            if graph_text:
+                graph_doc = Document(
+                    page_content=graph_text,
+                    metadata={"source_id": "SQLite Study Graph"}
+                )
+                combined_docs.append(graph_doc)
+            
+            combined_docs.extend(history_docs[:2])
+            combined_docs.extend(reordered_source_docs)
+            
+            logger.info(
+                "[retrieve] Study mode LangGraph retrieval: dense=%d sparse=%d history=%d fused=%d reranked=%d reordered=%d",
+                total_dense, total_sparse, total_history, total_rrf, total_reranked, len(reordered_source_docs)
+            )
+            
+            retrieval_stats = {
+                "dense_count": total_dense,
+                "sparse_count": total_sparse,
+                "history_count": len(history_docs),
+                "rrf_fused": total_rrf,
+                "reranked": total_reranked,
+                "reordered": len(reordered_source_docs),
+                "cached_hit": False,
+            }
+            self._last_graph_context = all_graph_context
+            self._last_current_concepts = unique_ccon
+            return combined_docs, ret_query, None, retrieval_stats
+
+        # Deep Research mode
+        all_docs = source_docs[:k]
+
         logger.info(
-            "[retrieve] query_len=%d target_sids=%s → %d docs",
-            len(query), target_sids, len(unique_docs[:k]),
+            "[retrieve] non-chat mode retrieval: target_sids=%s → %d docs, mode=%s",
+            target_sids, len(all_docs), mode
         )
 
         retrieval_stats = {
@@ -453,10 +438,12 @@ class MiniNotebookLM:
             "history_count": 0,
             "rrf_fused": 0,
             "reranked": 0,
-            "compressed": 0,
+            "reordered": len(all_docs),
             "cached_hit": False,
         }
-        return unique_docs[:k], ret_query, None, retrieval_stats
+        self._last_graph_context = all_graph_context
+        return all_docs, ret_query, None, retrieval_stats
+
 
 
     # ── Generation ──────────────────────────────────────────────────────────────────
@@ -494,7 +481,7 @@ class MiniNotebookLM:
         if documents is None:
             _sids = source_ids if source_ids else None
             documents, ret_query, cache_hit, retrieval_stats = self.retrieve(
-                safe_query, k=k, rewrite=rewrite, source_ids=_sids, mode=mode
+                safe_query, k=k, rewrite=rewrite, source_ids=_sids, mode=mode, do_expand=do_expand
             )
         else:
             retrieval_stats = {
@@ -503,7 +490,7 @@ class MiniNotebookLM:
                 "history_count": 0,
                 "rrf_fused": 0,
                 "reranked": 0,
-                "compressed": 0,
+                "reordered": 0,
                 "cached_hit": False,
             }
 
@@ -549,6 +536,17 @@ class MiniNotebookLM:
 
         answer = gen_result.get("answer", "")
 
+        # Safe Knowledge Graph Enrichment in Study Mode
+        if mode == "study" and documents:
+            try:
+                from src.storage.knowledge_graph_updater import KnowledgeGraphUpdater
+                updater = KnowledgeGraphUpdater()
+                clean_docs = [d for d in documents if d.metadata.get("source_id") != "SQLite Study Graph"]
+                updater.enrich_graph(safe_query, answer, clean_docs)
+            except Exception as e:
+                logger.warning("[MiniNotebookLM] Safe graph enrichment failed: %s", e)
+
+
         # ── 4. Update history ─────────────────────────────────────────────────────────
         self._history.append({"role": "user",      "content": safe_query})
         self._history.append({"role": "assistant", "content": answer})
@@ -584,15 +582,8 @@ class MiniNotebookLM:
         sub_queries_res = []
         quiz_cards_res = []
         summary_bullets_res = []
-        if mode == "study" and documents:
-            try:
-                from src.retrieval.study_mode import StudyMode
-                sm = StudyMode()
-                quiz_cards_res = sm.flashcards(documents)
-                summary_bullets_res = sm.summary_bullets(documents)
-            except Exception as exc:
-                logger.warning("[ask] Study mode helper failed: %s", exc)
-        elif mode in ("research", "deep_research") and documents:
+        # Study mode flashcards/summary bullets dropped
+        if mode in ("research", "deep_research") and documents:
             try:
                 import re
                 from src.generation.llm_registry import LLMRegistry
@@ -618,6 +609,7 @@ class MiniNotebookLM:
             sub_queries=sub_queries_res,
             quiz_cards=quiz_cards_res,
             summary_bullets=summary_bullets_res,
+            graph_context=getattr(self, "_last_graph_context", []),
         )
 
     def ask_stream(
@@ -654,7 +646,7 @@ class MiniNotebookLM:
         if documents is None:
             _sids = source_ids if source_ids else None
             documents, ret_query, cache_hit, retrieval_stats = self.retrieve(
-                safe_query, k=k, rewrite=rewrite, source_ids=_sids, mode=mode
+                safe_query, k=k, rewrite=rewrite, source_ids=_sids, mode=mode, do_expand=do_expand
             )
         else:
             retrieval_stats = {
@@ -663,7 +655,7 @@ class MiniNotebookLM:
                 "history_count": 0,
                 "rrf_fused": 0,
                 "reranked": 0,
-                "compressed": 0,
+                "reordered": 0,
                 "cached_hit": False,
             }
 
@@ -791,6 +783,16 @@ class MiniNotebookLM:
             sources_used = assembled.get("sources_used", [])
             chunks_used = assembled.get("chunks_used", [])
 
+            # Safe Knowledge Graph Enrichment in Study Mode
+            if mode == "study" and documents:
+                try:
+                    from src.storage.knowledge_graph_updater import KnowledgeGraphUpdater
+                    updater = KnowledgeGraphUpdater()
+                    clean_docs = [d for d in documents if d.metadata.get("source_id") != "SQLite Study Graph"]
+                    updater.enrich_graph(safe_query, answer, clean_docs)
+                except Exception as e:
+                    logger.warning("[MiniNotebookLM] Safe graph enrichment failed: %s", e)
+
             # ── 5. Update history ───────────────────────────────────────────────────
             self._history.append({"role": "user",      "content": safe_query})
             self._history.append({"role": "assistant", "content": answer})
@@ -806,15 +808,8 @@ class MiniNotebookLM:
             sub_queries_res = []
             quiz_cards_res = []
             summary_bullets_res = []
-            if mode == "study":
-                try:
-                    from src.retrieval.study_mode import StudyMode
-                    sm = StudyMode()
-                    quiz_cards_res = sm.flashcards(documents)
-                    summary_bullets_res = sm.summary_bullets(documents)
-                except Exception as exc:
-                    logger.warning("[ask] Study mode helper failed: %s", exc)
-            elif mode in ("research", "deep_research"):
+            # Study mode flashcards/summary bullets dropped
+            if mode in ("research", "deep_research"):
                 try:
                     import re
                     llm_sync = LLMRegistry.get(temperature=0.5)
@@ -847,6 +842,7 @@ class MiniNotebookLM:
                 "chunk_strategy": chunk_strategy,
                 "model_name": self.config.llm_model,
                 "chunks_used": chunks_used,
+                "graph_context": getattr(self, "_last_graph_context", []),
             }
             yield meta
             yield {"type": "done"}

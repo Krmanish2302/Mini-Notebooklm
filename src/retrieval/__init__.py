@@ -23,7 +23,7 @@ def retrieve(
     vectorstore_path: str,
     top_k:            int  = 5,
     use_rerank:       bool = True,
-    use_compression:  bool = False,
+    use_reordering:   bool = True,
     do_expand:        bool = True,   # BUG-RET-06: renamed from expand_query
 ) -> dict:
     """One-line entry point. Returns final RetrievalState dict."""
@@ -32,7 +32,7 @@ def retrieve(
         vectorstore_path=vectorstore_path,
         top_k=top_k,
         use_rerank=use_rerank,
-        use_compression=use_compression,
+        use_reordering=use_reordering,
         do_expand=do_expand,
     ))
 
