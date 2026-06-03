@@ -118,9 +118,20 @@ class SQLiteManager:
     All message retrieval methods return List[BaseMessage].
     """
 
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self, db_path: str = _DEFAULT_DB):
+        if self._initialized:
+            return
         self.db_path = db_path
         self._init_db()
+        self._initialized = True
 
     # ── Connection context manager ────────────────────────────────────────────
 

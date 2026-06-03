@@ -383,20 +383,12 @@ class MiniNotebookLM:
                     source_docs.append(doc)
 
         if mode == "chat":
-            chunks_with_scores = []
-            for doc in source_docs:
-                score = doc.metadata.get("relevance_score", doc.metadata.get("score", 0.0))
-                try:
-                    score = float(score)
-                except (ValueError, TypeError):
-                    score = 0.0
-                chunks_with_scores.append((doc, score))
-            reordered_source_docs = reorder_chunks(chunks_with_scores)[:k]
-            combined_docs = history_docs[:2] + reordered_source_docs
+            # Chunks are already reranked and reordered inside chat_retrieve node
+            combined_docs = history_docs[:2] + source_docs[:k]
 
             logger.info(
                 "[retrieve] Chat mode LangGraph retrieval: dense=%d sparse=%d history=%d fused=%d reranked=%d reordered=%d",
-                total_dense, total_sparse, total_history, total_rrf, total_reranked, len(reordered_source_docs)
+                total_dense, total_sparse, total_history, total_rrf, total_reranked, total_reordered
             )
 
             retrieval_stats = {
@@ -405,7 +397,7 @@ class MiniNotebookLM:
                 "history_count": total_history,
                 "rrf_fused": total_rrf,
                 "reranked": total_reranked,
-                "reordered": len(reordered_source_docs),
+                "reordered": total_reordered,
                 "cached_hit": False,
             }
             self._last_graph_context = []
