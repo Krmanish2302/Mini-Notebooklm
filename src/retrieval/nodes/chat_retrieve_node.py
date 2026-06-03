@@ -7,9 +7,11 @@ Applies RRF, reranks source chunks, reorders source chunks (lost-in-the-middle),
 from __future__ import annotations
 import logging
 import os
+import json
 from typing import List, Dict, Any
 from langchain_core.documents import Document
 from src.retrieval.reranker import Reranker
+from src.storage.sqlite_manager import SQLiteManager
 
 logger = logging.getLogger(__name__)
 
@@ -127,24 +129,100 @@ def chat_retrieve(state: dict) -> dict:
         else:
             reranked_docs = fused_docs[:top_k]
 
-        # Apply lost-in-the-middle reordering on source chunks only
+        # Resolve Parents from SQLite
+        db = SQLiteManager()
+        parent_ids = []
+        seen_parent_ids = set()
+
+        for doc in reranked_docs:
+            pid = doc.metadata.get("parent_id")
+            if pid and pid not in seen_parent_ids:
+                seen_parent_ids.add(pid)
+                parent_ids.append(pid)
+
+        resolved_parents_list = []
+        if parent_ids:
+            try:
+                db_parents = db.get_parents_batch(parent_ids)
+                parents_map = {p["parent_id"]: p for p in db_parents}
+                for pid in parent_ids:
+                    if pid in parents_map:
+                        resolved_parents_list.append(parents_map[pid])
+            except Exception as e:
+                logger.warning("[chat_retrieve] Failed to get parents batch: %s", e)
+
+        # Fallback to child chunks if no parent records exist in SQLite
+        if not resolved_parents_list:
+            for i, doc in enumerate(reranked_docs):
+                resolved_parents_list.append({
+                    "parent_id": doc.metadata.get("chunk_id") or f"fallback_{i}",
+                    "source_id": doc.metadata.get("source_id", "unknown"),
+                    "source_type": doc.metadata.get("source_type", "pdf"),
+                    "parent_text": doc.page_content,
+                    "parent_strategy": "Child fallback",
+                    "parent_type": "child_fallback",
+                    "range_info": f"Page {doc.metadata.get('page', '')}" if "page" in doc.metadata else "Child chunk",
+                    "parent_metadata": doc.metadata,
+                    "child_ids": [doc.metadata.get("chunk_id")]
+                })
+
+        # Apply lost-in-the-middle reordering on resolved parent documents
         try:
             from src.retrieval.reorder import reorder_chunks
-            chunks_with_scores = []
+            child_score_map = {}
             for doc in reranked_docs:
                 score = doc.metadata.get("relevance_score", doc.metadata.get("score", 0.0))
                 try:
                     score = float(score)
                 except (ValueError, TypeError):
                     score = 0.0
-                chunks_with_scores.append((doc, score))
-            reordered_docs = reorder_chunks(chunks_with_scores)
+                pid = doc.metadata.get("parent_id")
+                cid = doc.metadata.get("chunk_id")
+                if pid:
+                    child_score_map[pid] = max(child_score_map.get(pid, -9999.0), score)
+                if cid:
+                    child_score_map[cid] = max(child_score_map.get(cid, -9999.0), score)
+
+            parents_with_scores = [
+                (p, child_score_map.get(p["parent_id"], 0.0))
+                for p in resolved_parents_list
+            ]
+            reordered_parents = reorder_chunks(parents_with_scores)
         except Exception as e:
             logger.warning("[chat_retrieve] Reordering failed: %s", e)
-            reordered_docs = reranked_docs
+            reordered_parents = resolved_parents_list
 
-        # Merge history chunks and reordered source chunks
-        combined_docs = history_docs + reordered_docs
+        # Limit to top_k parents
+        reordered_parents = reordered_parents[:top_k]
+
+        # Convert resolved parents to Document format
+        reordered_parent_docs = []
+        for p in reordered_parents:
+            p_meta = p.get("parent_metadata") or {}
+            if isinstance(p_meta, str):
+                try:
+                    p_meta = json.loads(p_meta)
+                except Exception:
+                    p_meta = {}
+            meta = {
+                "source_id": p["source_id"],
+                "page": p.get("range_info") or p_meta.get("pages", ""),
+                "parent_id": p["parent_id"],
+                "parent_type": p["parent_type"],
+                "parent_strategy": p["parent_strategy"]
+            }
+            if p["parent_type"] == "child_fallback":
+                meta.update(p_meta)
+            
+            reordered_parent_docs.append(
+                Document(
+                    page_content=p["parent_text"],
+                    metadata=meta
+                )
+            )
+
+        # Merge history chunks and reordered source parent documents
+        combined_docs = history_docs + reordered_parent_docs
 
         metadata = {
             "dense_count": len(dense_docs),
@@ -152,12 +230,12 @@ def chat_retrieve(state: dict) -> dict:
             "history_count": len(history_docs),
             "rrf_fused": len(fused_docs),
             "reranked": len(reranked_docs),
-            "reordered": len(reordered_docs)
+            "reordered": len(reordered_parent_docs)
         }
 
         logger.info(
             "[chat_retrieve] Chat retrieval done: dense=%d sparse=%d history=%d fused=%d reranked=%d reordered=%d",
-            len(dense_docs), len(sparse_docs), len(history_docs), len(fused_docs), len(reranked_docs), len(reordered_docs)
+            len(dense_docs), len(sparse_docs), len(history_docs), len(fused_docs), len(reranked_docs), len(reordered_parent_docs)
         )
 
         return {

@@ -160,7 +160,7 @@ def group_chunks_into_parents(
             
             for c in group_chunks:
                 c_tokens = _token_estimate(c.page_content)
-                if current_subgroup and (current_tokens + c_tokens > 1500):
+                if current_subgroup and (current_tokens + c_tokens > 2500):
                     child_ids = [gc.metadata.get("chunk_id") for gc in current_subgroup if gc.metadata.get("chunk_id")]
                     parent_text = "\n\n".join(gc.page_content for gc in current_subgroup)
                     
@@ -233,7 +233,7 @@ def group_chunks_into_parents(
                 
                 for c in group_chunks:
                     c_tokens = _token_estimate(c.page_content)
-                    if current_subgroup and (current_tokens + c_tokens > 1500):
+                    if current_subgroup and (current_tokens + c_tokens > 2500):
                         child_ids = [gc.metadata.get("chunk_id") for gc in current_subgroup if gc.metadata.get("chunk_id")]
                         parent_text = "\n\n".join(gc.page_content for gc in current_subgroup)
                         pages = sorted(list(set(gc.metadata.get("page") or gc.metadata.get("page_number") for gc in current_subgroup if gc.metadata.get("page") or gc.metadata.get("page_number"))))
@@ -309,7 +309,7 @@ def group_chunks_into_parents(
                 page_chunks = page_groups[page]
                 page_tokens = sum(_token_estimate(c.page_content) for c in page_chunks)
                 
-                if temp_group and (temp_tokens + page_tokens > 1500):
+                if temp_group and (temp_tokens + page_tokens > 2500):
                     child_ids = [c.metadata.get("chunk_id") for c in temp_group if c.metadata.get("chunk_id")]
                     parent_text = "\n\n".join(c.page_content for c in temp_group)
                     pages = sorted(list(set(gc.metadata.get("page") or gc.metadata.get("page_number") for gc in temp_group if gc.metadata.get("page") or gc.metadata.get("page_number"))))

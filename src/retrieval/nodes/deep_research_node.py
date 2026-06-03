@@ -290,8 +290,8 @@ def deep_research_retrieve(state: dict) -> dict:
                 )
             )
 
-        # ── 7. Merge history turns ──────────────────────────────────────────
-        combined_docs = history_docs + reordered_parent_docs
+        # ── 7. Merge history turns (history handled by master_pipeline prompt builder)
+        combined_docs = reordered_parent_docs
 
         metadata = {
             "dense_count": len(dense_docs),

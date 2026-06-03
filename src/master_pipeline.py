@@ -73,7 +73,7 @@ class PipelineConfig:
     llm_provider:    str   = field(default_factory=lambda: os.getenv("LLM_PROVIDER",    "groq"))
     llm_model:       str   = field(default_factory=lambda: os.getenv("LLM_MODEL",       "llama-3.3-70b-versatile"))
     llm_temperature: float = field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.7")))
-    llm_max_tokens:  int   = field(default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS",    "1024")))
+    llm_max_tokens:  int   = field(default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS",    "4096")))
 
     # Retrieval
     vectorstore_path:   str  = field(default_factory=lambda: os.getenv("VECTORSTORE_PATH", "data/vectorstores/default"))
@@ -175,8 +175,8 @@ class MiniNotebookLM:
         source: str,
         *,
         source_id:     Optional[str] = None,
-        chunk_size:    int           = 512,
-        chunk_overlap: int           = 64,
+        chunk_size:    int           = int(os.getenv("CHUNK_SIZE", "1000")),
+        chunk_overlap: int           = int(os.getenv("CHUNK_OVERLAP", "150")),
         **kwargs,
     ) -> Dict[str, Any]:
         if not self._ingestion_cls:
@@ -384,7 +384,7 @@ class MiniNotebookLM:
 
         if mode == "chat":
             # Chunks are already reranked and reordered inside chat_retrieve node
-            combined_docs = history_docs[:2] + source_docs[:k]
+            combined_docs = source_docs[:k]
 
             logger.info(
                 "[retrieve] Chat mode LangGraph retrieval: dense=%d sparse=%d history=%d fused=%d reranked=%d reordered=%d",
@@ -399,8 +399,8 @@ class MiniNotebookLM:
                 "reranked": total_reranked,
                 "reordered": total_reordered,
                 "cached_hit": False,
+                "graph_context": []
             }
-            self._last_graph_context = []
             return combined_docs, ret_query, None, retrieval_stats
 
         # Deduplicate current concepts
@@ -424,7 +424,6 @@ class MiniNotebookLM:
                 )
                 combined_docs.append(graph_doc)
             
-            combined_docs.extend(history_docs[:2])
             combined_docs.extend(reordered_source_docs)
             
             logger.info(
@@ -440,9 +439,8 @@ class MiniNotebookLM:
                 "reranked": total_reranked,
                 "reordered": len(reordered_source_docs),
                 "cached_hit": False,
+                "graph_context": all_graph_context
             }
-            self._last_graph_context = all_graph_context
-            self._last_current_concepts = unique_ccon
             return combined_docs, ret_query, None, retrieval_stats
 
         # Deep Research mode
@@ -461,8 +459,8 @@ class MiniNotebookLM:
             "reranked": 0,
             "reordered": len(all_docs),
             "cached_hit": False,
+            "graph_context": all_graph_context
         }
-        self._last_graph_context = all_graph_context
         return all_docs, ret_query, None, retrieval_stats
 
 
@@ -664,7 +662,7 @@ class MiniNotebookLM:
             sub_queries=sub_queries_res,
             quiz_cards=[],
             summary_bullets=[],
-            graph_context=getattr(self, "_last_graph_context", []),
+            graph_context=retrieval_stats.get("graph_context", []),
         )
 
     def ask_stream(
@@ -851,7 +849,7 @@ class MiniNotebookLM:
                 "chunk_strategy": chunk_strategy,
                 "model_name": self.config.llm_model,
                 "chunks_used": chunks_used,
-                "graph_context": getattr(self, "_last_graph_context", []),
+                "graph_context": retrieval_stats.get("graph_context", []),
                 "ragas": ragas_result,
             }
             yield meta

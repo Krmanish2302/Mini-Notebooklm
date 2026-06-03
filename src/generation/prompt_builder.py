@@ -170,6 +170,10 @@ def format_context(documents: List[Any]) -> str:
             parts.append(f"CONCEPT KNOWLEDGE MAP (SQLite Graph):\n{content}")
             continue
 
+        # Minimum content guard: skip stubs / empty fallbacks (unless it's history)
+        if not meta.get("is_history") and meta.get("source_id") != "history" and len(content.strip()) < 100:
+            continue
+
         src = meta.get("source", meta.get("source_id", ""))
         src_suffix = (" " + _EM_DASH + " " + src) if src else ""
         header = f"[S{source_idx}]{src_suffix}"
