@@ -20,6 +20,9 @@ from src.storage.sqlite_manager import SQLiteManager
 
 logger = logging.getLogger(__name__)
 
+_reranker = Reranker()
+
+
 def should_expand_query(query: str) -> bool:
     """
     Heuristics to decide if a query warrants alternate sub-queries:
@@ -182,7 +185,7 @@ def deep_research_retrieve(state: dict) -> dict:
         # ── 4. Rerank source child chunks only ─────────────────────────────
         if use_rerank and len(fused_docs) > 1:
             try:
-                child_docs = Reranker().rerank(query, fused_docs, top_n=top_k * 2)
+                child_docs = _reranker.rerank(query, fused_docs, top_n=top_k * 2)
             except Exception as e:
                 logger.warning("[deep_research_retrieve] Reranking failed: %s", e)
                 child_docs = fused_docs[:top_k * 2]
@@ -251,9 +254,19 @@ def deep_research_retrieve(state: dict) -> dict:
                 })
 
         # ── 6. Lost-in-the-Middle Reordering of Parents ─────────────────────
+        child_score_map = {}
+        for doc in child_docs:
+            score = float(doc.metadata.get("relevance_score", doc.metadata.get("score", 0.0)))
+            pid = doc.metadata.get("parent_id")
+            cid = doc.metadata.get("chunk_id")
+            if pid:
+                child_score_map[pid] = max(child_score_map.get(pid, -9999.0), score)
+            if cid:
+                child_score_map[cid] = max(child_score_map.get(cid, -9999.0), score)
+
         parents_with_scores = [
-            (p, float(len(resolved_parents_list) - i)) 
-            for i, p in enumerate(resolved_parents_list)
+            (p, child_score_map.get(p["parent_id"], 0.0)) 
+            for p in resolved_parents_list
         ]
         reordered_parents = reorder_chunks(parents_with_scores)
         

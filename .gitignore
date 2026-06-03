@@ -9654,3 +9654,6 @@ data/vectorstores/resume/docstore/fc053bac-aa4b-4de3-a75b-4b9a8eec5d8a
 .gitignore
 .gitignore
 articrafts/walkthrough latency
+data/vectorstores/test_verification_doc/index.faiss
+data/vectorstores/test_verification_doc/index.pkl
+data/vectorstores/test_verification_doc/docstore/c6e5950a-450c-4bf0-a589-ed049676621c

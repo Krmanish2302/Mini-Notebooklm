@@ -21,6 +21,37 @@ from src.generation.llm_registry import LLMRegistry
 
 logger = logging.getLogger(__name__)
 
+_reranker = Reranker()
+
+def _extract_candidates(text: str) -> List[str]:
+    candidates = set()
+    text_clean = re.sub(r'[\s_\-]+', ' ', text)
+    
+    # 1. Capitalized n-grams
+    cap_words = re.findall(r'\b[A-Z][a-zA-Z0-9]*\b', text_clean)
+    for w in cap_words:
+        if len(w) >= 3:
+            candidates.add(w)
+            candidates.add(w.lower())
+
+    # 2. Word n-grams (up to trigrams)
+    words = [w.strip() for w in re.split(r'\W+', text_clean) if w.strip()]
+    for i in range(len(words)):
+        w1 = words[i]
+        if len(w1) >= 4:
+            candidates.add(w1)
+            candidates.add(w1.lower())
+        if i < len(words) - 1:
+            w2 = f"{words[i]} {words[i+1]}"
+            candidates.add(w2)
+            candidates.add(w2.lower())
+        if i < len(words) - 2:
+            w3 = f"{words[i]} {words[i+1]} {words[i+2]}"
+            candidates.add(w3)
+            candidates.add(w3.lower())
+            
+    return list(candidates)
+
 _CONCEPT_PROMPT = ChatPromptTemplate.from_messages([
     ("system", "You are an expert tutor. Extract the 1-3 primary technical concepts, definitions, or topics "
                "that are the subject of the user's study query. Output them as a comma-separated list. "
@@ -151,7 +182,7 @@ def study_retrieve(state: dict) -> dict:
         # ── 3. Rerank source child chunks only ─────────────────────────────────────────
         if use_rerank and len(fused_docs) > 1:
             try:
-                child_docs = Reranker().rerank(query, fused_docs, top_n=top_k * 2)
+                child_docs = _reranker.rerank(query, fused_docs, top_n=top_k * 2)
             except Exception as e:
                 logger.warning("[study_retrieve] Reranking failed: %s", e)
                 child_docs = fused_docs[:top_k * 2]
@@ -192,9 +223,19 @@ def study_retrieve(state: dict) -> dict:
                 })
 
         # ── 5. Localized Parent Reordering (Lost-in-the-Middle) ───────────────────────
+        child_score_map = {}
+        for doc in child_docs:
+            score = float(doc.metadata.get("relevance_score", doc.metadata.get("score", 0.0)))
+            pid = doc.metadata.get("parent_id")
+            cid = doc.metadata.get("chunk_id")
+            if pid:
+                child_score_map[pid] = max(child_score_map.get(pid, -9999.0), score)
+            if cid:
+                child_score_map[cid] = max(child_score_map.get(cid, -9999.0), score)
+
         parents_with_scores = [
-            (p, float(len(resolved_parents_list) - i)) 
-            for i, p in enumerate(resolved_parents_list)
+            (p, child_score_map.get(p["parent_id"], 0.0))
+            for p in resolved_parents_list
         ]
         reordered_parents = reorder_chunks(parents_with_scores)
         reordered_parents = reordered_parents[:top_k]
@@ -220,13 +261,20 @@ def study_retrieve(state: dict) -> dict:
         logger.info("[study_retrieve] Extracted query concepts: %s", concepts)
         query_concepts = list(concepts)
 
+        # Build candidate terms to fetch nodes selectively
+        candidate_terms = set(concepts)
+        candidate_terms.update(_extract_candidates(query))
+        for child in child_docs[:top_k]:
+            candidate_terms.update(_extract_candidates(child.page_content))
+
         # Retrieve nodes in DB for normalization/alias match
         try:
-            all_db_nodes = db.list_graph_nodes()
+            matched_nodes = db.get_graph_nodes_by_names_or_ids(list(candidate_terms))
+            logger.info("[study_retrieve] Fetched %d candidate graph nodes from SQLite", len(matched_nodes))
             
             # Prepare normalized targets: (original_node, normalized_name, normalized_id, normalized_aliases)
             normalized_nodes = []
-            for n in all_db_nodes:
+            for n in matched_nodes:
                 name = n["name"].strip()
                 node_id = n["node_id"].strip()
                 meta = n.get("metadata") or {}
@@ -294,8 +342,8 @@ def study_retrieve(state: dict) -> dict:
         # Fetch current concept descriptions/definitions
         current_concepts_info = []
         try:
-            nodes_map = {n["name"].lower(): n for n in all_db_nodes}
-            nodes_id_map = {n["node_id"].lower(): n for n in all_db_nodes}
+            nodes_map = {n["name"].lower(): n for n in matched_nodes}
+            nodes_id_map = {n["node_id"].lower(): n for n in matched_nodes}
             for c in query_concepts:
                 c_lower = c.lower()
                 c_id = c_lower.replace(" ", "_")

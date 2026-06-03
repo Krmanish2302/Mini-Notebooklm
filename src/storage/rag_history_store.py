@@ -27,8 +27,10 @@ import json
 import logging
 import time
 from typing import Any, List, Optional
+import numpy as np
 
 logger = logging.getLogger(__name__)
+
 
 # ── SQLite DDL ─────────────────────────────────────────────────────────────────
 _DDL = """
@@ -330,12 +332,12 @@ class RAGHistoryStore:
                     ))
                 return docs
 
-        # Fallback if chat_history_chunks is empty: load raw turns from chat_history and chunk on-the-fly
+        # Fallback if chat_history_chunks is empty: load raw turns from chat_history and return last turns as whole documents
         try:
             with self._db._conn() as conn:
                 rows = conn.execute(
                     """
-                    SELECT turn_index, user_query, assistant_answer, response_embedding
+                    SELECT turn_index, user_query, assistant_answer
                     FROM   chat_history
                     WHERE  session_id = ?
                     ORDER  BY turn_index ASC
@@ -348,44 +350,6 @@ class RAGHistoryStore:
         if not rows:
             return []
 
-        # If we have turns, we split them into chunks on-the-fly and score them
-        scored_chunks = []
-        if self._emb is not None:
-            try:
-                q_vec = self._emb.embed_query(current_query)
-                import re
-                for row in rows:
-                    turn_idx = row[0]
-                    assistant_answer = row[2]
-                    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", assistant_answer) if s.strip()]
-                    for chunk_idx, sentence in enumerate(sentences):
-                        s_emb = self._embed_text(sentence)
-                        if s_emb:
-                            score = _cosine(q_vec, s_emb)
-                            scored_chunks.append((turn_idx, chunk_idx, sentence, score))
-            except Exception as exc:
-                logger.warning("[RAGHistoryStore] retrieve_history_docs fallback chunking/scoring failed: %s", exc)
-
-        if scored_chunks:
-            top = sorted(scored_chunks, key=lambda x: x[3], reverse=True)[:top_k]
-            top.sort(key=lambda x: (x[0], x[1]))
-            
-            docs = []
-            for turn_idx, chunk_idx, text, score in top:
-                docs.append(Document(
-                    page_content=text,
-                    metadata={
-                        "source_id": "history",
-                        "source_name": "Chat History",
-                        "is_history": True,
-                        "turn_index": turn_idx,
-                        "chunk_index": chunk_idx,
-                        "relevance_score": score
-                    }
-                ))
-            return docs
-
-        # Ultimate fallback: return last turns as whole documents
         turns = rows[-fallback_last:]
         docs = []
         for row in turns:
@@ -498,11 +462,13 @@ class RAGHistoryStore:
 # ── Cosine helper ──────────────────────────────────────────────────────────────
 
 def _cosine(a: List[float], b: List[float]) -> float:
-    if len(a) != len(b):
+    if not a or not b or len(a) != len(b):
         return 0.0
-    dot  = sum(x * y for x, y in zip(a, b))
-    na   = sum(x * x for x in a) ** 0.5
-    nb   = sum(x * x for x in b) ** 0.5
-    if na == 0 or nb == 0:
+    arr_a = np.array(a, dtype=np.float32)
+    arr_b = np.array(b, dtype=np.float32)
+    norm_a = np.linalg.norm(arr_a)
+    norm_b = np.linalg.norm(arr_b)
+    if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
-    return dot / (na * nb)
+    return float(np.dot(arr_a, arr_b) / (norm_a * norm_b + 1e-9))
+

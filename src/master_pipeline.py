@@ -522,12 +522,12 @@ class MiniNotebookLM:
         self._history.append({"role": "assistant", "content": answer})
         self._trim_history()
 
-        # Save to SQLite-based RAGHistoryStore
+        # Save to SQLite-based RAGHistoryStore (non-blocking background thread)
         if self.history_store is not None:
             try:
-                self.history_store.add_turn("default", query, answer)
+                self._executor.submit(self.history_store.add_turn, "default", query, answer)
             except Exception as e:
-                logger.warning("[MiniNotebookLM] Failed to save turn to RAGHistoryStore: %s", e)
+                logger.warning("[MiniNotebookLM] Failed to submit turn to RAGHistoryStore: %s", e)
 
         # 3. RAGAS evaluation (optional)
         ragas_result = None

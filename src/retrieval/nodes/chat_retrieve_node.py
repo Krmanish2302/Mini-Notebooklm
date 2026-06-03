@@ -9,8 +9,12 @@ import logging
 import os
 from typing import List, Dict, Any
 from langchain_core.documents import Document
+from src.retrieval.reranker import Reranker
 
 logger = logging.getLogger(__name__)
+
+_reranker = Reranker()
+
 
 def chat_retrieve(state: dict) -> dict:
 
@@ -116,8 +120,7 @@ def chat_retrieve(state: dict) -> dict:
         # Rerank only the source child chunks
         if len(fused_docs) > 1:
             try:
-                from src.retrieval.reranker import Reranker
-                reranked_docs = Reranker().rerank(query, fused_docs, top_n=top_k)
+                reranked_docs = _reranker.rerank(query, fused_docs, top_n=top_k)
             except Exception as e:
                 logger.warning("[chat_retrieve] Reranking failed: %s", e)
                 reranked_docs = fused_docs[:top_k]

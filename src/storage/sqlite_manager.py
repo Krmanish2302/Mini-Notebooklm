@@ -103,6 +103,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_
 CREATE INDEX IF NOT EXISTS idx_parents_source   ON parents(source_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_src  ON graph_edges(source_node);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_tgt  ON graph_edges(target_node);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_name ON graph_nodes(name);
 """
 
 
@@ -139,6 +140,9 @@ class SQLiteManager:
     def _conn(self) -> Generator[sqlite3.Connection, None, None]:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        # Set journal mode to Write-Ahead Logging (WAL) and synchronous to NORMAL for faster concurrent R/W operations
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         try:
             yield conn
             conn.commit()
@@ -602,6 +606,44 @@ class SQLiteManager:
     def list_graph_nodes(self) -> List[Dict[str, Any]]:
         with self._conn() as conn:
             rows = conn.execute("SELECT * FROM graph_nodes").fetchall()
+        return [
+            {
+                "node_id":    r["node_id"],
+                "name":       r["name"],
+                "type":       r["type"],
+                "metadata":   json.loads(r["metadata_json"] or "{}"),
+                "created_at": r["created_at"]
+            }
+            for r in rows
+        ]
+
+    def get_graph_nodes_by_names_or_ids(self, names_or_ids: List[str]) -> List[Dict[str, Any]]:
+        if not names_or_ids:
+            return []
+        names_or_ids = list(set([n.strip() for n in names_or_ids if n and n.strip()]))
+        if not names_or_ids:
+            return []
+            
+        node_ids = list(set([n.lower().replace(" ", "_") for n in names_or_ids] + [n.lower() for n in names_or_ids]))
+        
+        placeholders_name = ",".join("?" for _ in names_or_ids)
+        placeholders_id = ",".join("?" for _ in node_ids)
+        
+        query = f"SELECT * FROM graph_nodes WHERE node_id IN ({placeholders_id}) OR name IN ({placeholders_name})"
+        params = node_ids + names_or_ids
+        
+        # Check aliases in metadata_json
+        like_clauses = []
+        for name in names_or_ids:
+            if len(name) >= 4:
+                like_clauses.append("metadata_json LIKE ?")
+                params.append(f'%"{name}"%')
+                
+        if like_clauses:
+            query += " OR " + " OR ".join(like_clauses)
+            
+        with self._conn() as conn:
+            rows = conn.execute(query, params).fetchall()
         return [
             {
                 "node_id":    r["node_id"],
