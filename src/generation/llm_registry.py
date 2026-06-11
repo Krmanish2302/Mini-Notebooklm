@@ -79,7 +79,7 @@ class LLMRegistry:
                 max_tokens=max_tokens,
                 openai_api_key=key or "lm-studio",
                 base_url=base_url,
-                timeout=10.0,
+                timeout=float(os.getenv("LLM_TIMEOUT", "60.0")),
                 max_retries=1,
             )
 

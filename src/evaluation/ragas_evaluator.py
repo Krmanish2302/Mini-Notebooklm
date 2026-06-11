@@ -171,8 +171,13 @@ class RAGASEvaluator:
 
     def _get_embedder(self):
         if self._embedder is None:
-            from sentence_transformers import SentenceTransformer
-            self._embedder = SentenceTransformer(self._emb_model_name)
+            import threading
+            if not hasattr(self, "_lock"):
+                self._lock = threading.Lock()
+            with self._lock:
+                if self._embedder is None:
+                    from sentence_transformers import SentenceTransformer
+                    self._embedder = SentenceTransformer(self._emb_model_name)
         return self._embedder
 
     # ── Public API ────────────────────────────────────────────────────────────

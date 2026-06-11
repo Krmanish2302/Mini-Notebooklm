@@ -4,12 +4,17 @@ embedding_registry.py
 Registry mapping provider names → LangChain Embeddings instances.
 """
 from __future__ import annotations
+import logging
 import os
+import threading
 from typing import Dict
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingRegistry:
     _instances: Dict[str, object] = {}
+    _lock = threading.Lock()
 
     @classmethod
     def get(cls, model_name: str = None):
@@ -26,16 +31,21 @@ class EmbeddingRegistry:
         if model_name in cls._instances:
             return cls._instances[model_name]
 
-        if model_name in {"text-embedding-3-small", "text-embedding-3-large"}:
-            from langchain_openai import OpenAIEmbeddings
-            emb = OpenAIEmbeddings(model=model_name)
-        else:
-            # Assume it's a HuggingFace model name
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-            emb = HuggingFaceEmbeddings(model_name=model_name)
+        with cls._lock:
+            if model_name in cls._instances:
+                return cls._instances[model_name]
 
-        cls._instances[model_name] = emb
-        return emb
+            logger.info("[EmbeddingRegistry] Cache miss! Loading model: %s", model_name)
+            if model_name in {"text-embedding-3-small", "text-embedding-3-large"}:
+                from langchain_openai import OpenAIEmbeddings
+                emb = OpenAIEmbeddings(model=model_name)
+            else:
+                # Assume it's a HuggingFace model name
+                from langchain_community.embeddings import HuggingFaceEmbeddings
+                emb = HuggingFaceEmbeddings(model_name=model_name)
+
+            cls._instances[model_name] = emb
+            return emb
 
     @classmethod
     def get_default(cls):

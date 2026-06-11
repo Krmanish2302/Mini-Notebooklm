@@ -6,6 +6,7 @@ cross-encoder/ms-marco-MiniLM-L-4-v2
 """
 from __future__ import annotations
 import logging
+import threading
 from typing import List
 
 from langchain_core.documents import Document
@@ -15,12 +16,15 @@ logger = logging.getLogger(__name__)
 
 # Module-level lazy-loaded singleton to avoid reloading from disk on every query
 _cross_encoder: CrossEncoder | None = None
+_lock = threading.Lock()
 
 def _get_cross_encoder() -> CrossEncoder:
     global _cross_encoder
     if _cross_encoder is None:
-        _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-4-v2")
-        logger.info("[Reranker] CrossEncoder model 'cross-encoder/ms-marco-MiniLM-L-4-v2' loaded (singleton)")
+        with _lock:
+            if _cross_encoder is None:
+                _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-4-v2")
+                logger.info("[Reranker] CrossEncoder model 'cross-encoder/ms-marco-MiniLM-L-4-v2' loaded (singleton)")
     return _cross_encoder
 
 class Reranker:

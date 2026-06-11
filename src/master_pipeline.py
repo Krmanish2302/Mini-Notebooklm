@@ -90,6 +90,9 @@ class PipelineConfig:
 
     # History
     max_history_turns: int = field(default_factory=lambda: int(os.getenv("MAX_HISTORY_TURNS", "8")))
+    summary_llm_provider: str = field(default_factory=lambda: os.getenv("SUMMARY_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "groq")))
+    summary_llm_model:    str = field(default_factory=lambda: os.getenv("SUMMARY_LLM_MODEL",    os.getenv("SUMMARY_LLM_MODEL_FALLBACK", "llama-3.1-8b-instant")))
+
 
 
 # ── Result dataclass ─────────────────────────────────────────────────────────────────
@@ -132,6 +135,7 @@ class MiniNotebookLM:
         self._evaluator:  Any = None
 
         self._history: List[Dict[str, str]] = []
+        self._history_summary: str = ""
         self.last_ragas: Optional[Dict[str, Any]] = None
 
         # Reusable ThreadPoolExecutor for background tasks & parallel retrieval
@@ -265,6 +269,14 @@ class MiniNotebookLM:
                     target_sids = [d for d in os.listdir("data/vectorstores") if os.path.isdir(os.path.join("data/vectorstores", d))]
                 except Exception:
                     target_sids = []
+        else:
+            # Filter user-provided source_ids to ensure they actually exist in DB and are active
+            if self._db:
+                try:
+                    active_sids = {s["source_id"] for s in self._db.list_sources(active_only=True)}
+                    target_sids = [sid for sid in target_sids if sid in active_sids]
+                except Exception as e:
+                    logger.warning("[retrieve] Failed to validate user-provided source_ids: %s", e)
 
         if not target_sids:
             logger.warning("[retrieve] No active sources found to query.")
@@ -307,7 +319,8 @@ class MiniNotebookLM:
         futures = {}
         for sid in target_sids:
             sid_path = os.path.join("data/vectorstores", sid)
-            if os.path.exists(sid_path):
+            # Ensure the vectorstore directory and index.faiss exist before querying
+            if os.path.exists(sid_path) and os.path.exists(os.path.join(sid_path, "index.faiss")):
                 state = RetrievalState(
                     query=query,
                     vectorstore_path=sid_path,
@@ -873,19 +886,87 @@ class MiniNotebookLM:
     # ── History management ──────────────────────────────────────────────────────────────
 
     def _format_history(self) -> str:
+        recent_turns_count = int(os.getenv("RECENT_HISTORY_TURNS", "3"))
+        recent_messages_count = recent_turns_count * 2
+        
+        if not self._history_summary:
+            lines = []
+            for turn in self._history:
+                role = "User" if turn["role"] == "user" else "Assistant"
+                lines.append(f"{role}: {turn['content']}")
+            return "\n\n".join(lines)
+            
         lines = []
-        for turn in self._history[-(self.config.max_history_turns * 2):]:
+        lines.append("SUMMARY OF PAST DISCUSSION:")
+        lines.append(self._history_summary)
+        lines.append("")
+        
+        lines.append("RECENT TURNS:")
+        for turn in self._history[-recent_messages_count:]:
             role = "User" if turn["role"] == "user" else "Assistant"
             lines.append(f"{role}: {turn['content']}")
+            
         return "\n\n".join(lines)
 
     def _trim_history(self) -> None:
-        max_messages = self.config.max_history_turns * 2
-        if len(self._history) > max_messages:
-            self._history = self._history[-max_messages:]
+        recent_turns_count = int(os.getenv("RECENT_HISTORY_TURNS", "3"))
+        recent_messages_count = recent_turns_count * 2
+        
+        if len(self._history) > recent_messages_count:
+            archived_turns = self._history[:-recent_messages_count]
+            try:
+                self._executor.submit(self._update_history_summary, archived_turns)
+            except Exception as e:
+                logger.warning("[MiniNotebookLM] Failed to submit history summary task: %s", e)
+            self._history = self._history[-recent_messages_count:]
+
+    def _update_history_summary(self, older_turns: List[Dict[str, str]]) -> None:
+        try:
+            from src.generation.llm_registry import LLMRegistry
+            llm = LLMRegistry.get(
+                provider=self.config.summary_llm_provider,
+                model=self.config.summary_llm_model,
+                temperature=0.2,
+            )
+            lines = []
+            for turn in older_turns:
+                role = "User" if turn["role"] == "user" else "Assistant"
+                lines.append(f"{role}: {turn['content']}")
+            older_history_str = "\n".join(lines)
+            
+            if self._history_summary:
+                prompt = (
+                    "You are a precise conversation summarizing assistant.\n"
+                    "Update the existing conversation summary with the details from the new conversation turns.\n\n"
+                    "CRITICAL REQUIREMENTS:\n"
+                    "1. Retain all key Named Entities (NER) including specific names, tools, libraries, model names, numbers, parameters, systems, locations, and dates.\n"
+                    "2. Retain important questions asked and preferences stated by the user.\n"
+                    "3. Keep the updated summary extremely concise, dense, and under 3 sentences.\n"
+                    "4. Write in a factual, third-person style.\n\n"
+                    f"Existing Summary:\n{self._history_summary}\n\n"
+                    f"New turns to integrate:\n{older_history_str}"
+                )
+            else:
+                prompt = (
+                    "You are a precise conversation summarizing assistant.\n"
+                    "Write a very concise, high-level summary of the following past conversation turns.\n\n"
+                    "CRITICAL REQUIREMENTS:\n"
+                    "1. Retain all key Named Entities (NER) including specific names, tools, libraries, model names, numbers, parameters, systems, locations, and dates.\n"
+                    "2. Retain important questions asked and preferences stated by the user.\n"
+                    "3. Keep the summary extremely concise, dense, and under 3 sentences.\n"
+                    "4. Write in a factual, third-person style.\n\n"
+                    f"Conversation turns to summarize:\n{older_history_str}"
+                )
+            res = llm.invoke(prompt)
+            summary = res.content.strip()
+            self._history_summary = summary
+            logger.info("[MiniNotebookLM] Updated history summary in background using %s/%s: %s", self.config.summary_llm_provider, self.config.summary_llm_model, summary)
+        except Exception as e:
+            logger.warning("[MiniNotebookLM] Failed to update history summary: %s", e)
 
     def clear_history(self) -> None:
         self._history.clear()
+        self._history_summary = ""
 
     @property
     def history(self) -> List[Dict[str, str]]:

@@ -54,7 +54,8 @@ def extract_video_id(url: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 @safe_node("yt_fetch")
 def yt_fetch(state: dict) -> dict:
-    from youtube_transcript_api import YouTubeTranscriptApi
+    from langchain_community.document_loaders import YoutubeLoader
+    from langchain_community.document_loaders.youtube import TranscriptFormat
     from langchain_core.documents import Document
 
     url = state["file_path"]   # URL stored in file_path
@@ -65,18 +66,39 @@ def yt_fetch(state: dict) -> dict:
         raise ValueError(f"Could not extract YouTube video ID from URL: {url}")
         
     try:
-        transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-    except Exception as e:
-        logger.warning("[yt_fetch] youtube_transcript_api failed: %s, falling back to YoutubeLoader", e)
-        from langchain_community.document_loaders import YoutubeLoader
-        loader = YoutubeLoader.from_youtube_url(url, add_video_info=False)
+        # Load transcript using LangChain's YoutubeLoader with LINES format
+        loader = YoutubeLoader.from_youtube_url(
+            url, 
+            add_video_info=False, 
+            transcript_format=TranscriptFormat.LINES,
+            language=["en", "en-US"]
+        )
         docs = loader.load()
-        # Mock a single segment if fallback is used
-        transcript_data = [{"text": d.page_content, "start": 0.0, "duration": 180.0} for d in docs]
+        
+        # Convert list of Documents to segment dictionaries for compatibility
+        transcript_data = []
+        for d in docs:
+            transcript_data.append({
+                "text": d.page_content,
+                "start": d.metadata.get("start", 0.0),
+                "duration": d.metadata.get("duration", 5.0)
+            })
+    except Exception as e:
+        logger.error("[yt_fetch] LangChain YoutubeLoader failed: %s", e)
+        raise ValueError(
+            f"Could not retrieve any transcript or captions for YouTube video '{url}'. "
+            "Please ensure the video exists and has English subtitles/captions enabled."
+        ) from e
+
+    if not transcript_data:
+        raise ValueError(
+            f"Could not retrieve any transcript or captions for YouTube video '{url}'. "
+            "Please ensure the video exists and has English subtitles/captions enabled."
+        )
 
     # Return raw transcript segments in state so that chunk node can perform semantic chunking with timestamps
     total_words = sum(len(segment["text"].split()) for segment in transcript_data)
-    logger.info("[yt_fetch] Fetched %d segments, ~%d words from '%s'", len(transcript_data), total_words, url)
+    logger.info("[yt_fetch] LangChain fetched %d segments, ~%d words from '%s'", len(transcript_data), total_words, url)
     return {
         "raw_documents": [Document(page_content=url, metadata={"source_id": source_id, "source_type": "youtube"})], 
         "original_word_count": total_words,
